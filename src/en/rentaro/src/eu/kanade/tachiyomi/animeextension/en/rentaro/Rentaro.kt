@@ -41,13 +41,11 @@ class Rentaro :
         clearOldPrefs()
     }
 
-    override val baseUrl
-        get() = preferences.domainPref
+    // TMDB v3 mirror: API-compatible with api.themoviedb.org/3 but injects the
+    // API key server-side, so no key has to ship in the APK.
+    override val baseUrl = "https://db.speedracelight.com/3"
 
-    // Rentaro/Videasy proxy
-    private val apiUrl = "https://db.speedracelight.com/3"
-
-    private fun apiOrigin(url: String): String = url.toHttpUrl().run { "$scheme://$host" }
+    private val apiUrl = baseUrl
 
     override val lang = "en"
     override val supportsLatest = true
@@ -106,9 +104,11 @@ class Rentaro :
         query: String,
         filters: AnimeFilterList,
     ): AnimesPage {
-        if (query.startsWith("https://")) {
+        // The intent filter accepts both schemes, so match both here or an
+        // http deep link would fall through to a plain text search.
+        if (query.startsWith("https://") || query.startsWith("http://")) {
             val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
+            if (url.host !in DEEP_LINK_HOSTS) {
                 throw Exception("Unsupported url")
             }
             val type = url.pathSegments.getOrNull(0)
@@ -116,7 +116,10 @@ class Rentaro :
             val rawId = url.pathSegments.getOrNull(1)
                 ?: throw Exception("Unsupported url")
             if (type !in listOf("movie", "tv")) throw Exception("Unsupported url")
-            return getSearchAnime(page, "${PREFIX_ID}$type/$rawId", filters)
+            // TMDB canonical paths append a slug: "/movie/550-fight-club".
+            val id = rawId.takeWhile { it.isDigit() }
+            if (id.isEmpty()) throw Exception("Unsupported url")
+            return getSearchAnime(page, "$PREFIX_ID$type/$id", filters)
         }
 
         // Deep link from RentaroUrlActivity: "id:<type>/<id>"
@@ -267,8 +270,8 @@ class Rentaro :
     override fun getFilterList(): AnimeFilterList = RentaroFilters.getFilterList()
 
     // ============================== Details ==============================
-    // anime.url uses native rentaro.sc paths: "/movie/<id>" or "/tv/<id>".
-    override fun getAnimeUrl(anime: SAnime): String = baseUrl + anime.url
+    // anime.url holds TMDB paths: "/movie/<id>" or "/tv/<id>".
+    override fun getAnimeUrl(anime: SAnime): String = TMDB_WEB_URL + anime.url
 
     private fun animeUrlToId(anime: SAnime): Pair<String, String> = animeUrlRegex.find(anime.url)?.let { matchResult ->
         val type = matchResult.groupValues[1]
@@ -460,7 +463,6 @@ class Rentaro :
             title = title,
             year = year,
             imdbId = imdbId,
-            baseUrl = apiOrigin(baseUrl),
             enabledServers = preferences.enabledServerNames,
             subLimit = preferences.subLimitPref.toIntOrNull()
                 ?: PREF_SUB_LIMIT_DEFAULT.toInt(),
@@ -469,10 +471,6 @@ class Rentaro :
     }
 
     // ============================== Settings ==============================
-    private val SharedPreferences.domainPref by preferences.delegate(
-        PREF_DOMAIN_KEY,
-        PREF_DOMAIN_DEFAULT,
-    )
     private val SharedPreferences.qualityPref by preferences.delegate(
         PREF_QUALITY_KEY,
         PREF_QUALITY_DEFAULT,
@@ -491,12 +489,10 @@ class Rentaro :
     )
 
     private fun SharedPreferences.clearOldPrefs(): SharedPreferences {
-        val domain = getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)!!
-            .removePrefix("https://")
-        val invalidDomain = domain !in DOMAIN_ENTRIES
-
-        if (invalidDomain) {
-            edit().putString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT).apply()
+        // Remove the domain setting persisted by earlier versions; the
+        // metadata host and player origin are both fixed now.
+        if (contains(PREF_DOMAIN_KEY)) {
+            edit().remove(PREF_DOMAIN_KEY).apply()
         }
 
         // Drop server names removed from the catalog; restore defaults
@@ -515,15 +511,6 @@ class Rentaro :
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.addListPreference(
-            key = PREF_DOMAIN_KEY,
-            title = "Preferred Domain",
-            entries = DOMAIN_ENTRIES.toList(),
-            entryValues = DOMAIN_VALUES.toList(),
-            default = PREF_DOMAIN_DEFAULT,
-            summary = "%s",
-        )
-
         screen.addListPreference(
             key = PREF_QUALITY_KEY,
             title = "Preferred Quality",
@@ -616,10 +603,18 @@ class Rentaro :
         private const val MIN_VOTES_FOR_RATING_SORT = "200"
         private const val MIN_VOTES_FOR_RECENT_SORT = "50"
 
+        // Where "Open in browser" sends the user. TMDB ids are native here.
+        private const val TMDB_WEB_URL = "https://www.themoviedb.org"
+
+        // Hosts accepted when a URL is pasted into search. Kept in sync with
+        // the intent filter in AndroidManifest.xml.
+        private val DEEP_LINK_HOSTS = setOf(
+            "www.themoviedb.org",
+            "themoviedb.org",
+        )
+
+        // Retained only so the stale value can be purged from existing installs.
         private const val PREF_DOMAIN_KEY = "pref_domain"
-        private val DOMAIN_ENTRIES = arrayOf("www.rentaro.at", "www.cineplay.to", "www.fmovies.gd")
-        private val DOMAIN_VALUES = DOMAIN_ENTRIES.map { "https://$it" }
-        private val PREF_DOMAIN_DEFAULT = DOMAIN_VALUES.first()
 
         private const val PREF_LATEST_KEY = "pref_latest"
         private const val PREF_LATEST_DEFAULT = "movie"

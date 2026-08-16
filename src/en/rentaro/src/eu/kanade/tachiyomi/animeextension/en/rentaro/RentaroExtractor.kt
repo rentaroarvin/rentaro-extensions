@@ -53,18 +53,12 @@ class RentaroExtractor(
         val lastFailureAtMillis: Long,
     )
 
-    private fun getOrigin(url: String, stripWww: Boolean = true): String {
-        val origin = url.toHttpUrl().run { "$scheme://$host" }
-        return if (stripWww) origin.replace("://www.", "://") else origin
-    }
-
     @RequiresApi(Build.VERSION_CODES.N)
     suspend fun videosFromUrl(
         path: String,
         title: String,
         year: String,
         imdbId: String,
-        baseUrl: String,
         enabledServers: Set<String>,
         subLimit: Int,
         qualityPref: String,
@@ -81,11 +75,11 @@ class RentaroExtractor(
             return emptyList()
         }
 
-        // API headers use full domain (preserving www. if present)
-        val apiOrigin = getOrigin(baseUrl, stripWww = false)
+        // The Videasy backends ignore Referer/Origin entirely, but the stream
+        // CDNs allowlist the player origin, so send it on every request.
         val backendHeaders = headers.newBuilder()
-            .set("Referer", "$apiOrigin/")
-            .set("Origin", apiOrigin)
+            .set("Referer", "$PLAYER_ORIGIN/")
+            .set("Origin", PLAYER_ORIGIN)
             .build()
 
         val seed = client.newCall(
@@ -110,7 +104,7 @@ class RentaroExtractor(
                 resultCache.get(cacheKey)?.takeIf { it.expiresAtMillis > now }
             }
             if (cached != null) {
-                return@parallelCatchingFlatMap buildVideos(server, cached.result, baseUrl, subLimit)
+                return@parallelCatchingFlatMap buildVideos(server, cached.result, subLimit)
             }
 
             try {
@@ -148,7 +142,7 @@ class RentaroExtractor(
                     resultCache.put(cacheKey, CachedResult(decrypted, now + CACHE_TTL_MS))
                 }
                 serverFailureState.remove(stateKey)
-                buildVideos(server, decrypted, baseUrl, subLimit)
+                buildVideos(server, decrypted, subLimit)
             } catch (e: Throwable) {
                 serverFailureState.merge(
                     stateKey,
@@ -243,7 +237,6 @@ class RentaroExtractor(
     private fun buildVideos(
         server: VideasyServer,
         decrypted: VideasyDecryptedResult,
-        baseUrl: String,
         subLimit: Int,
     ): List<Video> {
         val subtitles = decrypted.subtitles
@@ -254,12 +247,11 @@ class RentaroExtractor(
             }
             .take(subLimit.coerceAtLeast(0))
 
-        // Use full domain (preserve www.) for video headers — some CDNs
-        // (especially Jett's shegu.net) are sensitive to the exact Referer.
-        val streamOrigin = getOrigin(baseUrl, stripWww = false)
+        // Stream CDNs allowlist the player origin: some reject a missing
+        // Referer with 403, and all reject an unrecognised one.
         val videoHeaders = headers.newBuilder()
-            .set("Referer", "$streamOrigin/")
-            .set("Origin", streamOrigin)
+            .set("Referer", "$PLAYER_ORIGIN/")
+            .set("Origin", PLAYER_ORIGIN)
             .build()
 
         val filteredSources = decrypted.sources?.let { sources ->
@@ -401,6 +393,13 @@ class RentaroExtractor(
     }
 
     companion object {
+        /**
+         * Origin the stream CDNs allowlist. Verified: the strict CDNs return
+         * 403 with no Referer or an unknown one, and 206 with this value.
+         * Not user-configurable — an unrecognised origin breaks playback.
+         */
+        private const val PLAYER_ORIGIN = "https://player.videasy.to"
+
         private const val VIDEASY_API_BASE = "https://api.speedracelight.com"
         private const val DECRYPTION_API_URL = "https://enc-dec.app/api/dec-videasy"
         private const val HEX = "0123456789ABCDEF"
