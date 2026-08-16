@@ -1,60 +1,40 @@
+<div align="center">
+
+| Install on Aniyomi | Install on Anikku | Build |
+|:------------------:|:-----------------:|:-----:|
+| [![Install](https://img.shields.io/badge/Click%20here%20to%20install%20repo-gray?style=flat&labelColor=red)](https://intradeus.github.io/http-protocol-redirector/?r=aniyomi://add-repo?url=https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json) | [![Install](https://img.shields.io/badge/Click%20here%20to%20install%20repo-gray?style=flat&labelColor=red)](https://intradeus.github.io/http-protocol-redirector/?r=anikku://add-repo?url=https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json) | ![CI](https://github.com/rentaroarvin/rentaro-extensions/actions/workflows/build_push.yml/badge.svg) |
+
+</div>
+
 # Rentaro Extensions
 
-Source code for a personal Aniyomi / Anikku extension. Metadata comes from
-TMDB; playback is resolved through the Videasy backend.
+This repository contains a personal extension catalogue for the
+[Anikku](https://github.com/komikku-app/anikku) or
+[Aniyomi](https://github.com/aniyomiorg/aniyomi) forks.
 
-> Personal hobby repo. Not affiliated with Aniyomi, Mihon, or any content
-> provider, and not intended for public distribution.
+## How to add the repo
 
-## Installation
+* Tap one of the install buttons above, or
+* Copy & paste the following URL into **Settings → Browse → Extension repos → Add**:
 
-Add the extension repo URL in your app under
-**Settings → Browse → Extension repos → Add**:
-
-```
+```html
 https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json
 ```
 
-Then go to **Browse → Extensions** and install **Rentaro**. Enable
-**Show NSFW sources** in settings if the extension does not appear, since it is
-flagged `nsfw=1`.
+Then install **Rentaro** from **Browse → Extensions**. Enable **Show NSFW
+sources** in settings if it does not appear in the list.
 
-Supported clients: Aniyomi, Anikku, and forks that read the Tachiyomi-style
-extension index.
+### Manual downloads
 
-APKs can also be installed manually from
-[`apk/`](https://github.com/rentaroarvin/rentaro-repo/tree/repo/apk).
-
-## Repositories
-
-| Repo | Branch | Purpose |
-| --- | --- | --- |
-| [rentaro-extensions](https://github.com/rentaroarvin/rentaro-extensions) | `main` | Kotlin source, Gradle build, CI |
-| [rentaro-repo](https://github.com/rentaroarvin/rentaro-repo) | `repo` | Published index, APKs, icons |
-
-CI builds signed APKs on every push to `main`, regenerates the index, and
-pushes it to the index repo via a write-scoped deploy key.
+If you prefer to directly download the APK files, they are available in the
+[`repo` branch](https://github.com/rentaroarvin/rentaro-repo/tree/repo/apk) of
+the index repository.
 
 ## Sources
 
-| Name | Lang | Metadata | Streams |
-| --- | --- | --- | --- |
-| Rentaro | en | TMDB v3 (keyless mirror) | Videasy |
-
-### How it works
-
-1. **Catalogue** — Browsing, search, filters, and episode lists come from a
-   TMDB v3 mirror. It is API-compatible with `api.themoviedb.org/3`
-   (`/trending`, `/discover`, `/search`, `/{type}/{id}`, `/tv/{id}/season/{n}`)
-   but injects the API key server-side, so no key ships in the APK.
-2. **Seed** — A short-lived token (~30 s TTL) is fetched per title.
-3. **Sources** — Nine Videasy backends are queried in parallel with a
-   double-percent-encoded title and `enc=2`, returning an encrypted payload.
-4. **Decrypt** — The payload is decrypted, then HLS/DASH master playlists are
-   expanded into individual quality variants with subtitles attached.
-
-Results are cached briefly per title, and a circuit breaker skips backends that
-fail repeatedly.
+| Name | Language |
+| --- | --- |
+| Rentaro | en |
 
 ## Building
 
@@ -65,38 +45,39 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@21
 echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties
 
 ./gradlew :src:en:rentaro:assembleDebug     # unsigned, for local testing
-./gradlew assembleRelease                   # signed, needs the values below
+./gradlew assembleRelease                   # signed
 ```
 
 Release signing reads `signingkey.jks` from the repo root plus the `ALIAS`,
-`KEY_STORE_PASSWORD`, and `KEY_PASSWORD` environment variables. The keystore is
-gitignored and stored in CI as the base64 secret `SIGNING_KEY`.
+`KEY_STORE_PASSWORD`, and `KEY_PASSWORD` environment variables.
 
-To regenerate the index locally after a release build:
-
-```bash
-python3 .github/scripts/create-repo.py   # writes repo/
-```
-
-## Layout
-
-```
-gradle/build-logic/   kei.plugins.* Gradle plugins
-core/                 keiyoushi.utils helpers
-lib/playlistutils/    HLS/DASH playlist expansion
-common/               shared manifest + ProGuard rules
-src/en/rentaro/       the extension
-.github/              CI workflow and index generator
-```
-
+Pushing to `main` builds signed APKs and publishes the index automatically.
 Bumping `extVersionCode` in `src/en/rentaro/build.gradle` is what signals an
 update to clients.
 
-> Renaming a source or changing its `lang` changes its generated ID and orphans
-> existing library entries.
+## License
 
-## Credits
+    Copyright 2015 Javier Tomás
 
-Build infrastructure and the stream-resolution logic are derived from
-[yuzono/anime-extensions](https://github.com/yuzono/anime-extensions)
-(Apache-2.0). See [LICENSE](LICENSE).
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+Build infrastructure and source code are derived from
+[yuzono/anime-extensions](https://github.com/yuzono/anime-extensions).
+
+## Disclaimer
+
+This project does not have any affiliation with the content providers available.
+
+This project is not affiliated with Anikku/Aniyomi. Don't ask for help about
+these extensions at the official support means of Anikku/Aniyomi. All credits to
+the codebase goes to the original contributors.
