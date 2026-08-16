@@ -24,6 +24,7 @@ import keiyoushi.utils.parallelCatchingMapNotNull
 import keiyoushi.utils.parallelMapNotNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -53,45 +54,64 @@ class Rentaro :
     private val extractor by lazy { RentaroExtractor(client, headers) }
 
     // ============================== Popular ===============================
-    override fun popularAnimeRequest(page: Int): Request {
-        val url = apiUrl.toHttpUrl().newBuilder().apply {
-            addPathSegment("trending")
-            addPathSegment("all")
-            addPathSegment("week")
-            addQueryParameter("language", "en-US")
-            addQueryParameter("page", page.toString())
-        }.build()
-        return GET(url)
-    }
+    override fun popularAnimeRequest(page: Int): Request = GET(tabUrl(preferences.popularListPref, PREF_POPULAR_DEFAULT, page))
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseMediaPage(response)
 
-    // =============================== Latest ===============================
-    override suspend fun getLatestUpdates(page: Int): AnimesPage {
-        val types = if (preferences.latestPref == "movie") listOf("movie", "tv") else listOf("tv", "movie")
-
-        return types.parallelCatchingMapNotNull { mediaType ->
-            client.newCall(latestUpdatesRequest(page, mediaType))
-                .awaitSuccess()
-                .use { latestUpdatesParse(it) }
-        }.let { animePages ->
-            val animes = animePages.flatMap { it.animes }
-            val hasNextPage = animePages.any { it.hasNextPage }
-            AnimesPage(animes, hasNextPage)
-        }
+    /**
+     * Resolves a tab preference to a list endpoint. Both tabs point at real
+     * TMDB lists, so a single request is enough; [RentaroFilters.KEY_RECENT]
+     * is the one exception and is handled by [getLatestUpdates].
+     */
+    private fun tabUrl(key: String, fallbackKey: String, page: Int): HttpUrl {
+        val path = RentaroFilters.listByKey(key)?.path
+            ?: RentaroFilters.listByKey(fallbackKey)?.path
+            ?: listOf("trending", "all", "week")
+        return listUrl(path, page)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
+    // =============================== Latest ===============================
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        val key = preferences.latestListPref
+        // "Recently Released" has no list endpoint: it merges two discover
+        // queries sorted by release date.
+        if (key == RentaroFilters.KEY_RECENT) {
+            val types = if (preferences.latestPref == "movie") {
+                listOf("movie", "tv")
+            } else {
+                listOf("tv", "movie")
+            }
+            return types.parallelCatchingMapNotNull { mediaType ->
+                client.newCall(recentlyReleasedRequest(page, mediaType))
+                    .awaitSuccess()
+                    .use { latestUpdatesParse(it) }
+            }.let { animePages ->
+                AnimesPage(
+                    animePages.flatMap { it.animes },
+                    animePages.any { it.hasNextPage },
+                )
+            }
+        }
 
-    private fun latestUpdatesRequest(page: Int, mediaType: String): Request {
+        return client.newCall(latestUpdatesRequest(page))
+            .awaitSuccess()
+            .use { latestUpdatesParse(it) }
+    }
+
+    override fun latestUpdatesRequest(page: Int): Request = GET(tabUrl(preferences.latestListPref, PREF_LATEST_LIST_DEFAULT, page))
+
+    /** Newest releases that already aired, with a vote floor to drop noise. */
+    private fun recentlyReleasedRequest(page: Int, mediaType: String): Request {
+        val isMovie = mediaType == "movie"
+        val dateField = if (isMovie) "primary_release_date" else "first_air_date"
         val url = apiUrl.toHttpUrl().newBuilder().apply {
             addPathSegment("discover")
             addPathSegment(mediaType)
             addQueryParameter("language", "en-US")
-            addQueryParameter("sort_by", "primary_release_date.desc")
+            addQueryParameter("sort_by", "$dateField.desc")
             addQueryParameter("page", page.toString())
-            addQueryParameter("vote_count.gte", "50")
-            addQueryParameter("primary_release_date.lte", today())
+            addQueryParameter("vote_count.gte", MIN_VOTES_FOR_RECENT_SORT)
+            addQueryParameter("$dateField.lte", today())
         }.build()
         return GET(url)
     }
@@ -142,8 +162,15 @@ class Rentaro :
         val isAnimes = typeIndex == RentaroFilters.TYPE_ANIMES
         val isAll = typeIndex == RentaroFilters.TYPE_ALL
 
+        val listIndex = filters.filterIsInstance<RentaroFilters.ListFilter>()
+            .firstOrNull()?.state ?: 0
+        val selectedList = RentaroFilters.BROWSE_LISTS.getOrNull(listIndex)
+
         val rawPages: List<PageDto<MediaItemDto>> = if (query.isNotBlank() && isAll) {
             listOfNotNull(fetchMediaPage(textSearchRequest(page, query, "multi")))
+        } else if (query.isBlank() && selectedList?.path != null) {
+            // A ready-made TMDB list; filters other than Type don't apply.
+            listOfNotNull(fetchMediaPage(GET(listUrl(selectedList.path, page))))
         } else {
             val mediaTypes: List<String> = when (typeIndex) {
                 RentaroFilters.TYPE_MOVIES -> listOf("movie")
@@ -153,6 +180,8 @@ class Rentaro :
             mediaTypes.parallelMapNotNull { mediaType ->
                 val request = if (query.isNotBlank()) {
                     textSearchRequest(page, query, mediaType)
+                } else if (selectedList?.key == RentaroFilters.KEY_RECENT) {
+                    recentlyReleasedRequest(page, mediaType)
                 } else {
                     discoverRequest(page, mediaType, filters, animesOnly = isAnimes)
                 }
@@ -164,11 +193,28 @@ class Rentaro :
         if (query.isNotBlank() && isAll) {
             items = items.filter { it.mediaType == "movie" || it.mediaType == "tv" }
         }
+        // Ready-made lists ignore the discover params, so honour Type here.
+        if (query.isBlank() && selectedList?.path != null) {
+            items = when (typeIndex) {
+                RentaroFilters.TYPE_MOVIES -> items.filter(::isMovieItem)
+                RentaroFilters.TYPE_TV, RentaroFilters.TYPE_ANIMES -> items.filterNot(::isMovieItem)
+                else -> items
+            }
+        }
         if (isAnimes) items = items.filter(::isLikelyAnime)
         val hasNextPage = rawPages.any { it.page < it.totalPages }
 
         return AnimesPage(items.map(::mediaItemToSAnime), hasNextPage)
     }
+
+    /** Curated list endpoints omit `media_type`; fall back to the title field. */
+    private fun isMovieItem(media: MediaItemDto): Boolean = media.mediaType?.let { it == "movie" } ?: (media.title != null)
+
+    private fun listUrl(path: List<String>, page: Int): HttpUrl = apiUrl.toHttpUrl().newBuilder().apply {
+        path.forEach(::addPathSegment)
+        addQueryParameter("language", "en-US")
+        addQueryParameter("page", page.toString())
+    }.build()
 
     private suspend fun fetchMediaPage(request: Request): PageDto<MediaItemDto>? = runCatching {
         client.newCall(request).awaitSuccess()
@@ -196,19 +242,13 @@ class Rentaro :
         filters: AnimeFilterList,
         animesOnly: Boolean,
     ): Request {
+        val isMovie = mediaType == "movie"
+
         val sortIndex = filters.filterIsInstance<RentaroFilters.SortFilter>()
             .firstOrNull()?.state ?: RentaroFilters.SORT_POPULAR
-        val sortBy = when (sortIndex) {
-            RentaroFilters.SORT_RATING -> "vote_average.desc"
-            RentaroFilters.SORT_RECENT -> if (mediaType == "movie") {
-                "primary_release_date.desc"
-            } else {
-                "first_air_date.desc"
-            }
-            else -> "popularity.desc"
-        }
+        val sortBy = RentaroFilters.sortValue(sortIndex, isMovie)
 
-        val genreMap = if (mediaType == "movie") {
+        val genreMap = if (isMovie) {
             RentaroFilters.MOVIE_GENRE_MAP
         } else {
             RentaroFilters.TV_GENRE_MAP
@@ -221,7 +261,62 @@ class Rentaro :
         val genreIds = if (animesOnly) (listOf("16") + userGenres).distinct() else userGenres
         val genreParam = genreIds.joinToString(",")
 
+        val excluded = filters.filterIsInstance<RentaroFilters.ExcludeGenreFilter>()
+            .firstOrNull()?.state
+            ?.filter { it.state }
+            ?.mapNotNull { genreMap[it.name] }
+            ?.filterNot { it in genreIds }
+            .orEmpty()
+            .joinToString(",")
+
         val providers = filters.filterIsInstance<RentaroFilters.WatchProviderFilter>()
+            .firstOrNull()?.state
+            ?.filter { it.state }
+            ?.joinToString("|") { it.id }
+            .orEmpty()
+
+        val monetization = filters.filterIsInstance<RentaroFilters.MonetizationFilter>()
+            .firstOrNull()?.state
+            ?.withIndex()
+            ?.filter { it.value.state }
+            ?.mapNotNull { RentaroFilters.MONETIZATION_TYPES.getOrNull(it.index)?.second }
+            .orEmpty()
+            .joinToString("|")
+
+        val regionIndex = filters.filterIsInstance<RentaroFilters.RegionFilter>()
+            .firstOrNull()?.state ?: 0
+        val region = RentaroFilters.REGIONS.getOrNull(regionIndex)?.second ?: "US"
+
+        val languageIndex = filters.filterIsInstance<RentaroFilters.LanguageFilter>()
+            .firstOrNull()?.state ?: 0
+        val language = RentaroFilters.LANGUAGES.getOrNull(languageIndex)?.second.orEmpty()
+
+        val year = filters.filterIsInstance<RentaroFilters.YearFilter>()
+            .firstOrNull()?.state?.trim().orEmpty()
+            .takeIf { it.length == 4 && it.all(Char::isDigit) }
+            .orEmpty()
+
+        val minRatingIndex = filters.filterIsInstance<RentaroFilters.MinRatingFilter>()
+            .firstOrNull()?.state ?: 0
+        val minRating = RentaroFilters.MIN_RATINGS.getOrNull(minRatingIndex).orEmpty()
+
+        val runtimeIndex = filters.filterIsInstance<RentaroFilters.RuntimeFilter>()
+            .firstOrNull()?.state ?: 0
+        val runtime = RentaroFilters.RUNTIME_RANGES.getOrNull(runtimeIndex)
+
+        val certIndex = filters.filterIsInstance<RentaroFilters.CertificationFilter>()
+            .firstOrNull()?.state ?: 0
+        val certification = RentaroFilters.CERTIFICATIONS.getOrNull(certIndex).orEmpty()
+
+        val statusIndex = filters.filterIsInstance<RentaroFilters.SeriesStatusFilter>()
+            .firstOrNull()?.state ?: 0
+        val seriesStatus = RentaroFilters.SERIES_STATUS.getOrNull(statusIndex).orEmpty()
+
+        val seriesTypeIndex = filters.filterIsInstance<RentaroFilters.SeriesTypeFilter>()
+            .firstOrNull()?.state ?: 0
+        val seriesType = RentaroFilters.SERIES_TYPES.getOrNull(seriesTypeIndex).orEmpty()
+
+        val networks = filters.filterIsInstance<RentaroFilters.NetworkFilter>()
             .firstOrNull()?.state
             ?.filter { it.state }
             ?.joinToString("|") { it.id }
@@ -233,19 +328,61 @@ class Rentaro :
             addQueryParameter("sort_by", sortBy)
             addQueryParameter("language", "en-US")
             addQueryParameter("page", page.toString())
+
             if (genreParam.isNotBlank()) addQueryParameter("with_genres", genreParam)
-            if (animesOnly) addQueryParameter("with_original_language", "ja")
-            if (providers.isNotBlank()) {
-                addQueryParameter("with_watch_providers", providers)
-                addQueryParameter("watch_region", "US")
+            if (excluded.isNotBlank()) addQueryParameter("without_genres", excluded)
+
+            // "Animes only" already pins the original language to Japanese.
+            if (animesOnly) {
+                addQueryParameter("with_original_language", "ja")
+            } else if (language.isNotBlank()) {
+                addQueryParameter("with_original_language", language)
             }
-            when (sortIndex) {
-                RentaroFilters.SORT_RATING -> {
+
+            if (year.isNotBlank()) {
+                val yearField = if (isMovie) "primary_release_year" else "first_air_date_year"
+                addQueryParameter(yearField, year)
+            }
+
+            if (minRating.isNotBlank()) {
+                addQueryParameter("vote_average.gte", minRating)
+                // Without a vote floor, a single 10/10 vote outranks everything.
+                addQueryParameter("vote_count.gte", MIN_VOTES_FOR_RATING_SORT)
+            }
+
+            // Availability filters are meaningless without a region.
+            if (providers.isNotBlank() || monetization.isNotBlank()) {
+                addQueryParameter("watch_region", region)
+                if (providers.isNotBlank()) addQueryParameter("with_watch_providers", providers)
+                if (monetization.isNotBlank()) {
+                    addQueryParameter("with_watch_monetization_types", monetization)
+                }
+            }
+
+            if (isMovie) {
+                runtime?.let { (min, max) ->
+                    min?.let { addQueryParameter("with_runtime.gte", it) }
+                    max?.let { addQueryParameter("with_runtime.lte", it) }
+                }
+                if (certification.isNotBlank()) {
+                    addQueryParameter("certification_country", "US")
+                    addQueryParameter("certification", certification)
+                }
+            } else {
+                if (seriesStatus.isNotBlank()) addQueryParameter("with_status", seriesStatus)
+                if (seriesType.isNotBlank()) addQueryParameter("with_type", seriesType)
+                if (networks.isNotBlank()) addQueryParameter("with_networks", networks)
+            }
+
+            // Rating sorts need a floor; date sorts need an upper bound so
+            // unreleased titles don't fill the first pages.
+            when {
+                RentaroFilters.sortNeedsVoteFloor(sortIndex) && minRating.isBlank() -> {
                     addQueryParameter("vote_count.gte", MIN_VOTES_FOR_RATING_SORT)
                 }
-                RentaroFilters.SORT_RECENT -> {
+                RentaroFilters.sortIsByDate(sortIndex) -> {
                     addQueryParameter("vote_count.gte", MIN_VOTES_FOR_RECENT_SORT)
-                    val dateField = if (mediaType == "movie") {
+                    val dateField = if (isMovie) {
                         "primary_release_date.lte"
                     } else {
                         "first_air_date.lte"
@@ -471,6 +608,14 @@ class Rentaro :
     }
 
     // ============================== Settings ==============================
+    private val SharedPreferences.popularListPref by preferences.delegate(
+        PREF_POPULAR_KEY,
+        PREF_POPULAR_DEFAULT,
+    )
+    private val SharedPreferences.latestListPref by preferences.delegate(
+        PREF_LATEST_LIST_KEY,
+        PREF_LATEST_LIST_DEFAULT,
+    )
     private val SharedPreferences.qualityPref by preferences.delegate(
         PREF_QUALITY_KEY,
         PREF_QUALITY_DEFAULT,
@@ -512,6 +657,24 @@ class Rentaro :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         screen.addListPreference(
+            key = PREF_POPULAR_KEY,
+            title = "'Popular' Tab Shows",
+            entries = RentaroFilters.TAB_LISTS.map { it.label },
+            entryValues = RentaroFilters.TAB_LISTS.map { it.key },
+            default = PREF_POPULAR_DEFAULT,
+            summary = "%s",
+        )
+
+        screen.addListPreference(
+            key = PREF_LATEST_LIST_KEY,
+            title = "'Latest' Tab Shows",
+            entries = RentaroFilters.TAB_LISTS.map { it.label },
+            entryValues = RentaroFilters.TAB_LISTS.map { it.key },
+            default = PREF_LATEST_LIST_DEFAULT,
+            summary = "%s",
+        )
+
+        screen.addListPreference(
             key = PREF_QUALITY_KEY,
             title = "Preferred Quality",
             entries = listOf("2160p", "1080p", "720p", "480p", "360p"),
@@ -522,11 +685,11 @@ class Rentaro :
 
         screen.addListPreference(
             key = PREF_LATEST_KEY,
-            title = "Preferred 'Latest' Page",
+            title = "Prioritise in mixed lists",
             entries = listOf("Movies", "TV Shows"),
             entryValues = listOf("movie", "tv"),
             default = PREF_LATEST_DEFAULT,
-            summary = "%s",
+            summary = "Which type comes first when both are shown. Current: %s",
         )
 
         screen.addEditTextPreference(
@@ -615,6 +778,13 @@ class Rentaro :
 
         // Retained only so the stale value can be purged from existing installs.
         private const val PREF_DOMAIN_KEY = "pref_domain"
+
+        // Which TMDB list each browse tab shows.
+        private const val PREF_POPULAR_KEY = "pref_popular_list"
+        private const val PREF_POPULAR_DEFAULT = "trending_all_week"
+
+        private const val PREF_LATEST_LIST_KEY = "pref_latest_list"
+        private const val PREF_LATEST_LIST_DEFAULT = RentaroFilters.KEY_RECENT
 
         private const val PREF_LATEST_KEY = "pref_latest"
         private const val PREF_LATEST_DEFAULT = "movie"
