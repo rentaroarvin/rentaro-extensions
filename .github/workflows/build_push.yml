@@ -1,0 +1,115 @@
+name: Build & Publish
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  INDEX_REPO: rentaroarvin/rentaro-repo
+  INDEX_BRANCH: repo
+
+jobs:
+  build:
+    name: Build extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare signing key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          printf '%s' "$SIGNING_KEY" | base64 -d > signingkey.jks
+          chmod 600 signingkey.jks
+
+      - name: Build release APKs
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Verify signatures
+        run: |
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)"
+          for apk in src/*/*/build/outputs/apk/release/*.apk; do
+            echo "== $apk"
+            "$BUILD_TOOLS/apksigner" verify --print-certs "$apk" | grep 'certificate DN'
+          done
+
+      - name: Generate repo index
+        run: python3 .github/scripts/create-repo.py
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f signingkey.jks
+
+      - name: Upload index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-index
+          path: repo/
+          retention-days: 3
+
+  publish:
+    name: Publish to index repo
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download index artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: repo-index
+          path: staged
+
+      - name: Checkout index repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INDEX_REPO }}
+          ref: ${{ env.INDEX_BRANCH }}
+          ssh-key: ${{ secrets.REPO_SSH_KEY }}
+          path: index
+          fetch-depth: 0
+
+      - name: Sync files
+        run: |
+          rm -rf index/apk index/icon
+          mkdir -p index/apk index/icon
+          cp -R staged/apk/. index/apk/
+          cp -R staged/icon/. index/icon/
+          cp staged/index.json staged/index.min.json staged/repo.json index/
+
+      - name: Commit and push
+        working-directory: index
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          git commit -m "Update repo from ${GITHUB_SHA::7}"
+          git push origin HEAD:${{ env.INDEX_BRANCH }}
