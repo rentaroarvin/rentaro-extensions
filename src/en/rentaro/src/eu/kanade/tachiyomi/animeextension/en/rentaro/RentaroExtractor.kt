@@ -385,7 +385,7 @@ class RentaroExtractor(
         return parts.joinToString(" · ")
     }
 
-    // ======================== Nexus (Vega) backend ========================
+    // ======================== Nexus (Art) backend ========================
 
     private val nexusJson = Json { ignoreUnknownKeys = true }
 
@@ -553,7 +553,7 @@ class RentaroExtractor(
      * tracks display as seven identical rows.
      */
     private fun nexusLabel(serverName: String, quality: String, url: String): String {
-        val parts = mutableListOf("$NEXUS_NAME/$serverName")
+        val parts = mutableListOf("$NEXUS_NAME/${shortenNexusServer(serverName)}")
 
         val resolution = qualityRegex.find(quality)?.groupValues?.get(1)
         when {
@@ -589,6 +589,24 @@ class RentaroExtractor(
         }
         return parts.joinToString(" · ")
     }
+
+    /**
+     * Trims the trailing tag from a Nexus server name, e.g.
+     *
+     *     "MbPly-[Multi-Lang]"      -> "MbPly"
+     *     "Nitro - [Multi-Lang]"    -> "Nitro"
+     *     "FlyVid (FHD)"            -> "FlyVid"
+     *
+     * The tag is redundant next to the per-entry language and resolution the
+     * label already carries. The separator varies between names, so it is
+     * consumed along with the bracket rather than left dangling, and names
+     * without a tag ("4k-Hub") keep their own hyphens intact.
+     */
+    private fun shortenNexusServer(name: String): String = NEXUS_SERVER_TAG_REGEX.replace(name, "")
+        .trim()
+        .trimEnd('-')
+        .trim()
+        .ifBlank { name }
 
     private fun randomSalt(): String = (1..NEXUS_SALT_LENGTH).map { NEXUS_SALT_ALPHABET.random() }.joinToString("")
 
@@ -858,7 +876,7 @@ class RentaroExtractor(
 
         // Nexus: third independent backend (web.nxsha.app). Encrypted API, no
         // external decryption service needed.
-        private const val NEXUS_NAME = "Vega"
+        private const val NEXUS_NAME = "Art"
         private const val NEXUS_API_BASE = "https://web.nxsha.app"
         private const val NEXUS_ORIGIN = "https://web.nxsha.app"
 
@@ -894,6 +912,13 @@ class RentaroExtractor(
 
         /** Matches a size tag such as "20.26 GB" or "643.3 MB". */
         private val NEXUS_SIZE_REGEX = Regex("""\d+(\.\d+)?\s*[MG]B""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Matches a trailing "[Multi-Lang]" or "(FHD)" tag on a Nexus server
+         * name, together with whatever separator precedes it. Verified against
+         * all 27 names the backend has been seen to return.
+         */
+        private val NEXUS_SERVER_TAG_REGEX = Regex("""\s*[-–]?\s*[\[(][^\])]*[\])]\s*$""")
 
         private const val NEXUS_SALT_LENGTH = 10
         private const val NEXUS_SALT_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
