@@ -687,6 +687,13 @@ class RentaroExtractor(
         val SERVER_DISPLAY_NAMES: List<String> =
             VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME
 
+        /**
+         * Servers kept in the catalogue but not enabled by default: they resolve
+         * sources yet the returned streams do not play. Flagged in the picker so
+         * enabling one is a deliberate choice.
+         */
+        val EXPERIMENTAL_SERVERS: Set<String> = setOf(VIDLINK_NAME)
+
         /** Audio-language hint shown per server in the preference list. */
         fun audioLabelFor(displayName: String): String = when (displayName) {
             VIDLINK_NAME -> "Original"

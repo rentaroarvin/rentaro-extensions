@@ -651,12 +651,19 @@ class Rentaro :
             // in once, tracked by key so it happens exactly one time each.
             val pendingOptIn = NEW_SERVERS_OPT_IN.filterNot { (key, _) -> getBoolean(key, false) }
             val added = pendingOptIn.flatMap { (_, names) -> names }.filter { it in knownServers }
-            val healed = (validServers + added).ifEmpty { PREF_SERVERS_DEFAULT }
+            // Conversely, a server force-enabled by an earlier version cannot be
+            // pruned once it turns out to be broken, because the name is still
+            // valid. Withdraw those once, on the same one-shot basis.
+            val pendingOptOut = WITHDRAWN_SERVERS_OPT_OUT
+                .filterNot { (key, _) -> getBoolean(key, false) }
+            val removed = pendingOptOut.flatMap { (_, names) -> names }.toSet()
+            val healed = (validServers + added - removed).ifEmpty { PREF_SERVERS_DEFAULT }
 
-            if (healed != storedServers || pendingOptIn.isNotEmpty()) {
+            if (healed != storedServers || pendingOptIn.isNotEmpty() || pendingOptOut.isNotEmpty()) {
                 edit().apply {
                     putStringSet(PREF_SERVERS_KEY, healed)
                     pendingOptIn.forEach { (key, _) -> putBoolean(key, true) }
+                    pendingOptOut.forEach { (key, _) -> putBoolean(key, true) }
                 }.apply()
             }
         }
@@ -720,7 +727,12 @@ class Rentaro :
             key = PREF_SERVERS_KEY,
             title = "Enabled Servers",
             entries = RentaroExtractor.SERVER_DISPLAY_NAMES.map { name ->
-                "$name (${RentaroExtractor.audioLabelFor(name)})"
+                val suffix = if (name in RentaroExtractor.EXPERIMENTAL_SERVERS) {
+                    " - experimental"
+                } else {
+                    ""
+                }
+                "$name (${RentaroExtractor.audioLabelFor(name)})$suffix"
             },
             entryValues = RentaroExtractor.SERVER_DISPLAY_NAMES,
             default = PREF_SERVERS_DEFAULT,
@@ -805,7 +817,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse")
+            setOf("Yoru", "Cypher", "Breach", "Vyse")
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.
@@ -816,8 +828,19 @@ class Rentaro :
          * it is in [PREF_SERVERS_DEFAULT]. Each key is set once so a user who
          * deliberately turns the server off is not overridden again.
          */
-        private val NEW_SERVERS_OPT_IN = listOf(
-            "pref_optin_orion" to setOf("Orion"),
+        private val NEW_SERVERS_OPT_IN = emptyList<Pair<String, Set<String>>>()
+
+        /**
+         * Servers withdrawn from the defaults, keyed by a one-shot marker.
+         *
+         * Orion (VidLink) resolves sources correctly but the returned files do
+         * not play, so it is no longer enabled out of the box. v6 and v7 had
+         * force-enabled it, and pruning cannot undo that because the name is
+         * still valid, so it is switched off once here. Anyone who wants to
+         * keep testing it can re-enable it and will not be overridden again.
+         */
+        private val WITHDRAWN_SERVERS_OPT_OUT = listOf(
+            "pref_optout_orion" to setOf("Orion"),
         )
     }
 }
