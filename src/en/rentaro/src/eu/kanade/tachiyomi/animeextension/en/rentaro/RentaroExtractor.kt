@@ -1119,29 +1119,31 @@ class RentaroExtractor(
         )
 
         /**
-         * Coverage at or above which a scraper ships enabled. Set so anything
-         * that answered for more than one probe title is on: those requests are
-         * issued in parallel, so the cost of a miss is small next to losing a
-         * source the backend actually holds.
+         * Scrapers enabled out of the box, chosen by hand rather than derived
+         * from [NexusProvider.hitRate].
+         *
+         * The hit rate only counts how many probe titles a scraper answered
+         * for, which says nothing about whether the answer plays. Following
+         * each source through to real media bytes showed the two are largely
+         * unrelated: Nitro looks healthy and returns a well-formed playlist
+         * whose every segment is an ad CDN, while several 2/4 scrapers serve
+         * genuine files. This list is the set that actually delivered video.
          */
-        private const val NEXUS_DEFAULT_MIN_HITS = 2
-
-        /**
-         * Scrapers enabled out of the box. The ones left off returned nothing
-         * for any probe title, or only one; they stay in the list to be
-         * switched on deliberately rather than costing a request every episode.
-         */
-        val NEXUS_PROVIDER_DEFAULT: Set<String> =
-            NEXUS_PROVIDERS.filter { it.hitRate >= NEXUS_DEFAULT_MIN_HITS }
-                .map { it.scraper }
-                .toSet()
+        val NEXUS_PROVIDER_DEFAULT: Set<String> = setOf(
+            "castle", // CastVid  - HLS
+            "vidapi", // VidPi    - HLS, needs no Referer
+            "bkl-blast", // MbBlast  - MKV
+            "mhbox", // MhPly    - DASH, what the site's own player uses
+            "stvv", // Stvvid   - MP4
+            "k4khdhub", // 4k-Hub   - MKV, the only 2160p source
+        )
 
         /** Entry labels for the provider preference, ordered as the list is. */
         fun nexusProviderEntries(): List<String> = NEXUS_PROVIDERS.map { provider ->
-            val note = when (provider.hitRate) {
-                0 -> " - no sources when tested"
-                in 1 until NEXUS_DEFAULT_MIN_HITS -> " - few titles"
-                else -> ""
+            val note = when {
+                provider.scraper in NEXUS_PROVIDER_DEFAULT -> ""
+                provider.hitRate == 0 -> " - no sources when tested"
+                else -> " - did not play when tested"
             }
             "${provider.label}$note"
         }

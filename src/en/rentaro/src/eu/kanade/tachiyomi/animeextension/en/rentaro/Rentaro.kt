@@ -673,6 +673,18 @@ class Rentaro :
             }
         }
 
+        // The Art provider default was first derived from how many probe titles
+        // each scraper answered for, which turned out not to track whether the
+        // source plays. Following each one through to real media bytes produced
+        // a different set, so the stored selection is reset once to match. Keyed
+        // so a later hand-picked selection is never overridden again.
+        if (!getBoolean(PREF_NEXUS_PROVIDERS_RESET_KEY, false)) {
+            edit().apply {
+                putStringSet(PREF_NEXUS_PROVIDERS_KEY, RentaroExtractor.NEXUS_PROVIDER_DEFAULT)
+                putBoolean(PREF_NEXUS_PROVIDERS_RESET_KEY, true)
+            }.apply()
+        }
+
         return this
     }
 
@@ -838,6 +850,13 @@ class Rentaro :
             setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
+
+        /**
+         * One-shot marker for resetting the Art provider selection to the
+         * playback-verified default. Set once so a later hand-picked selection
+         * survives future updates.
+         */
+        private const val PREF_NEXUS_PROVIDERS_RESET_KEY = "pref_nexus_providers_reset_v2"
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.
