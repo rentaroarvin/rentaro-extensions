@@ -273,7 +273,9 @@ data class NexusSourceDto(
     val quality: String? = null,
     val label: String? = null,
     val type: String? = null,
-    // Sent as a string ("False"/"True") rather than a JSON boolean.
-    val isEmbed: String? = null,
+    // A real JSON boolean. Declaring this as a String makes kotlinx.serialization
+    // reject the whole response, since `ignoreUnknownKeys` tolerates unexpected
+    // fields but never a mismatched type.
+    val isEmbed: Boolean? = null,
     val headers: Map<String, String>? = null,
 )

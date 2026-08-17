@@ -498,7 +498,7 @@ class RentaroExtractor(
         return sourcesDto.sources.mapNotNull { source ->
             val url = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             // Embeds are player pages, not streams.
-            if (source.isEmbed.equals("True", ignoreCase = true)) return@mapNotNull null
+            if (source.isEmbed == true) return@mapNotNull null
             // Verified against the live API: these answer text/html landing
             // pages rather than media, so they would only fail in the player.
             if (NEXUS_LANDING_MARKERS.any { it in url }) return@mapNotNull null
