@@ -646,9 +646,18 @@ class Rentaro :
         if (storedServers != null) {
             val knownServers = RentaroExtractor.SERVER_DISPLAY_NAMES.toSet()
             val validServers = storedServers.intersect(knownServers)
-            if (validServers != storedServers) {
-                val healed = validServers.ifEmpty { PREF_SERVERS_DEFAULT }
-                edit().putStringSet(PREF_SERVERS_KEY, healed).apply()
+            // Pruning alone can only shrink the set, so newly added servers
+            // would stay switched off forever on an existing install. Opt those
+            // in once, tracked by key so it happens exactly one time each.
+            val pendingOptIn = NEW_SERVERS_OPT_IN.filterNot { (key, _) -> getBoolean(key, false) }
+            val added = pendingOptIn.flatMap { (_, names) -> names }.filter { it in knownServers }
+            val healed = (validServers + added).ifEmpty { PREF_SERVERS_DEFAULT }
+
+            if (healed != storedServers || pendingOptIn.isNotEmpty()) {
+                edit().apply {
+                    putStringSet(PREF_SERVERS_KEY, healed)
+                    pendingOptIn.forEach { (key, _) -> putBoolean(key, true) }
+                }.apply()
             }
         }
 
@@ -797,5 +806,18 @@ class Rentaro :
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
             setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse")
+
+        /**
+         * Servers added after the initial release, keyed by a one-shot marker.
+         *
+         * Healing the stored set only intersects it with the known catalogue,
+         * which can remove names but never add them. Without this, a server
+         * introduced later stays disabled on every existing install even though
+         * it is in [PREF_SERVERS_DEFAULT]. Each key is set once so a user who
+         * deliberately turns the server off is not overridden again.
+         */
+        private val NEW_SERVERS_OPT_IN = listOf(
+            "pref_optin_orion" to setOf("Orion"),
+        )
     }
 }
