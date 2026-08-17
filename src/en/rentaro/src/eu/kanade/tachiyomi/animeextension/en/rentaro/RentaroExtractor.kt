@@ -13,6 +13,8 @@ import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -93,49 +95,66 @@ class RentaroExtractor(
             .set("Origin", PLAYER_ORIGIN)
             .build()
 
-        val videasyVideos = if (eligibleServers.isEmpty()) {
-            emptyList()
-        } else {
-            videasyVideos(
-                eligibleServers,
-                path,
-                title,
-                year,
-                imdbId,
-                tmdbId,
-                seasonId,
-                episodeId,
-                isMovie,
-                backendHeaders,
-                subLimit,
-            )
-        }
-
-        // VidLink is an independent backend, so a Videasy-wide failure (a bad
-        // seed, enc-dec.app being down) must not take it with it.
+        // The three backends are unrelated services, so they are resolved
+        // concurrently: the wait becomes the slowest of them rather than their
+        // sum. Each keeps its own failure handling, since they differ.
         //
-        // Only IOException is absorbed here. A blanket catch previously hid a
-        // NoSuchFieldError thrown during token class-init on older devices, so
-        // the server silently vanished instead of surfacing the fault.
-        val vidLinkVideos = if (!vidLinkEnabled) {
-            emptyList()
-        } else {
-            try {
-                vidLinkVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
-            } catch (e: IOException) {
-                emptyList()
+        // Servers *within* a backend were already parallel; it was only these
+        // three that ran one after another.
+        val (videasyVideos, vidLinkVideos, nexusVideos) = coroutineScope {
+            val videasyTask = async {
+                if (eligibleServers.isEmpty()) {
+                    emptyList()
+                } else {
+                    videasyVideos(
+                        eligibleServers,
+                        path,
+                        title,
+                        year,
+                        imdbId,
+                        tmdbId,
+                        seasonId,
+                        episodeId,
+                        isMovie,
+                        backendHeaders,
+                        subLimit,
+                    )
+                }
             }
-        }
 
-        // Nexus is a third independent backend with its own encrypted API.
-        val nexusVideos = if (!nexusEnabled) {
-            emptyList()
-        } else {
-            try {
-                nexusVideos(tmdbId, imdbId, seasonId, episodeId, isMovie, enabledNexusProviders)
-            } catch (_: IOException) {
-                emptyList()
+            // VidLink is an independent backend, so a Videasy-wide failure (a
+            // bad seed, enc-dec.app being down) must not take it with it.
+            //
+            // Only IOException is absorbed here. A blanket catch previously hid
+            // a NoSuchFieldError thrown during token class-init on older
+            // devices, so the server silently vanished instead of surfacing the
+            // fault.
+            val vidLinkTask = async {
+                if (!vidLinkEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        vidLinkVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+                    } catch (e: IOException) {
+                        emptyList()
+                    }
+                }
             }
+
+            // Nexus is a third independent backend with its own encrypted API.
+            val nexusTask = async {
+                if (!nexusEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        nexusVideos(tmdbId, imdbId, seasonId, episodeId, isMovie, enabledNexusProviders)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            }
+
+            Triple(videasyTask.await(), vidLinkTask.await(), nexusTask.await())
         }
 
         // Grouped by server, best quality first inside each group.
