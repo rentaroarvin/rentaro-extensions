@@ -855,8 +855,11 @@ class Rentaro :
          * One-shot marker for resetting the Art provider selection to the
          * playback-verified default. Set once so a later hand-picked selection
          * survives future updates.
+         *
+         * Bumped when the default itself changes, since the previous marker is
+         * already spent on installs that took the earlier set.
          */
-        private const val PREF_NEXUS_PROVIDERS_RESET_KEY = "pref_nexus_providers_reset_v2"
+        private const val PREF_NEXUS_PROVIDERS_RESET_KEY = "pref_nexus_providers_reset_v3"
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.

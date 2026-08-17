@@ -1123,27 +1123,56 @@ class RentaroExtractor(
          * from [NexusProvider.hitRate].
          *
          * The hit rate only counts how many probe titles a scraper answered
-         * for, which says nothing about whether the answer plays. Following
-         * each source through to real media bytes showed the two are largely
-         * unrelated: Nitro looks healthy and returns a well-formed playlist
-         * whose every segment is an ad CDN, while several 2/4 scrapers serve
-         * genuine files. This list is the set that actually delivered video.
+         * for, which says nothing about whether the answer plays. Every entry
+         * below was followed through to real media bytes across two titles;
+         * the counts are how many of its sources returned video. Providers
+         * offer several mirrors, so a single dead one does not condemn the
+         * scraper — checking only the first source is what made some of these
+         * look broken earlier.
          */
         val NEXUS_PROVIDER_DEFAULT: Set<String> = setOf(
-            "castle", // CastVid  - HLS
-            "vidapi", // VidPi    - HLS, needs no Referer
-            "bkl-blast", // MbBlast  - MKV
-            "mhbox", // MhPly    - DASH, what the site's own player uses
-            "stvv", // Stvvid   - MP4
-            "k4khdhub", // 4k-Hub   - MKV, the only 2160p source
+            "castle", // CastVid - HLS, 9/9 sources
+            "streamflix", // StremFx - MKV, 2/2
+            "bkl-blast", // MbBlast - MKV, 3/3
+            "mhbox", // MhPly   - DASH, 3/3, what the site's own player uses
+            "k4khdhub", // 4k-Hub  - MKV, 5/14, the only 2160p source
+            "vidapi", // VidPi   - HLS, 4/6, rejects a Referer
+            "stvv", // Stvvid  - MP4, 4/6
+            "hdhub4u", // 4k-bk   - MKV, 2/3
+            "holly", // Lolly   - MP4, 1/5
+            "ophim", // Ophm    - kept by request; 0/3 when tested
+        )
+
+        /**
+         * Scrapers that returned no playable source for any probe title, so a
+         * note can distinguish "off by choice" from "known not to work".
+         */
+        private val NEXUS_KNOWN_DEAD = setOf(
+            "nitro", // valid playlist, every segment an ad CDN
+            "watchout",
+            "imovr",
+            "awsind",
+            "rive-citadel",
+            "yomovies",
+            "rive-primevids",
+            "mbox",
+            "rive-flowcast",
+            "rive-hindicast",
+            "rive-asiacloud",
+            "levi",
+            "toonstream",
+            "tamilblasters",
+            "filmyfly",
+            "rive-guru",
+            "em-8",
         )
 
         /** Entry labels for the provider preference, ordered as the list is. */
         fun nexusProviderEntries(): List<String> = NEXUS_PROVIDERS.map { provider ->
             val note = when {
                 provider.scraper in NEXUS_PROVIDER_DEFAULT -> ""
-                provider.hitRate == 0 -> " - no sources when tested"
-                else -> " - did not play when tested"
+                provider.scraper in NEXUS_KNOWN_DEAD -> " - no video when tested"
+                else -> ""
             }
             "${provider.label}$note"
         }
