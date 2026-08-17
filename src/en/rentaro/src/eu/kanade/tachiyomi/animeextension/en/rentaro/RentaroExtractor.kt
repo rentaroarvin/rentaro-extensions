@@ -67,6 +67,7 @@ class RentaroExtractor(
         enabledServers: Set<String>,
         subLimit: Int,
         qualityPref: String,
+        enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
     ): List<Video> {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
@@ -130,7 +131,7 @@ class RentaroExtractor(
             emptyList()
         } else {
             try {
-                nexusVideos(tmdbId, imdbId, seasonId, episodeId, isMovie)
+                nexusVideos(tmdbId, imdbId, seasonId, episodeId, isMovie, enabledNexusProviders)
             } catch (_: IOException) {
                 emptyList()
             }
@@ -424,6 +425,10 @@ class RentaroExtractor(
      * Nexus is a third independent backend, encrypted symmetrically in both
      * directions. /api/servers lists the scrapers carrying the title and
      * /api/sources resolves each one to direct files.
+     *
+     * Only the scrapers named in [enabledProviders] are resolved. The backend
+     * advertises 27 and each is a separate upstream request, so resolving all
+     * of them costs a burst of traffic for providers that mostly answer 404.
      */
     private suspend fun nexusVideos(
         tmdbId: String,
@@ -431,7 +436,10 @@ class RentaroExtractor(
         seasonId: String,
         episodeId: String,
         isMovie: Boolean,
+        enabledProviders: Set<String>,
     ): List<Video> {
+        if (enabledProviders.isEmpty()) return emptyList()
+
         val tmdbInt = tmdbId.toIntOrNull() ?: return emptyList()
         val type = if (isMovie) "movie" else "tv"
 
@@ -453,6 +461,7 @@ class RentaroExtractor(
         val serversJson = NexusCrypto.decode(envelope.hash ?: return emptyList())
             ?: return emptyList()
         val servers = nexusJson.decodeFromString<NexusServersDto>(serversJson).servers
+            .filter { it.scraper != null && it.scraper in enabledProviders }
         if (servers.isEmpty()) return emptyList()
 
         // Every scraper proxies a different upstream site, so one being down or
@@ -962,6 +971,79 @@ class RentaroExtractor(
 
         /** Matches a size tag such as "20.26 GB" or "643.3 MB". */
         private val NEXUS_SIZE_REGEX = Regex("""\d+(\.\d+)?\s*[MG]B""", RegexOption.IGNORE_CASE)
+
+        /**
+         * The scrapers the Nexus backend advertises, each a separate upstream
+         * site reached by its own request.
+         *
+         * `scraper` is the wire value /api/sources expects; `label` is the
+         * backend's own display name with its redundant tag trimmed.
+         *
+         * `hitRate` is how many of four probe titles (two films, two episodes)
+         * the scraper returned a playable source for. It measures catalogue
+         * coverage, not reliability: a scraper answering for two of four simply
+         * carries fewer titles, and works normally for those it has.
+         */
+        val NEXUS_PROVIDERS = listOf(
+            NexusProvider("holly", "Lolly", 4),
+            NexusProvider("castle", "CastVid", 4),
+            NexusProvider("ophim", "Ophm", 4),
+            NexusProvider("yomovies", "StreamX", 4),
+            NexusProvider("vidapi", "VidPi", 4),
+            NexusProvider("streamflix", "StremFx", 4),
+            NexusProvider("nitro", "Nitro", 3),
+            NexusProvider("bkl-blast", "MbBlast", 3),
+            NexusProvider("rive-citadel", "Citadel", 3),
+            NexusProvider("watchout", "Multi-bill", 3),
+            NexusProvider("rive-primevids", "Prvibd", 3),
+            NexusProvider("imovr", "Topflix", 3),
+            NexusProvider("awsind", "AwsPly", 3),
+            NexusProvider("k4khdhub", "4k-Hub", 3),
+            // The only DASH provider, and the one the site's own player uses.
+            NexusProvider("mhbox", "MhPly", 2),
+            NexusProvider("mbox", "MbPly", 2),
+            NexusProvider("stvv", "Stvvid", 2),
+            NexusProvider("hdhub4u", "4k-bk", 2),
+            NexusProvider("rive-flowcast", "River", 1),
+            NexusProvider("rive-hindicast", "HindiSk", 1),
+            NexusProvider("rive-asiacloud", "AsiaLug", 0),
+            NexusProvider("levi", "Hevily", 0),
+            NexusProvider("toonstream", "TunWatch", 0),
+            NexusProvider("tamilblasters", "TamBlast", 0),
+            NexusProvider("filmyfly", "FlyVid", 0),
+            NexusProvider("rive-guru", "Gbru", 0),
+            NexusProvider("em-8", "VidHindi", 0),
+        )
+
+        /**
+         * Coverage at or above which a scraper ships enabled. Set so anything
+         * that answered for more than one probe title is on: those requests are
+         * issued in parallel, so the cost of a miss is small next to losing a
+         * source the backend actually holds.
+         */
+        private const val NEXUS_DEFAULT_MIN_HITS = 2
+
+        /**
+         * Scrapers enabled out of the box. The ones left off returned nothing
+         * for any probe title, or only one; they stay in the list to be
+         * switched on deliberately rather than costing a request every episode.
+         */
+        val NEXUS_PROVIDER_DEFAULT: Set<String> =
+            NEXUS_PROVIDERS.filter { it.hitRate >= NEXUS_DEFAULT_MIN_HITS }
+                .map { it.scraper }
+                .toSet()
+
+        /** Entry labels for the provider preference, ordered as the list is. */
+        fun nexusProviderEntries(): List<String> = NEXUS_PROVIDERS.map { provider ->
+            val note = when (provider.hitRate) {
+                0 -> " - no sources when tested"
+                in 1 until NEXUS_DEFAULT_MIN_HITS -> " - few titles"
+                else -> ""
+            }
+            "${provider.label}$note"
+        }
+
+        fun nexusProviderValues(): List<String> = NEXUS_PROVIDERS.map { it.scraper }
 
         /**
          * Matches a trailing "[Multi-Lang]" or "(FHD)" tag on a Nexus server

@@ -604,6 +604,7 @@ class Rentaro :
             subLimit = preferences.subLimitPref.toIntOrNull()
                 ?: PREF_SUB_LIMIT_DEFAULT.toInt(),
             qualityPref = preferences.qualityPref,
+            enabledNexusProviders = preferences.enabledNexusProviders,
         )
     }
 
@@ -631,6 +632,10 @@ class Rentaro :
     private val SharedPreferences.enabledServerNames: Set<String> by preferences.delegate(
         PREF_SERVERS_KEY,
         PREF_SERVERS_DEFAULT,
+    )
+    private val SharedPreferences.enabledNexusProviders: Set<String> by preferences.delegate(
+        PREF_NEXUS_PROVIDERS_KEY,
+        RentaroExtractor.NEXUS_PROVIDER_DEFAULT,
     )
 
     private fun SharedPreferences.clearOldPrefs(): SharedPreferences {
@@ -738,6 +743,19 @@ class Rentaro :
             default = PREF_SERVERS_DEFAULT,
             summary = "Select servers to enable. Languages shown per server.",
         )
+
+        // Art fans out to its backend's own scrapers, each a separate upstream
+        // request, so they are selectable rather than all-or-nothing.
+        screen.addSetPreference(
+            key = PREF_NEXUS_PROVIDERS_KEY,
+            title = "Art Providers",
+            entries = RentaroExtractor.nexusProviderEntries(),
+            entryValues = RentaroExtractor.nexusProviderValues(),
+            default = RentaroExtractor.NEXUS_PROVIDER_DEFAULT,
+            summary = "Which providers Art queries. Each is a separate request, " +
+                "so enabling every one slows the video list. Only applies when " +
+                "Art is enabled above.",
+        )
     }
 
     // ============================= Utilities ==============================
@@ -818,6 +836,8 @@ class Rentaro :
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
             setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art")
+
+        private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.

@@ -254,6 +254,22 @@ data class NexusServersDto(
     val servers: List<NexusServerDto> = emptyList(),
 )
 
+/**
+ * One selectable Nexus scraper.
+ *
+ * Not a wire type: this is the local catalogue backing the provider
+ * preference, so the picker can be built without first calling the API.
+ *
+ * @param scraper value /api/sources expects as its `provider`
+ * @param label backend display name, redundant tag trimmed
+ * @param hitRate how many of four probe titles returned a playable source
+ */
+data class NexusProvider(
+    val scraper: String,
+    val label: String,
+    val hitRate: Int,
+)
+
 @Serializable
 data class NexusServerDto(
     val id: JsonPrimitive? = null,
