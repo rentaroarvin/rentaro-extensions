@@ -204,11 +204,22 @@ data class VidLinkResponseDto(
 @Serializable
 data class VidLinkStreamDto(
     val type: String? = null,
-    // Adaptive variant: one master playlist.
+    // Adaptive variant: one master playlist (HLS .m3u8 or DASH .mpd).
     val playlist: String? = null,
     // Progressive variant: quality label ("720") -> file entry.
     val qualities: Map<String, VidLinkQualityDto>? = null,
     val captions: List<VidLinkCaptionDto> = emptyList(),
+    // Signed CloudFront cookie required by the DASH CDN. Without it the
+    // manifest and every segment return 403.
+    val playlistHeaders: Map<String, String>? = null,
+    val playbackMetadata: VidLinkPlaybackMetadataDto? = null,
+)
+
+@Serializable
+data class VidLinkPlaybackMetadataDto(
+    val format: String? = null,
+    val codecName: String? = null,
+    val resolutions: List<String> = emptyList(),
 )
 
 @Serializable

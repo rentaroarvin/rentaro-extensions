@@ -817,7 +817,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Breach", "Vyse")
+            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse")
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.
@@ -828,7 +828,11 @@ class Rentaro :
          * it is in [PREF_SERVERS_DEFAULT]. Each key is set once so a user who
          * deliberately turns the server off is not overridden again.
          */
-        private val NEW_SERVERS_OPT_IN = emptyList<Pair<String, Set<String>>>()
+        private val NEW_SERVERS_OPT_IN = listOf(
+            // v8 withdrew Orion while its playback was broken; the DASH fix
+            // makes it work, so switch it back on once.
+            "pref_optin_orion_dash" to setOf("Orion"),
+        )
 
         /**
          * Servers withdrawn from the defaults, keyed by a one-shot marker.
@@ -839,8 +843,6 @@ class Rentaro :
          * still valid, so it is switched off once here. Anyone who wants to
          * keep testing it can re-enable it and will not be overridden again.
          */
-        private val WITHDRAWN_SERVERS_OPT_OUT = listOf(
-            "pref_optout_orion" to setOf("Orion"),
-        )
+        private val WITHDRAWN_SERVERS_OPT_OUT = emptyList<Pair<String, Set<String>>>()
     }
 }

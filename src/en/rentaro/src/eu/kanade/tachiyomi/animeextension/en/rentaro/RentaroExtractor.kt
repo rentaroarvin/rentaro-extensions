@@ -242,14 +242,10 @@ class RentaroExtractor(
         val apiHeaders = headers.newBuilder()
             .set("Referer", "$VIDLINK_ORIGIN/")
             .set("Origin", VIDLINK_ORIGIN)
-            .build()
-
-        // The stream CDN is a different property to the API and allowlists its
-        // own origin, not vidlink.pro. Sending the API's Referer here gets the
-        // request rejected, so playback needs a separate header set.
-        val streamHeaders = headers.newBuilder()
-            .set("Referer", "$VIDLINK_CDN_ORIGIN/")
-            .set("Origin", VIDLINK_CDN_ORIGIN)
+            // Without this the API answers with progressive HEVC MP4s whose CDN
+            // rejects direct requests. With it, the same call returns a DASH
+            // manifest plus the signed cookie needed to fetch it.
+            .set("X-Playback-Environment", VIDLINK_PLAYBACK_ENV)
             .build()
 
         val body = client.newCall(GET(url.toString(), apiHeaders))
@@ -269,7 +265,40 @@ class RentaroExtractor(
             }
             .take(subLimit.coerceAtLeast(0))
 
+        // The CDN authorises by signed CloudFront cookie, not by Referer: the
+        // manifest and every segment 403 without it. Header names are copied
+        // verbatim from the response so a future addition is picked up too.
+        val streamHeaders = headers.newBuilder().apply {
+            stream.playlistHeaders.orEmpty().forEach { (name, value) ->
+                set(name, value)
+            }
+        }.build()
+
         stream.playlist?.takeIf { it.isNotBlank() }?.let { playlist ->
+            val meta = stream.playbackMetadata
+            val isDash = stream.type.equals("dash", ignoreCase = true) ||
+                meta?.format.equals("DASH", ignoreCase = true) ||
+                playlist.endsWith(".mpd", ignoreCase = true)
+
+            // PlaylistUtils parses HLS only; a DASH manifest is handed to the
+            // player whole, which resolves its own representations.
+            if (isDash) {
+                val label = meta?.resolutions
+                    ?.mapNotNull(String::toIntOrNull)
+                    ?.maxOrNull()
+                    ?.let { "${it}p" }
+                    ?: "Auto"
+                return listOf(
+                    Video(
+                        url = playlist,
+                        quality = vidLinkLabel(label, playlist, subtitles.size, meta?.codecName),
+                        videoUrl = playlist,
+                        headers = streamHeaders,
+                        subtitleTracks = subtitles,
+                    ),
+                )
+            }
+
             val expanded = runCatching {
                 playlistUtils.extractFromHls(
                     playlistUrl = playlist,
@@ -296,7 +325,13 @@ class RentaroExtractor(
         }
 
         // Progressive files: each quality is directly playable, so there is no
-        // playlist to expand.
+        // playlist to expand. These carry no signed cookie, so the CDN needs the
+        // player origin as Referer instead.
+        val progressiveHeaders = headers.newBuilder()
+            .set("Referer", "$VIDLINK_CDN_ORIGIN/")
+            .set("Origin", VIDLINK_CDN_ORIGIN)
+            .build()
+
         return stream.qualities.orEmpty()
             .mapNotNull { (label, entry) ->
                 val videoUrl = entry.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -305,7 +340,7 @@ class RentaroExtractor(
                     url = videoUrl,
                     quality = vidLinkLabel(quality, videoUrl, subtitles.size, entry.codecName),
                     videoUrl = videoUrl,
-                    headers = streamHeaders,
+                    headers = progressiveHeaders,
                     subtitleTracks = subtitles,
                 )
             }
@@ -583,9 +618,18 @@ class RentaroExtractor(
         private const val VIDLINK_ORIGIN = "https://vidlink.pro"
 
         /**
-         * Origin the stream CDN (hakunaymatata.com) allowlists. It is a separate
-         * property to the API and rejects vidlink.pro as a Referer, so playback
-         * requests must carry this instead.
+         * Sent as `X-Playback-Environment` on the API call. The site's own
+         * player sends this, and it changes the response substantially:
+         * without it the API returns progressive HEVC MP4s on a CDN that
+         * rejects direct requests, with it a DASH manifest plus the signed
+         * CloudFront cookie needed to fetch it. Captured from a working
+         * browser session and confirmed against the live API.
+         */
+        private const val VIDLINK_PLAYBACK_ENV = "dash-hevc"
+
+        /**
+         * Origin the progressive-file CDN allowlists. Only used for the
+         * `qualities` fallback, since the DASH path authorises by cookie.
          */
         private const val VIDLINK_CDN_ORIGIN = "https://filmboom.top"
 
@@ -692,7 +736,7 @@ class RentaroExtractor(
          * sources yet the returned streams do not play. Flagged in the picker so
          * enabling one is a deliberate choice.
          */
-        val EXPERIMENTAL_SERVERS: Set<String> = setOf(VIDLINK_NAME)
+        val EXPERIMENTAL_SERVERS: Set<String> = emptySet()
 
         /** Audio-language hint shown per server in the preference list. */
         fun audioLabelFor(displayName: String): String = when (displayName) {
