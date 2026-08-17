@@ -137,15 +137,41 @@ class RentaroExtractor(
             }
         }
 
-        return (videasyVideos + vidLinkVideos + nexusVideos).sortedWith(
-            compareByDescending<Video> {
-                it.quality.contains(qualityPref, ignoreCase = true) ||
-                    (qualityPref == "2160" && it.quality.contains("4k", ignoreCase = true))
-            }.thenByDescending {
-                extractQualityValue(it.quality)
-            },
-        )
+        // Grouped by server, best quality first inside each group.
+        //
+        // Every label is built as "<server> · <detail>…", so the leading segment
+        // identifies the group. Server order follows the catalogue rather than
+        // the alphabet, which keeps a preferred server near the top instead of
+        // scattering one server's entries through the list. Preferred Quality
+        // then orders entries within a group, not across the whole list.
+        val serverRank = SERVER_ORDER_HINT.withIndex().associate { (index, name) -> name to index }
+
+        return (videasyVideos + vidLinkVideos + nexusVideos)
+            .groupBy { videoServerName(it.quality) }
+            .toList()
+            .sortedBy { (server, _) ->
+                // Art fans out to "Art/<provider>", so rank on the base name and
+                // keep its providers adjacent. Unknown names sort last, stably.
+                serverRank[server.substringBefore('/')] ?: serverRank.size
+            }
+            .flatMap { (_, group) ->
+                group.sortedWith(
+                    compareByDescending<Video> {
+                        it.quality.contains(qualityPref, ignoreCase = true) ||
+                            (qualityPref == "2160" && it.quality.contains("4k", ignoreCase = true))
+                    }.thenByDescending {
+                        extractQualityValue(it.quality)
+                    },
+                )
+            }
     }
+
+    /**
+     * The leading segment of a video label, which every builder sets to the
+     * server that produced the entry. Art keeps its "Art/<provider>" form so
+     * each provider groups separately while staying next to its siblings.
+     */
+    private fun videoServerName(label: String): String = label.substringBefore(" · ").trim()
 
     @RequiresApi(Build.VERSION_CODES.N)
     private suspend fun videasyVideos(
@@ -1152,6 +1178,13 @@ class RentaroExtractor(
          */
         val SERVER_DISPLAY_NAMES: List<String> =
             VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME
+
+        /**
+         * Order the video list groups servers in. Mirrors [SERVER_DISPLAY_NAMES]
+         * so the picker follows the same order as the settings list rather than
+         * the alphabet; a name missing from it sorts last instead of throwing.
+         */
+        private val SERVER_ORDER_HINT: List<String> = SERVER_DISPLAY_NAMES
 
         /**
          * Servers kept in the catalogue but not enabled by default: they resolve
