@@ -817,7 +817,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse")
+            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Vega")
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.
@@ -832,6 +832,8 @@ class Rentaro :
             // v8 withdrew Orion while its playback was broken; the DASH fix
             // makes it work, so switch it back on once.
             "pref_optin_orion_dash" to setOf("Orion"),
+            // Vega (Nexus backend) added in this version.
+            "pref_optin_vega" to setOf("Vega"),
         )
 
         /**

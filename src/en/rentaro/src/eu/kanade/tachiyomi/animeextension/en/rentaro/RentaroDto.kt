@@ -4,6 +4,7 @@ import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNames
+import kotlinx.serialization.json.JsonPrimitive
 
 // ============================== TMDB DTOs ===============================
 @Serializable
@@ -235,4 +236,44 @@ data class VidLinkQualityDto(
 data class VidLinkCaptionDto(
     val url: String? = null,
     val language: String? = null,
+)
+
+// ============================= Nexus =============================
+// Second independent backend. Its API is symmetrically encrypted, so both the
+// request and the response bodies are opaque strings; these model the decrypted
+// JSON rather than the wire format.
+@Serializable
+data class NexusEnvelopeDto(
+    @SerialName("_hash")
+    val hash: String? = null,
+)
+
+@Serializable
+data class NexusServersDto(
+    val servers: List<NexusServerDto> = emptyList(),
+)
+
+@Serializable
+data class NexusServerDto(
+    val id: JsonPrimitive? = null,
+    val name: String? = null,
+    // The value the /api/sources call expects as its `provider`.
+    val scraper: String? = null,
+)
+
+@Serializable
+data class NexusSourcesDto(
+    val sources: List<NexusSourceDto> = emptyList(),
+    val error: String? = null,
+)
+
+@Serializable
+data class NexusSourceDto(
+    val url: String? = null,
+    val quality: String? = null,
+    val label: String? = null,
+    val type: String? = null,
+    // Sent as a string ("False"/"True") rather than a JSON boolean.
+    val isEmbed: String? = null,
+    val headers: Map<String, String>? = null,
 )

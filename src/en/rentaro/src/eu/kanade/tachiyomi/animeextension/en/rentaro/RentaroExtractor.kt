@@ -13,10 +13,14 @@ import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -74,8 +78,9 @@ class RentaroExtractor(
             (!server.movieOnly || isMovie) && server.displayName in enabledServers
         }
         val vidLinkEnabled = VIDLINK_NAME in enabledServers
+        val nexusEnabled = NEXUS_NAME in enabledServers
 
-        if (eligibleServers.isEmpty() && !vidLinkEnabled) {
+        if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled) {
             return emptyList()
         }
 
@@ -120,7 +125,18 @@ class RentaroExtractor(
             }
         }
 
-        return (videasyVideos + vidLinkVideos).sortedWith(
+        // Nexus is a third independent backend with its own encrypted API.
+        val nexusVideos = if (!nexusEnabled) {
+            emptyList()
+        } else {
+            try {
+                nexusVideos(tmdbId, imdbId, seasonId, episodeId, isMovie)
+            } catch (_: IOException) {
+                emptyList()
+            }
+        }
+
+        return (videasyVideos + vidLinkVideos + nexusVideos).sortedWith(
             compareByDescending<Video> {
                 it.quality.contains(qualityPref, ignoreCase = true) ||
                     (qualityPref == "2160" && it.quality.contains("4k", ignoreCase = true))
@@ -368,6 +384,176 @@ class RentaroExtractor(
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
     }
+
+    // ======================== Nexus (Vega) backend ========================
+
+    private val nexusJson = Json { ignoreUnknownKeys = true }
+
+    /**
+     * Builds the plaintext the encrypted `?q=` parameter carries.
+     *
+     * `_req_ts` and `_req_salt` mirror what the site's own client appends; the
+     * backend tolerates them and echoes them back. Assembled through
+     * JsonObject rather than string concatenation so a value needing escaping
+     * cannot produce malformed JSON.
+     */
+    private fun nexusPayload(
+        tmdbId: Int,
+        imdbId: String,
+        type: String,
+        seasonId: String,
+        episodeId: String,
+        provider: String? = null,
+    ): String = buildJsonObject {
+        put("tmdbId", tmdbId)
+        put("imdb_id", imdbId)
+        put("type", type)
+        put("season", seasonId)
+        put("episode", episodeId)
+        put("method", "dl")
+        if (provider != null) put("provider", provider)
+        put("_req_ts", System.currentTimeMillis())
+        put("_req_salt", randomSalt())
+    }.toString()
+
+    /**
+     * Nexus is a third independent backend, encrypted symmetrically in both
+     * directions. /api/servers lists the scrapers carrying the title and
+     * /api/sources resolves each one to direct files.
+     */
+    private suspend fun nexusVideos(
+        tmdbId: String,
+        imdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+    ): List<Video> {
+        val tmdbInt = tmdbId.toIntOrNull() ?: return emptyList()
+        val type = if (isMovie) "movie" else "tv"
+
+        val serversQuery = NexusCrypto.encode(
+            nexusPayload(tmdbInt, imdbId, type, seasonId, episodeId),
+        )
+
+        val nexusHeaders = headers.newBuilder()
+            .set("Referer", "$NEXUS_ORIGIN/")
+            .set("Accept", "application/json")
+            .build()
+
+        val serversUrl = "$NEXUS_API_BASE/api/servers?q=${URLEncoder.encode(serversQuery, "UTF-8")}"
+        val serversBody = client.newCall(GET(serversUrl, nexusHeaders))
+            .awaitSuccess()
+            .bodyString()
+
+        val envelope = nexusJson.decodeFromString<NexusEnvelopeDto>(serversBody)
+        val serversJson = NexusCrypto.decode(envelope.hash ?: return emptyList())
+            ?: return emptyList()
+        val servers = nexusJson.decodeFromString<NexusServersDto>(serversJson).servers
+        if (servers.isEmpty()) return emptyList()
+
+        // Every scraper proxies a different upstream site, so one being down or
+        // slow must not lose the rest.
+        return servers.parallelCatchingFlatMap { server ->
+            nexusSourcesForServer(
+                server,
+                tmdbInt,
+                imdbId,
+                type,
+                seasonId,
+                episodeId,
+                nexusHeaders,
+            )
+        }
+    }
+
+    private suspend fun nexusSourcesForServer(
+        server: NexusServerDto,
+        tmdbId: Int,
+        imdbId: String,
+        type: String,
+        seasonId: String,
+        episodeId: String,
+        nexusHeaders: Headers,
+    ): List<Video> {
+        val provider = server.scraper ?: return emptyList()
+        val serverName = server.name ?: provider
+
+        val sourcesQuery = NexusCrypto.encode(
+            nexusPayload(tmdbId, imdbId, type, seasonId, episodeId, provider),
+        )
+        val sourcesUrl = "$NEXUS_API_BASE/api/sources?q=${URLEncoder.encode(sourcesQuery, "UTF-8")}"
+
+        val sourcesBody = client.newCall(GET(sourcesUrl, nexusHeaders))
+            .awaitSuccess()
+            .bodyString()
+
+        val srcEnvelope = nexusJson.decodeFromString<NexusEnvelopeDto>(sourcesBody)
+        val srcJson = NexusCrypto.decode(srcEnvelope.hash ?: return emptyList())
+            ?: return emptyList()
+        val sourcesDto = nexusJson.decodeFromString<NexusSourcesDto>(srcJson)
+
+        // A provider with no match reports it here rather than by status code.
+        if (!sourcesDto.error.isNullOrBlank()) return emptyList()
+
+        return sourcesDto.sources.mapNotNull { source ->
+            val url = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            // Embeds are player pages, not streams.
+            if (source.isEmbed.equals("True", ignoreCase = true)) return@mapNotNull null
+            // Verified against the live API: these answer text/html landing
+            // pages rather than media, so they would only fail in the player.
+            if (NEXUS_LANDING_MARKERS.any { it in url }) return@mapNotNull null
+
+            val quality = source.quality?.takeIf { it.isNotBlank() }
+                ?: source.label?.takeIf { it.isNotBlank() }
+                ?: "Auto"
+
+            // Most entries carry an empty header map, but honour it when the
+            // backend does specify one.
+            val videoHeaders = source.headers
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { extra ->
+                    headers.newBuilder().apply {
+                        extra.forEach { (name, value) -> set(name, value) }
+                    }.build()
+                }
+                ?: headers
+
+            Video(
+                url = url,
+                quality = nexusLabel(serverName, quality, url),
+                videoUrl = url,
+                headers = videoHeaders,
+            )
+        }
+    }
+
+    /**
+     * Nexus quality strings are verbose (e.g.
+     * "1080p 2.9 GB | Hindi | English | BluRay"), so the resolution is pulled
+     * to the front and any remaining detail truncated to keep the picker
+     * readable.
+     */
+    private fun nexusLabel(serverName: String, quality: String, url: String): String {
+        val parts = mutableListOf("$NEXUS_NAME/$serverName")
+
+        val resolution = qualityRegex.find(quality)?.groupValues?.get(1)
+        when {
+            resolution != null -> parts += "${resolution}p"
+            quality.contains("4k", ignoreCase = true) -> parts += "4K"
+            else -> parts += quality.take(NEXUS_LABEL_LIMIT).trim()
+        }
+
+        val lower = url.lowercase()
+        when {
+            ".m3u8" in lower -> parts += "HLS"
+            ".mpd" in lower -> parts += "DASH"
+            ".mkv" in lower -> parts += "MKV"
+            ".mp4" in lower -> parts += "MP4"
+        }
+        return parts.joinToString(" · ")
+    }
+
+    private fun randomSalt(): String = (1..NEXUS_SALT_LENGTH).map { NEXUS_SALT_ALPHABET.random() }.joinToString("")
 
     private fun pctEncode(s: String): String {
         val bytes = s.toByteArray(Charsets.UTF_8)
@@ -633,6 +819,28 @@ class RentaroExtractor(
          */
         private const val VIDLINK_CDN_ORIGIN = "https://filmboom.top"
 
+        // Nexus: third independent backend (web.nxsha.app). Encrypted API, no
+        // external decryption service needed.
+        private const val NEXUS_NAME = "Vega"
+        private const val NEXUS_API_BASE = "https://web.nxsha.app"
+        private const val NEXUS_ORIGIN = "https://web.nxsha.app"
+
+        /**
+         * Hosts that answer an HTML landing page instead of media. Confirmed
+         * against the live API, where these returned `text/html` for a source
+         * the backend still advertised as a playable file.
+         */
+        private val NEXUS_LANDING_MARKERS = listOf(
+            "hubcloud.cx/?id=",
+            "hubcloud.cx/drive",
+        )
+
+        /** Keeps a verbose Nexus quality string from overflowing the picker. */
+        private const val NEXUS_LABEL_LIMIT = 40
+
+        private const val NEXUS_SALT_LENGTH = 10
+        private const val NEXUS_SALT_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
         private val HEVC_NAMES = setOf("hevc", "h265", "h.265")
 
         // Their token embeds an expiry; the site itself signs ~2 minutes ahead.
@@ -729,7 +937,7 @@ class RentaroExtractor(
          * is appended rather than derived from [VIDEASY_SERVERS].
          */
         val SERVER_DISPLAY_NAMES: List<String> =
-            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME
+            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME
 
         /**
          * Servers kept in the catalogue but not enabled by default: they resolve
@@ -741,6 +949,7 @@ class RentaroExtractor(
         /** Audio-language hint shown per server in the preference list. */
         fun audioLabelFor(displayName: String): String = when (displayName) {
             VIDLINK_NAME -> "Original"
+            NEXUS_NAME -> "Multi-Lang"
             else -> VIDEASY_SERVERS.firstOrNull { it.displayName == displayName }
                 ?.audioLabel ?: "Unknown"
         }
