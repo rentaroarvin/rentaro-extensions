@@ -37,13 +37,22 @@ internal object VidLinkToken {
     private const val NONCE_LEN = 24
     private const val TAG_LEN = 16
 
-    /** 2^130 - 5, the Poly1305 prime. */
-    private val P = BigInteger.TWO.pow(130).subtract(BigInteger.valueOf(5))
+    private val TWO = BigInteger.valueOf(2)
+
+    /**
+     * 2^130 - 5, the Poly1305 prime.
+     *
+     * Built from [BigInteger.ONE], not `BigInteger.TWO`: that constant is only
+     * available from API 33, while extensions target a minSdk of 21. Referencing
+     * it threw NoSuchFieldError during class init on older devices, which the
+     * caller's runCatching swallowed — the server just silently disappeared.
+     */
+    private val P = TWO.pow(130).subtract(BigInteger.valueOf(5))
 
     /** Clamp mask applied to `r`, per RFC 8439. */
     private val R_CLAMP = BigInteger(1, byteArrayOfHex("0ffffffc0ffffffc0ffffffc0fffffff"))
 
-    private val TWO_POW_128 = BigInteger.TWO.pow(128)
+    private val TWO_POW_128 = TWO.pow(128)
 
     fun create(tmdbId: String, expiryEpochSeconds: Long): String {
         val idBytes = tmdbId.toByteArray(Charsets.UTF_8)

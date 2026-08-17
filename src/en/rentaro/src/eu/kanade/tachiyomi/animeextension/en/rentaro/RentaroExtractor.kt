@@ -16,6 +16,7 @@ import keiyoushi.utils.toJsonRequestBody
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -105,12 +106,18 @@ class RentaroExtractor(
 
         // VidLink is an independent backend, so a Videasy-wide failure (a bad
         // seed, enc-dec.app being down) must not take it with it.
+        //
+        // Only IOException is absorbed here. A blanket catch previously hid a
+        // NoSuchFieldError thrown during token class-init on older devices, so
+        // the server silently vanished instead of surfacing the fault.
         val vidLinkVideos = if (!vidLinkEnabled) {
             emptyList()
         } else {
-            runCatching {
+            try {
                 vidLinkVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
-            }.getOrDefault(emptyList())
+            } catch (e: IOException) {
+                emptyList()
+            }
         }
 
         return (videasyVideos + vidLinkVideos).sortedWith(
