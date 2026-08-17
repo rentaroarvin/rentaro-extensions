@@ -239,12 +239,20 @@ class RentaroExtractor(
             addQueryParameter("multiLang", "0")
         }.build()
 
-        val vidLinkHeaders = headers.newBuilder()
+        val apiHeaders = headers.newBuilder()
             .set("Referer", "$VIDLINK_ORIGIN/")
             .set("Origin", VIDLINK_ORIGIN)
             .build()
 
-        val body = client.newCall(GET(url.toString(), vidLinkHeaders))
+        // The stream CDN is a different property to the API and allowlists its
+        // own origin, not vidlink.pro. Sending the API's Referer here gets the
+        // request rejected, so playback needs a separate header set.
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$VIDLINK_CDN_ORIGIN/")
+            .set("Origin", VIDLINK_CDN_ORIGIN)
+            .build()
+
+        val body = client.newCall(GET(url.toString(), apiHeaders))
             .awaitSuccess()
             .bodyString()
             .trim()
@@ -269,8 +277,8 @@ class RentaroExtractor(
                         vidLinkLabel(quality, playlist, subtitles.size)
                     },
                     subtitleList = subtitles,
-                    masterHeaders = vidLinkHeaders,
-                    videoHeaders = vidLinkHeaders,
+                    masterHeaders = streamHeaders,
+                    videoHeaders = streamHeaders,
                 )
             }.getOrDefault(emptyList())
 
@@ -280,7 +288,7 @@ class RentaroExtractor(
                         url = playlist,
                         quality = vidLinkLabel("Auto", playlist, subtitles.size),
                         videoUrl = playlist,
-                        headers = vidLinkHeaders,
+                        headers = streamHeaders,
                         subtitleTracks = subtitles,
                     ),
                 )
@@ -295,22 +303,32 @@ class RentaroExtractor(
                 val quality = if (label.all(Char::isDigit)) "${label}p" else label
                 Video(
                     url = videoUrl,
-                    quality = vidLinkLabel(quality, videoUrl, subtitles.size),
+                    quality = vidLinkLabel(quality, videoUrl, subtitles.size, entry.codecName),
                     videoUrl = videoUrl,
-                    headers = vidLinkHeaders,
+                    headers = streamHeaders,
                     subtitleTracks = subtitles,
                 )
             }
             .sortedByDescending { extractQualityValue(it.quality) }
     }
 
-    private fun vidLinkLabel(quality: String, url: String, subCount: Int): String {
+    private fun vidLinkLabel(
+        quality: String,
+        url: String,
+        subCount: Int,
+        codec: String? = null,
+    ): String {
         val parts = mutableListOf(VIDLINK_NAME, quality)
         val lower = url.lowercase()
         when {
             ".m3u8" in lower -> parts += "HLS"
             ".mp4" in lower -> parts += "MP4"
             ".mkv" in lower -> parts += "MKV"
+        }
+        // HEVC needs hardware support; label it so a failure to play is
+        // attributable rather than mysterious.
+        if (codec != null && HEVC_NAMES.any { codec.equals(it, ignoreCase = true) }) {
+            parts += "HEVC"
         }
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
@@ -563,6 +581,15 @@ class RentaroExtractor(
         private const val VIDLINK_NAME = "Orion"
         private const val VIDLINK_API_BASE = "https://vidlink.pro"
         private const val VIDLINK_ORIGIN = "https://vidlink.pro"
+
+        /**
+         * Origin the stream CDN (hakunaymatata.com) allowlists. It is a separate
+         * property to the API and rejects vidlink.pro as a Referer, so playback
+         * requests must carry this instead.
+         */
+        private const val VIDLINK_CDN_ORIGIN = "https://filmboom.top"
+
+        private val HEVC_NAMES = setOf("hevc", "h265", "h.265")
 
         // Their token embeds an expiry; the site itself signs ~2 minutes ahead.
         private const val VIDLINK_TOKEN_TTL_SECONDS = 120L

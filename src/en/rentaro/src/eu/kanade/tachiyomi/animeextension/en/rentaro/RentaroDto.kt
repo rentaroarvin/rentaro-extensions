@@ -215,6 +215,9 @@ data class VidLinkStreamDto(
 data class VidLinkQualityDto(
     val url: String? = null,
     val type: String? = null,
+    // "hevc"/"h265" files fail on players without hardware support, so the
+    // codec is surfaced in the video label rather than silently offered.
+    val codecName: String? = null,
 )
 
 @Serializable
