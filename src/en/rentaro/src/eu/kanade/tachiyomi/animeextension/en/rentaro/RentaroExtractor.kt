@@ -495,7 +495,7 @@ class RentaroExtractor(
         // A provider with no match reports it here rather than by status code.
         if (!sourcesDto.error.isNullOrBlank()) return emptyList()
 
-        return sourcesDto.sources.mapNotNull { source ->
+        val playable = sourcesDto.sources.mapNotNull { source ->
             val url = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             // Embeds are player pages, not streams.
             if (source.isEmbed == true) return@mapNotNull null
@@ -518,9 +518,22 @@ class RentaroExtractor(
                 }
                 ?: headers
 
+            Triple(url, nexusLabel(serverName, quality, url), videoHeaders)
+        }
+
+        // Distinct releases can still share a label once the same file is
+        // offered on several hosts. Those mirrors are worth keeping as
+        // fallbacks — these hosts die often — but need numbering so they read
+        // as alternates rather than as a glitch.
+        val labelCounts = playable.groupingBy { it.second }.eachCount()
+        val seen = mutableMapOf<String, Int>()
+
+        return playable.map { (url, label, videoHeaders) ->
+            val nth = seen.merge(label, 1, Int::plus)!!
+            val finalLabel = if (labelCounts[label]!! > 1) "$label · $nth" else label
             Video(
                 url = url,
-                quality = nexusLabel(serverName, quality, url),
+                quality = finalLabel,
                 videoUrl = url,
                 headers = videoHeaders,
             )
@@ -528,10 +541,16 @@ class RentaroExtractor(
     }
 
     /**
-     * Nexus quality strings are verbose (e.g.
-     * "1080p 2.9 GB | Hindi | English | BluRay"), so the resolution is pulled
-     * to the front and any remaining detail truncated to keep the picker
-     * readable.
+     * Builds a picker label from a Nexus quality string.
+     *
+     * The two backends word these very differently and both carry the detail
+     * that separates otherwise identical entries, so it has to survive:
+     *
+     *     "Hindi dub : 1080"                              -> 1080p · Hindi dub
+     *     "20.26 GB | 1080p | Hindi | English | BluRay"    -> 1080p · BluRay · 20.26 GB
+     *
+     * Reducing these to the resolution alone made seven different language
+     * tracks display as seven identical rows.
      */
     private fun nexusLabel(serverName: String, quality: String, url: String): String {
         val parts = mutableListOf("$NEXUS_NAME/$serverName")
@@ -542,6 +561,24 @@ class RentaroExtractor(
             quality.contains("4k", ignoreCase = true) -> parts += "4K"
             else -> parts += quality.take(NEXUS_LABEL_LIMIT).trim()
         }
+
+        // "Hindi dub : 1080" style: the audio descriptor precedes the colon and
+        // is the only thing distinguishing these entries from one another.
+        quality.substringBefore(':', "")
+            .takeIf { it.isNotBlank() && it.length <= NEXUS_AUDIO_LIMIT }
+            ?.trim()
+            ?.let { parts += it }
+
+        // "… | 1080p | Hindi | BluRay | x265 …" style: keep the source and codec
+        // tags, which separate a BluRay rip from a WEB-DL of the same height.
+        val tags = quality.split('|').map { it.trim() }
+        NEXUS_RELEASE_TAGS.firstOrNull { tag -> tags.any { it.equals(tag, ignoreCase = true) } }
+            ?.let { parts += it }
+        if (tags.any { it.equals("HEVC", ignoreCase = true) || it.equals("x265", ignoreCase = true) }) {
+            parts += "HEVC"
+        }
+        // Size is what separates the 66 GB, 41 GB and 20 GB releases.
+        tags.firstOrNull { NEXUS_SIZE_REGEX.matches(it) }?.let { parts += it }
 
         val lower = url.lowercase()
         when {
@@ -837,6 +874,26 @@ class RentaroExtractor(
 
         /** Keeps a verbose Nexus quality string from overflowing the picker. */
         private const val NEXUS_LABEL_LIMIT = 40
+
+        /**
+         * Caps the "Hindi dub"-style audio descriptor. Anything longer is not a
+         * language tag but the whole quality string lacking a resolution, which
+         * the fallback branch already handles.
+         */
+        private const val NEXUS_AUDIO_LIMIT = 24
+
+        /** Release-source tags worth surfacing, best-quality first. */
+        private val NEXUS_RELEASE_TAGS = listOf(
+            "BluRay",
+            "WEB-DL",
+            "WEBRip",
+            "HDTS",
+            "HDTV",
+            "CAM",
+        )
+
+        /** Matches a size tag such as "20.26 GB" or "643.3 MB". */
+        private val NEXUS_SIZE_REGEX = Regex("""\d+(\.\d+)?\s*[MG]B""", RegexOption.IGNORE_CASE)
 
         private const val NEXUS_SALT_LENGTH = 10
         private const val NEXUS_SALT_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
