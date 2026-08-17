@@ -18,6 +18,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import java.io.IOException
 import java.net.URLEncoder
@@ -535,27 +536,39 @@ class RentaroExtractor(
         if (!sourcesDto.error.isNullOrBlank()) return emptyList()
 
         val playable = sourcesDto.sources.mapNotNull { source ->
-            val url = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val rawUrl = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             // Embeds are player pages, not streams.
             if (source.isEmbed == true) return@mapNotNull null
             // Verified against the live API: these answer text/html landing
             // pages rather than media, so they would only fail in the player.
-            if (NEXUS_LANDING_MARKERS.any { it in url }) return@mapNotNull null
+            if (NEXUS_LANDING_MARKERS.any { it in rawUrl }) return@mapNotNull null
+
+            val url = sanitiseNexusUrl(rawUrl)
 
             val quality = source.quality?.takeIf { it.isNotBlank() }
                 ?: source.label?.takeIf { it.isNotBlank() }
                 ?: "Auto"
 
-            // Most entries carry an empty header map, but honour it when the
-            // backend does specify one.
-            val videoHeaders = source.headers
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { extra ->
-                    headers.newBuilder().apply {
-                        extra.forEach { (name, value) -> set(name, value) }
-                    }.build()
+            // These CDNs disagree about the Referer, so it is applied per host
+            // rather than globally.
+            //
+            // Verified against the live API: the Cloudflare Worker hosts
+            // (StremFx, Lolly, Stvvid) answer 403 without it and 206 with it, a
+            // wrong value is rejected too, and Origin alone does not help.
+            // VidPi is the opposite — its segment host serves media bare and
+            // 403s once any Referer is present — so sending it unconditionally
+            // trades three broken providers for a different broken one.
+            //
+            // The worker subdomain rotates on every request
+            // (mp4.shafer15c51d, mp4.gyimah15c2da, ...), so the registrable
+            // suffix is the only stable thing to key on. A header map supplied
+            // by the backend still overrides this.
+            val videoHeaders = headers.newBuilder()
+                .apply {
+                    if (needsNexusReferer(url)) set("Referer", "$NEXUS_ORIGIN/")
+                    source.headers?.forEach { (name, value) -> set(name, value) }
                 }
-                ?: headers
+                .build()
 
             NexusCandidate(
                 url = url,
@@ -611,6 +624,18 @@ class RentaroExtractor(
         }
     }
 
+    /**
+     * Whether a Nexus stream host requires the site Referer.
+     *
+     * The Cloudflare Worker hosts allowlist the site origin and answer 403
+     * without it. Other hosts are either indifferent or actively reject it, so
+     * this is deliberately a narrow allowlist rather than a default.
+     */
+    private fun needsNexusReferer(url: String): Boolean {
+        val host = url.toHttpUrlOrNull()?.host ?: return false
+        return NEXUS_REFERER_HOST_SUFFIXES.any { host == it || host.endsWith(".$it") }
+    }
+
     /** A Nexus source that passed filtering, before HLS expansion. */
     private data class NexusCandidate(
         val url: String,
@@ -618,6 +643,30 @@ class RentaroExtractor(
         val videoHeaders: Headers,
         val type: String?,
     )
+
+    /**
+     * Percent-encodes whitespace in a Nexus source URL.
+     *
+     * k4khdhub embeds the release filename in the path unencoded, so the URL
+     * arrives with literal spaces ("…/1397996373/Fight Club (1999) REPACK…").
+     * OkHttp rejects that outright, which made a working provider look dead;
+     * encoding the spaces returns the file. Only whitespace is touched, so an
+     * already-encoded URL is left byte-identical rather than double-encoded.
+     */
+    private fun sanitiseNexusUrl(url: String): String {
+        val trimmed = url.trim()
+        if (trimmed.none(Char::isWhitespace)) return trimmed
+        return buildString(trimmed.length) {
+            trimmed.forEach { c ->
+                when (c) {
+                    ' ' -> append("%20")
+                    '\t' -> append("%09")
+                    '\n', '\r' -> Unit
+                    else -> append(c)
+                }
+            }
+        }
+    }
 
     /**
      * Builds a picker label from a Nexus quality string.
@@ -997,6 +1046,15 @@ class RentaroExtractor(
 
         /** Matches a size tag such as "20.26 GB" or "643.3 MB". */
         private val NEXUS_SIZE_REGEX = Regex("""\d+(\.\d+)?\s*[MG]B""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Stream hosts that require the site Referer, matched on the
+         * registrable suffix because the subdomain rotates per request.
+         *
+         * Kept as an allowlist: VidPi's segment host serves media bare and
+         * rejects the header outright, so this cannot be a global default.
+         */
+        private val NEXUS_REFERER_HOST_SUFFIXES = listOf("workers.dev")
 
         /**
          * The scrapers the Nexus backend advertises, each a separate upstream
