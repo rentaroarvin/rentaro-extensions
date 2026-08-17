@@ -2,7 +2,7 @@
 
 | Install on Aniyomi | Install on Anikku | Build |
 |:------------------:|:-----------------:|:-----:|
-| [![Install](https://img.shields.io/badge/Click%20here%20to%20install%20repo-gray?style=flat&labelColor=red)](https://intradeus.github.io/http-protocol-redirector/?r=aniyomi://add-repo?url=https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json) | [![Install](https://img.shields.io/badge/Click%20here%20to%20install%20repo-gray?style=flat&labelColor=red)](https://intradeus.github.io/http-protocol-redirector/?r=anikku://add-repo?url=https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json) | ![CI](https://github.com/rentaroarvin/rentaro-extensions/actions/workflows/build_push.yml/badge.svg) |
+| [![Install](https://img.shields.io/badge/Click%20here%20to%20install%20repo-gray?style=flat&labelColor=red)](aniyomi://add-repo?url=https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json) | [![Install](https://img.shields.io/badge/Click%20here%20to%20install%20repo-gray?style=flat&labelColor=red)](anikku://add-repo?url=https://raw.githubusercontent.com/rentaroarvin/rentaro-repo/repo/index.min.json) | ![CI](https://github.com/rentaroarvin/rentaro-extensions/actions/workflows/build_push.yml/badge.svg) |
 
 </div>
 
