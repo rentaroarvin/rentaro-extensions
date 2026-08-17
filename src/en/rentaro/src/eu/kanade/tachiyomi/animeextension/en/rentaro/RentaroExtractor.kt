@@ -396,6 +396,11 @@ class RentaroExtractor(
      * backend tolerates them and echoes them back. Assembled through
      * JsonObject rather than string concatenation so a value needing escaping
      * cannot produce malformed JSON.
+     *
+     * Deliberately omits `method`. Sending `method=dl` restricts /api/servers
+     * to the four providers that expose downloadable files; without it the same
+     * call advertises all 27, including the DASH-only ones. The site's own
+     * player sends no `method` here.
      */
     private fun nexusPayload(
         tmdbId: Int,
@@ -410,7 +415,6 @@ class RentaroExtractor(
         put("type", type)
         put("season", seasonId)
         put("episode", episodeId)
-        put("method", "dl")
         if (provider != null) put("provider", provider)
         put("_req_ts", System.currentTimeMillis())
         put("_req_salt", randomSalt())
@@ -518,27 +522,67 @@ class RentaroExtractor(
                 }
                 ?: headers
 
-            Triple(url, nexusLabel(serverName, quality, url), videoHeaders)
+            NexusCandidate(
+                url = url,
+                label = nexusLabel(serverName, quality, url, source.type),
+                videoHeaders = videoHeaders,
+                type = source.type,
+            )
         }
 
         // Distinct releases can still share a label once the same file is
         // offered on several hosts. Those mirrors are worth keeping as
         // fallbacks — these hosts die often — but need numbering so they read
         // as alternates rather than as a glitch.
-        val labelCounts = playable.groupingBy { it.second }.eachCount()
+        val labelCounts = playable.groupingBy { it.label }.eachCount()
         val seen = mutableMapOf<String, Int>()
 
-        return playable.map { (url, label, videoHeaders) ->
-            val nth = seen.merge(label, 1, Int::plus)!!
-            val finalLabel = if (labelCounts[label]!! > 1) "$label · $nth" else label
-            Video(
-                url = url,
-                quality = finalLabel,
-                videoUrl = url,
-                headers = videoHeaders,
+        return playable.flatMap { candidate ->
+            val nth = seen.merge(candidate.label, 1, Int::plus)!!
+            val label = if (labelCounts[candidate.label]!! > 1) {
+                "${candidate.label} · $nth"
+            } else {
+                candidate.label
+            }
+
+            val asSingleFile = listOf(
+                Video(
+                    url = candidate.url,
+                    quality = label,
+                    videoUrl = candidate.url,
+                    headers = candidate.videoHeaders,
+                ),
             )
+
+            // Dropping `method=dl` widened the catalogue from four
+            // download-only providers to all 27, which brought adaptive
+            // playlists with it. A master playlist handed to the player as
+            // though it were a file offers a single unselectable rendition, so
+            // HLS is expanded into its variants here. DASH has no equivalent
+            // parser and is passed through whole for the player to resolve.
+            val isHls = candidate.type.equals("hls", ignoreCase = true) ||
+                candidate.type.equals("m3u8", ignoreCase = true) ||
+                ".m3u8" in candidate.url.lowercase()
+            if (!isHls) return@flatMap asSingleFile
+
+            runCatching {
+                playlistUtils.extractFromHls(
+                    playlistUrl = candidate.url,
+                    videoNameGen = { variant -> "$label · $variant" },
+                    masterHeaders = candidate.videoHeaders,
+                    videoHeaders = candidate.videoHeaders,
+                )
+            }.getOrDefault(emptyList()).ifEmpty { asSingleFile }
         }
     }
+
+    /** A Nexus source that passed filtering, before HLS expansion. */
+    private data class NexusCandidate(
+        val url: String,
+        val label: String,
+        val videoHeaders: Headers,
+        val type: String?,
+    )
 
     /**
      * Builds a picker label from a Nexus quality string.
@@ -552,7 +596,7 @@ class RentaroExtractor(
      * Reducing these to the resolution alone made seven different language
      * tracks display as seven identical rows.
      */
-    private fun nexusLabel(serverName: String, quality: String, url: String): String {
+    private fun nexusLabel(serverName: String, quality: String, url: String, type: String? = null): String {
         val parts = mutableListOf("$NEXUS_NAME/${shortenNexusServer(serverName)}")
 
         val resolution = qualityRegex.find(quality)?.groupValues?.get(1)
@@ -580,13 +624,19 @@ class RentaroExtractor(
         // Size is what separates the 66 GB, 41 GB and 20 GB releases.
         tags.firstOrNull { NEXUS_SIZE_REGEX.matches(it) }?.let { parts += it }
 
+        // The backend's own `type` is authoritative and covers the adaptive
+        // sources whose URL carries no usable extension; the URL is only a
+        // fallback for entries that omit it.
         val lower = url.lowercase()
-        when {
-            ".m3u8" in lower -> parts += "HLS"
-            ".mpd" in lower -> parts += "DASH"
-            ".mkv" in lower -> parts += "MKV"
-            ".mp4" in lower -> parts += "MP4"
+        val container = when {
+            type.equals("mpd", ignoreCase = true) || ".mpd" in lower -> "DASH"
+            type.equals("hls", ignoreCase = true) ||
+                type.equals("m3u8", ignoreCase = true) || ".m3u8" in lower -> "HLS"
+            ".mkv" in lower -> "MKV"
+            ".mp4" in lower || type.equals("mp4", ignoreCase = true) -> "MP4"
+            else -> null
         }
+        if (container != null) parts += container
         return parts.joinToString(" · ")
     }
 

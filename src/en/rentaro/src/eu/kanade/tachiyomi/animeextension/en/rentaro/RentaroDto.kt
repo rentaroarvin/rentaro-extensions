@@ -5,6 +5,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 // ============================== TMDB DTOs ===============================
 @Serializable
@@ -270,12 +271,21 @@ data class NexusSourcesDto(
 @Serializable
 data class NexusSourceDto(
     val url: String? = null,
-    val quality: String? = null,
-    val label: String? = null,
+    // Usually a string ("1080p 2.9 GB | BluRay") but rive-flowcast sends a bare
+    // number (720). Held as a primitive because `ignoreUnknownKeys` tolerates
+    // unexpected fields and never a mismatched type, so declaring String here
+    // makes that one provider's whole response unreadable.
+    @SerialName("quality")
+    val qualityRaw: JsonPrimitive? = null,
+    @SerialName("label")
+    val labelRaw: JsonPrimitive? = null,
     val type: String? = null,
-    // A real JSON boolean. Declaring this as a String makes kotlinx.serialization
-    // reject the whole response, since `ignoreUnknownKeys` tolerates unexpected
-    // fields but never a mismatched type.
+    // A real JSON boolean, for the same reason as above.
     val isEmbed: Boolean? = null,
     val headers: Map<String, String>? = null,
-)
+) {
+    /** The quality text, whichever JSON type it arrived as. */
+    val quality: String? get() = qualityRaw?.contentOrNull
+
+    val label: String? get() = labelRaw?.contentOrNull
+}
