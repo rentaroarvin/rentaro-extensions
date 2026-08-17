@@ -66,12 +66,15 @@ class RentaroExtractor(
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
         val tmdbId = pathParts[1]
+        val seasonId = if (isMovie) "1" else pathParts[2]
+        val episodeId = if (isMovie) "1" else pathParts[3]
 
         val eligibleServers = VIDEASY_SERVERS.filter { server ->
             (!server.movieOnly || isMovie) && server.displayName in enabledServers
         }
+        val vidLinkEnabled = VIDLINK_NAME in enabledServers
 
-        if (eligibleServers.isEmpty()) {
+        if (eligibleServers.isEmpty() && !vidLinkEnabled) {
             return emptyList()
         }
 
@@ -82,11 +85,63 @@ class RentaroExtractor(
             .set("Origin", PLAYER_ORIGIN)
             .build()
 
+        val videasyVideos = if (eligibleServers.isEmpty()) {
+            emptyList()
+        } else {
+            videasyVideos(
+                eligibleServers,
+                path,
+                title,
+                year,
+                imdbId,
+                tmdbId,
+                seasonId,
+                episodeId,
+                isMovie,
+                backendHeaders,
+                subLimit,
+            )
+        }
+
+        // VidLink is an independent backend, so a Videasy-wide failure (a bad
+        // seed, enc-dec.app being down) must not take it with it.
+        val vidLinkVideos = if (!vidLinkEnabled) {
+            emptyList()
+        } else {
+            runCatching {
+                vidLinkVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+            }.getOrDefault(emptyList())
+        }
+
+        return (videasyVideos + vidLinkVideos).sortedWith(
+            compareByDescending<Video> {
+                it.quality.contains(qualityPref, ignoreCase = true) ||
+                    (qualityPref == "2160" && it.quality.contains("4k", ignoreCase = true))
+            }.thenByDescending {
+                extractQualityValue(it.quality)
+            },
+        )
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private suspend fun videasyVideos(
+        eligibleServers: List<VideasyServer>,
+        path: String,
+        title: String,
+        year: String,
+        imdbId: String,
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        backendHeaders: Headers,
+        subLimit: Int,
+    ): List<Video> {
         val seed = client.newCall(
             GET("$VIDEASY_API_BASE/seed?mediaId=$tmdbId", backendHeaders),
         ).awaitSuccess().parseAs<SeedDto>().seed
 
-        val videoList = eligibleServers.parallelCatchingFlatMap { server ->
+        return eligibleServers.parallelCatchingFlatMap { server ->
             val now = System.currentTimeMillis()
 
             val stateKey = "${server.displayName}:$path"
@@ -108,8 +163,6 @@ class RentaroExtractor(
             }
 
             try {
-                val seasonId = if (isMovie) "1" else pathParts[2]
-                val episodeId = if (isMovie) "1" else pathParts[3]
                 val serverUrl = server.apiBase.toHttpUrl().newBuilder().apply {
                     addPathSegments(server.path)
                     addPathSegment("sources-with-title")
@@ -151,15 +204,109 @@ class RentaroExtractor(
                 throw e
             }
         }
+    }
 
-        return videoList.sortedWith(
-            compareByDescending<Video> {
-                it.quality.contains(qualityPref, ignoreCase = true) ||
-                    (qualityPref == "2160" && it.quality.contains("4k", ignoreCase = true))
-            }.thenByDescending {
-                extractQualityValue(it.quality)
-            },
-        )
+    /**
+     * VidLink resolves in one signed request: no seed, no external decryption.
+     * Responses are either a per-quality map of progressive MP4s or a single
+     * adaptive HLS playlist, and `null` means the title simply isn't carried.
+     */
+    private suspend fun vidLinkVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val expiry = System.currentTimeMillis() / 1000 + VIDLINK_TOKEN_TTL_SECONDS
+        val token = VidLinkToken.create(tmdbId, expiry)
+
+        val url = VIDLINK_API_BASE.toHttpUrl().newBuilder().apply {
+            addPathSegments("api/b")
+            addPathSegment(if (isMovie) "movie" else "tv")
+            addPathSegment(token)
+            if (!isMovie) {
+                addPathSegment(seasonId)
+                addPathSegment(episodeId)
+            }
+            addQueryParameter("multiLang", "0")
+        }.build()
+
+        val vidLinkHeaders = headers.newBuilder()
+            .set("Referer", "$VIDLINK_ORIGIN/")
+            .set("Origin", VIDLINK_ORIGIN)
+            .build()
+
+        val body = client.newCall(GET(url.toString(), vidLinkHeaders))
+            .awaitSuccess()
+            .bodyString()
+            .trim()
+
+        // The API answers a literal `null` for titles it has no source for.
+        if (body.isEmpty() || body == "null") return emptyList()
+
+        val stream = body.parseAs<VidLinkResponseDto>().stream ?: return emptyList()
+
+        val subtitles = stream.captions
+            .mapNotNull { caption ->
+                val subUrl = caption.url ?: return@mapNotNull null
+                Track(subUrl, caption.language ?: "Unknown")
+            }
+            .take(subLimit.coerceAtLeast(0))
+
+        stream.playlist?.takeIf { it.isNotBlank() }?.let { playlist ->
+            val expanded = runCatching {
+                playlistUtils.extractFromHls(
+                    playlistUrl = playlist,
+                    videoNameGen = { quality ->
+                        vidLinkLabel(quality, playlist, subtitles.size)
+                    },
+                    subtitleList = subtitles,
+                    masterHeaders = vidLinkHeaders,
+                    videoHeaders = vidLinkHeaders,
+                )
+            }.getOrDefault(emptyList())
+
+            return expanded.ifEmpty {
+                listOf(
+                    Video(
+                        url = playlist,
+                        quality = vidLinkLabel("Auto", playlist, subtitles.size),
+                        videoUrl = playlist,
+                        headers = vidLinkHeaders,
+                        subtitleTracks = subtitles,
+                    ),
+                )
+            }
+        }
+
+        // Progressive files: each quality is directly playable, so there is no
+        // playlist to expand.
+        return stream.qualities.orEmpty()
+            .mapNotNull { (label, entry) ->
+                val videoUrl = entry.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val quality = if (label.all(Char::isDigit)) "${label}p" else label
+                Video(
+                    url = videoUrl,
+                    quality = vidLinkLabel(quality, videoUrl, subtitles.size),
+                    videoUrl = videoUrl,
+                    headers = vidLinkHeaders,
+                    subtitleTracks = subtitles,
+                )
+            }
+            .sortedByDescending { extractQualityValue(it.quality) }
+    }
+
+    private fun vidLinkLabel(quality: String, url: String, subCount: Int): String {
+        val parts = mutableListOf(VIDLINK_NAME, quality)
+        val lower = url.lowercase()
+        when {
+            ".m3u8" in lower -> parts += "HLS"
+            ".mp4" in lower -> parts += "MP4"
+            ".mkv" in lower -> parts += "MKV"
+        }
+        if (subCount > 0) parts += "$subCount subs"
+        return parts.joinToString(" · ")
     }
 
     private fun pctEncode(s: String): String {
@@ -402,6 +549,16 @@ class RentaroExtractor(
 
         private const val VIDEASY_API_BASE = "https://api.speedracelight.com"
         private const val DECRYPTION_API_URL = "https://enc-dec.app/api/dec-videasy"
+
+        // VidLink: a second, independent backend. It signs its own requests and
+        // needs no external decryption service, so it keeps working even if the
+        // Videasy chain (seed -> enc=2 -> enc-dec.app) breaks.
+        private const val VIDLINK_NAME = "Orion"
+        private const val VIDLINK_API_BASE = "https://vidlink.pro"
+        private const val VIDLINK_ORIGIN = "https://vidlink.pro"
+
+        // Their token embeds an expiry; the site itself signs ~2 minutes ahead.
+        private const val VIDLINK_TOKEN_TTL_SECONDS = 120L
         private const val HEX = "0123456789ABCDEF"
 
         private const val CACHE_SIZE = 64
@@ -429,7 +586,6 @@ class RentaroExtractor(
         //   Yoru    = cdn                      [MAY HAVE 4K] (api.speedracelight.com)
         //   Cypher  = downloader2                            (api.speedracelight.com)
         //   Breach  = m4uhd                                  (api.speedracelight.com)
-        //   Neon    = vsrc                                   (api.speedracelight.com)
         //   Vyse    = hdmovie      [FILTERS quality=English] (api.speedracelight.com)
         //   Killjoy = meine ?lang=german  - German           (api.speedracelight.com)
         //   Fade    = hdmovie      [FILTERS quality=Hindi]   (api.speedracelight.com)
@@ -453,12 +609,6 @@ class RentaroExtractor(
                 "Breach",
                 VIDEASY_API_BASE,
                 "m4uhd",
-                audioLabel = "Original",
-            ),
-            VideasyServer(
-                "Neon",
-                VIDEASY_API_BASE,
-                "vsrc",
                 audioLabel = "Original",
             ),
             VideasyServer(
@@ -496,6 +646,18 @@ class RentaroExtractor(
             ),
         )
 
-        val SERVER_DISPLAY_NAMES: List<String> = VIDEASY_SERVERS.map { it.displayName }
+        /**
+         * Servers offered in settings. VidLink is not a Videasy backend, so it
+         * is appended rather than derived from [VIDEASY_SERVERS].
+         */
+        val SERVER_DISPLAY_NAMES: List<String> =
+            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME
+
+        /** Audio-language hint shown per server in the preference list. */
+        fun audioLabelFor(displayName: String): String = when (displayName) {
+            VIDLINK_NAME -> "Original"
+            else -> VIDEASY_SERVERS.firstOrNull { it.displayName == displayName }
+                ?.audioLabel ?: "Unknown"
+        }
     }
 }

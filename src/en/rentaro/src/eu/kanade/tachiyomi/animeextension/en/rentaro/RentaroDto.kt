@@ -191,3 +191,34 @@ data class VideasyServer(
     val audioLabel: String? = null,
     val qualityFilter: String? = null,
 )
+
+// ============================ VidLink ============================
+// Independent backend: its own signed-token API, no external decryption
+// service. Responses carry either a per-quality map of progressive files or a
+// single adaptive HLS playlist, so both shapes are modelled here.
+@Serializable
+data class VidLinkResponseDto(
+    val stream: VidLinkStreamDto? = null,
+)
+
+@Serializable
+data class VidLinkStreamDto(
+    val type: String? = null,
+    // Adaptive variant: one master playlist.
+    val playlist: String? = null,
+    // Progressive variant: quality label ("720") -> file entry.
+    val qualities: Map<String, VidLinkQualityDto>? = null,
+    val captions: List<VidLinkCaptionDto> = emptyList(),
+)
+
+@Serializable
+data class VidLinkQualityDto(
+    val url: String? = null,
+    val type: String? = null,
+)
+
+@Serializable
+data class VidLinkCaptionDto(
+    val url: String? = null,
+    val language: String? = null,
+)

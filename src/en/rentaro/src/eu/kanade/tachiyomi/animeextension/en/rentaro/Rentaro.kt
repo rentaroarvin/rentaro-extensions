@@ -710,9 +710,8 @@ class Rentaro :
         screen.addSetPreference(
             key = PREF_SERVERS_KEY,
             title = "Enabled Servers",
-            entries = RentaroExtractor.VIDEASY_SERVERS.map { server ->
-                val lang = server.audioLabel ?: "Unknown"
-                "${server.displayName} ($lang)"
+            entries = RentaroExtractor.SERVER_DISPLAY_NAMES.map { name ->
+                "$name (${RentaroExtractor.audioLabelFor(name)})"
             },
             entryValues = RentaroExtractor.SERVER_DISPLAY_NAMES,
             default = PREF_SERVERS_DEFAULT,
@@ -797,6 +796,6 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Breach", "Neon", "Vyse")
+            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse")
     }
 }
