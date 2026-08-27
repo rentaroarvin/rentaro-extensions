@@ -111,20 +111,10 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         }
 
         // Get subtitles
-        val subtitleTracks = subtitleList + SUBTITLE_REGEX.findAll(masterPlaylist).mapNotNull {
-            Track(
-                UrlUtils.fixUrl(it.groupValues[2], playlistUrl) ?: return@mapNotNull null,
-                it.groupValues[1],
-            )
-        }.toList()
+        val subtitleTracks = subtitleList + parseMediaTracks(masterPlaylist, "SUBTITLES", playlistUrl)
 
         // Get audio tracks
-        val audioTracks = audioList + AUDIO_REGEX.findAll(masterPlaylist).mapNotNull {
-            Track(
-                UrlUtils.fixUrl(it.groupValues[2], playlistUrl) ?: return@mapNotNull null,
-                it.groupValues[1],
-            )
-        }.toList()
+        val audioTracks = audioList + parseMediaTracks(masterPlaylist, "AUDIO", playlistUrl)
 
         /*
          * Stream might have multiple sub-streams separated by [PLAYLIST_SEPARATOR]. Template:
@@ -158,9 +148,19 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         return masterPlaylist.substringAfter(PLAYLIST_SEPARATOR).split(PLAYLIST_SEPARATOR).mapNotNull { stream ->
             val codec = CODECS_REGEX.find(stream)?.groupValues?.get(1)
             if (!codec.isNullOrBlank()) {
-                // Skip audio only streams. Can check if `codecs` starts with any of avc/hev1/hvc1/vp9/av01.
-                val codecs = codec.split(',')
-                if (codecs.all { it.startsWith("mp4a") }) return@mapNotNull null
+                // Skip audio-only renditions. Tested as an allowlist of video
+                // codecs rather than by excluding `mp4a`, so an unrecognised
+                // audio codec (ec-3, ac-3, opus, flac) is skipped instead of
+                // being offered as video and failing on selection.
+                //
+                // A variant carrying no CODECS at all cannot be classified and
+                // is kept: several backends omit the attribute on genuine video
+                // renditions, and dropping those would lose the whole server.
+                val codecs = codec.split(',').map(String::trim)
+                val hasVideo = codecs.any { entry ->
+                    VIDEO_CODEC_PREFIXES.any { entry.startsWith(it, ignoreCase = true) }
+                }
+                if (!hasVideo) return@mapNotNull null
             }
 
             val resolution = RESOLUTION_REGEX.find(stream)
@@ -366,6 +366,37 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         }
     }
 
+    /**
+     * Parses `#EXT-X-MEDIA` renditions of one TYPE out of a master playlist.
+     *
+     * Scoped to a single line and matching each attribute independently, because
+     * RFC 8216 does not fix attribute order inside `#EXT-X-MEDIA`. The previous
+     * `TYPE=… .*? NAME="…" .*? URI="…"` form required NAME to precede URI and so
+     * silently dropped any rendition written the other way round; being
+     * unanchored it could also pair a NAME on one line with a URI on the next.
+     *
+     * A rendition without `URI` is muxed into the video segments and has no
+     * separate track to expose, so it is skipped rather than mispaired.
+     */
+    private fun parseMediaTracks(
+        masterPlaylist: String,
+        type: String,
+        playlistUrl: String,
+    ): List<Track> = EXT_X_MEDIA_REGEX.findAll(masterPlaylist).mapNotNull { match ->
+        val attributes = match.groupValues[1]
+        if (MEDIA_TYPE_REGEX.find(attributes)?.groupValues?.get(1) != type) return@mapNotNull null
+
+        val uri = MEDIA_URI_REGEX.find(attributes)?.groupValues?.get(1)
+            ?.takeIf { it.isNotBlank() }
+            ?: return@mapNotNull null
+        val name = MEDIA_NAME_REGEX.find(attributes)?.groupValues?.get(1)
+            ?.takeIf { it.isNotBlank() }
+            ?: MEDIA_LANGUAGE_REGEX.find(attributes)?.groupValues?.get(1)
+            ?: return@mapNotNull null
+
+        Track(UrlUtils.fixUrl(uri, playlistUrl) ?: return@mapNotNull null, name)
+    }.toList()
+
     private fun formatBytes(bytes: Long?): String = when {
         bytes == null -> ""
         bytes >= 1_000_000_000 -> "%.2f GB/s".format(bytes / 1_000_000_000.0)
@@ -434,8 +465,29 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
 
         private const val PLAYLIST_SEPARATOR = "#EXT-X-STREAM-INF:"
 
-        private val SUBTITLE_REGEX by lazy { Regex("""#EXT-X-MEDIA:TYPE=SUBTITLES.*?NAME="(.*?)".*?URI="(.*?)"""") }
-        private val AUDIO_REGEX by lazy { Regex("""#EXT-X-MEDIA:TYPE=AUDIO.*?NAME="(.*?)".*?URI="(.*?)"""") }
+        /**
+         * One `#EXT-X-MEDIA` tag, captured up to the end of its own line so a
+         * partial rendition cannot borrow an attribute from the next one.
+         */
+        private val EXT_X_MEDIA_REGEX by lazy { Regex("""#EXT-X-MEDIA:([^\r\n]*)""") }
+        private val MEDIA_TYPE_REGEX by lazy { Regex("""\bTYPE=([A-Z-]+)""") }
+        private val MEDIA_NAME_REGEX by lazy { Regex("""\bNAME="([^"]*)"""") }
+        private val MEDIA_URI_REGEX by lazy { Regex("""\bURI="([^"]*)"""") }
+        private val MEDIA_LANGUAGE_REGEX by lazy { Regex("""\bLANGUAGE="([^"]*)"""") }
+
+        /**
+         * Codec prefixes that identify a *video* rendition.
+         *
+         * The audio-only check is an allowlist rather than a `mp4a` denylist so
+         * it fails closed: a rendition tagged only with a codec nobody has seen
+         * yet is treated as audio and skipped, instead of being offered as video
+         * and failing in the player. Covers AVC, HEVC, Dolby Vision, VP9 and AV1
+         * in both their common spellings.
+         */
+        private val VIDEO_CODEC_PREFIXES = listOf(
+            "avc1", "avc3", "hev1", "hvc1", "hvc2", "dvh1", "dvhe",
+            "vp8", "vp9", "vp09", "av01", "mp4v",
+        )
 
         private val CODECS_REGEX by lazy { Regex("""CODECS="([^"]+)"""") }
         private val RESOLUTION_REGEX by lazy { Regex("""RESOLUTION=([xX\d]+)""") }

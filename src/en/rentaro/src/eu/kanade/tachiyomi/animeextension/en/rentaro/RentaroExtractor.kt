@@ -633,7 +633,33 @@ class RentaroExtractor(
                 )
             }.getOrDefault(emptyList())
 
-            return expanded.ifEmpty {
+            // Players that pick a parser from the URL rather than the response
+            // get it wrong on two of these servers, because neither variant URL
+            // looks like HLS: Nebula's end ".jpg" and are served as image/jpeg,
+            // and Solara's are a bare "/m3u8?=<token>" with no extension. Both
+            // are genuine HLS - Nebula's segments are fMP4 behind .jpg/.png
+            // names, Solara's are MPEG-TS served as text/css - so the media is
+            // fine and only the detection is wrong.
+            //
+            // A "#.m3u8" fragment makes the URL self-describing without altering
+            // the request: a fragment is never sent to the server, and relative
+            // segment URIs still resolve against the same base. Verified against
+            // both CDNs, which answer identically with and without it.
+            return expanded.map { video ->
+                val hinted = hlsHintedUrl(video.videoUrl ?: video.url)
+                if (hinted == null) {
+                    video
+                } else {
+                    Video(
+                        url = hinted,
+                        quality = video.quality,
+                        videoUrl = hinted,
+                        headers = video.headers,
+                        subtitleTracks = video.subtitleTracks,
+                        audioTracks = video.audioTracks,
+                    )
+                }
+            }.ifEmpty {
                 listOf(
                     Video(
                         url = playlist,
@@ -660,6 +686,22 @@ class RentaroExtractor(
                 subtitleTracks = subtitles,
             )
         }
+    }
+
+    /**
+     * Appends a `#.m3u8` fragment to a media-playlist URL that does not already
+     * look like HLS, or returns null when the URL needs no help.
+     *
+     * The fragment is a client-side hint only - it is never transmitted - so it
+     * cannot change what the CDN returns, and relative segment URIs continue to
+     * resolve against the same base.
+     */
+    private fun hlsHintedUrl(url: String): String? {
+        if (url.isBlank() || '#' in url) return null
+        val path = url.substringBefore('?').substringBefore('#')
+        if (path.endsWith(".m3u8", ignoreCase = true)) return null
+        if (path.endsWith(".mpd", ignoreCase = true)) return null
+        return "$url#.m3u8"
     }
 
     /**
