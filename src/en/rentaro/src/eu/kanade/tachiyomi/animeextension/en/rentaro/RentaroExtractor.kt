@@ -944,7 +944,13 @@ class RentaroExtractor(
             runCatching {
                 playlistUtils.extractFromHls(
                     playlistUrl = candidate.url,
-                    videoNameGen = { variant -> "$label · $variant" },
+                    // PlaylistUtils names a playlist with no variants "Video",
+                    // which adds nothing to a label that already carries the
+                    // height. Citadel and CastVid return media playlists rather
+                    // than masters, so that was every one of their rows.
+                    videoNameGen = { variant ->
+                        if (variant.equals("Video", ignoreCase = true)) label else "$label · $variant"
+                    },
                     masterHeaders = candidate.videoHeaders,
                     videoHeaders = candidate.videoHeaders,
                 )
@@ -1028,42 +1034,58 @@ class RentaroExtractor(
     /**
      * Builds a picker label from a Nexus quality string.
      *
-     * The two backends word these very differently and both carry the detail
-     * that separates otherwise identical entries, so it has to survive:
+     * The backends word these very differently and the audio language is often
+     * the only thing separating otherwise identical entries, so it has to
+     * survive. All four shapes seen on the live API:
      *
-     *     "Hindi dub : 1080"                              -> 1080p · Hindi dub
-     *     "20.26 GB | 1080p | Hindi | English | BluRay"    -> 1080p · BluRay · 20.26 GB
+     *     "Hindi dub : 1080"                            -> 1080p · Hindi dub
+     *     "720p | Hindi"                                -> 720p · Hindi audio
+     *     "[Hindi, English] - 720P"                     -> 720p · Hindi, English audio
+     *     "480P (Telugu)"                               -> 480p · Telugu audio
+     *     "20.26 GB | 1080p | Hindi | English | BluRay" -> 1080p · Hindi, English audio · BluRay · 20.26 GB
      *
-     * Reducing these to the resolution alone made seven different language
-     * tracks display as seven identical rows.
+     * Reducing these to the resolution alone made Citadel's sixteen language
+     * variants display as two identical rows, and the same for CastVid and
+     * MbBlast. The word "audio" is appended because players group these entries
+     * by looking for it - a bare language reads as an unclassified detail.
      */
     private fun nexusLabel(serverName: String, quality: String, url: String, type: String? = null): String {
         val parts = mutableListOf("$NEXUS_NAME/${shortenNexusServer(serverName)}")
 
-        val resolution = qualityRegex.find(quality)?.groupValues?.get(1)
+        // Codec tags carry a bare number ("x264", "H.265") that reads as a
+        // resolution, so they are taken out before the height is looked for.
+        // Without this "1.4 GB | … | x264" was labelled 264p.
+        val heightSource = NEXUS_CODEC_NOISE_REGEX.replace(quality, " ")
+        val resolution = qualityRegex.find(heightSource)?.groupValues?.get(1)
         when {
             resolution != null -> parts += "${resolution}p"
             quality.contains("4k", ignoreCase = true) -> parts += "4K"
-            else -> parts += quality.take(NEXUS_LABEL_LIMIT).trim()
+            // No height anywhere. Falling back to the raw string produced a row
+            // titled with the whole tag list, so only the part before the first
+            // separator is used and the rest is left to the tags below.
+            else -> quality.substringBefore('|').trim()
+                .takeIf { it.isNotBlank() }
+                ?.let { parts += it.take(NEXUS_LABEL_LIMIT) }
         }
 
-        // "Hindi dub : 1080" style: the audio descriptor precedes the colon and
-        // is the only thing distinguishing these entries from one another.
-        quality.substringBefore(':', "")
-            .takeIf { it.isNotBlank() && it.length <= NEXUS_AUDIO_LIMIT }
-            ?.trim()
-            ?.let { parts += it }
+        nexusAudioDescriptor(quality)?.let { parts += it }
 
         // "… | 1080p | Hindi | BluRay | x265 …" style: keep the source and codec
         // tags, which separate a BluRay rip from a WEB-DL of the same height.
-        val tags = quality.split('|').map { it.trim() }
+        // Split on both separators the backends use, so MbBlast's
+        // "1080P - HEVC (Telugu)" is not read as one opaque tag.
+        val tags = quality.split('|', '-', '(', ')').map { it.trim() }
         NEXUS_RELEASE_TAGS.firstOrNull { tag -> tags.any { it.equals(tag, ignoreCase = true) } }
             ?.let { parts += it }
         if (tags.any { it.equals("HEVC", ignoreCase = true) || it.equals("x265", ignoreCase = true) }) {
             parts += "HEVC"
         }
-        // Size is what separates the 66 GB, 41 GB and 20 GB releases.
-        tags.firstOrNull { NEXUS_SIZE_REGEX.matches(it) }?.let { parts += it }
+        // Size is what separates the 66 GB, 41 GB and 20 GB releases. Skipped
+        // when the height was missing and the size already became the title, so
+        // "1.4 GB | Hindi | …" is not labelled with its size twice.
+        tags.firstOrNull { NEXUS_SIZE_REGEX.matches(it) }
+            ?.takeIf { size -> parts.none { it == size } }
+            ?.let { parts += it }
 
         // The backend's own `type` is authoritative and covers the adaptive
         // sources whose URL carries no usable extension; the URL is only a
@@ -1080,6 +1102,77 @@ class RentaroExtractor(
         if (container != null) parts += container
         return parts.joinToString(" · ")
     }
+
+    /**
+     * Extracts the audio descriptor from a Nexus quality string.
+     *
+     * Tried in order of how specific the shape is. Anything already carrying its
+     * own descriptor word - MhPly's "Hindi dub", "Arabic sub", "Original Audio"
+     * - is passed through untouched; a bare language list gets "audio" appended
+     * so it reads as a choice rather than a stray tag.
+     */
+    private fun nexusAudioDescriptor(quality: String): String? {
+        // "Hindi dub : 1080,720" - the descriptor precedes the colon.
+        quality.substringBefore(':', "")
+            .trim()
+            .takeIf { it.isNotBlank() && it.length <= NEXUS_AUDIO_LIMIT }
+            ?.let { return it }
+
+        // "[Hindi, English] - 720P" and "480P (Telugu)" - bracketed language
+        // list. Rejected when it holds no language at all, so MbBlast's
+        // "1080P - HEVC (Telugu)" keeps HEVC as a release tag, and Ophm's
+        // "Vietsub (Full)" does not turn "Full" into an audio track.
+        NEXUS_BRACKETED_AUDIO_REGEX.find(quality)
+            ?.groupValues?.get(1)
+            ?.trim()
+            ?.takeIf { candidate ->
+                candidate.isNotBlank() &&
+                    candidate.none(Char::isDigit) &&
+                    candidate.split(',').any { part ->
+                        part.trim().lowercase() !in NEXUS_NON_AUDIO_TAGS
+                    }
+            }
+            ?.let { return nexusAudioSuffixed(nexusTrimLanguages(it)) }
+
+        // "720p | Hindi" and "… | Hindi | English | BluRay | x265" - the
+        // pipe-separated parts that are languages rather than release metadata.
+        val languages = quality.split('|')
+            .map { it.trim() }
+            .filter { part ->
+                part.isNotEmpty() &&
+                    part.none(Char::isDigit) &&
+                    part.lowercase() !in NEXUS_NON_AUDIO_TAGS
+            }
+        if (languages.isNotEmpty()) {
+            return nexusAudioSuffixed(nexusTrimLanguages(languages.joinToString(", ")))
+        }
+        return null
+    }
+
+    /**
+     * Shortens a language list that would overflow the picker.
+     *
+     * A list of five dub languages is longer than the label can carry, but
+     * dropping it entirely brought back the collisions this is meant to fix -
+     * CastVid lists the same height with five different language sets. Keeping
+     * the first few and counting the rest stays inside the limit while remaining
+     * distinct.
+     */
+    private fun nexusTrimLanguages(text: String): String {
+        if (text.length <= NEXUS_AUDIO_LIMIT) return text
+
+        val languages = text.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        if (languages.size <= 1) return text.take(NEXUS_AUDIO_LIMIT).trim()
+
+        for (keep in languages.size - 1 downTo 1) {
+            val candidate = languages.take(keep).joinToString(", ") + " +${languages.size - keep}"
+            if (candidate.length <= NEXUS_AUDIO_LIMIT) return candidate
+        }
+        return "${languages.size} langs"
+    }
+
+    /** Appends "audio" unless the text already names what kind of track it is. */
+    private fun nexusAudioSuffixed(text: String): String = if (NEXUS_AUDIO_WORDS.any { text.contains(it, ignoreCase = true) }) text else "$text audio"
 
     /**
      * Trims the trailing tag from a Nexus server name, e.g.
@@ -1514,6 +1607,37 @@ class RentaroExtractor(
 
         /** Matches a size tag such as "20.26 GB" or "643.3 MB". */
         private val NEXUS_SIZE_REGEX = Regex("""\d+(\.\d+)?\s*[MG]B""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Codec tags whose digits would otherwise be read as a resolution.
+         *
+         * "1.4 GB | Hindi | English | BluRay | x264" has no height at all, and
+         * the x264 was picked up as 264p until these were stripped first.
+         */
+        private val NEXUS_CODEC_NOISE_REGEX =
+            Regex("""\b(?:[xh]\.?26[45]|hevc|avc|av1|vp9|aac|ac3|dd5|dts|atmos)\b""", RegexOption.IGNORE_CASE)
+
+        /**
+         * A bracketed language list: `[Hindi, English] - 720P` or `480P (Telugu)`.
+         * Only one group matches per string, so both bracket styles share it.
+         */
+        private val NEXUS_BRACKETED_AUDIO_REGEX = Regex("""[\[(]([^\])]+)[\])]""")
+
+        /**
+         * Pipe-separated tags that describe the release rather than its audio.
+         *
+         * Everything else between pipes is treated as a language, so this has to
+         * cover the codec, container and source words the backends emit.
+         */
+        private val NEXUS_NON_AUDIO_TAGS = setOf(
+            "bluray", "web-dl", "webrip", "webdl", "hdrip", "hdts", "hdtv", "cam", "dvdrip",
+            "hevc", "avc", "x264", "x265", "h264", "h265", "h.264", "h.265", "av1", "vp9",
+            "mkv", "mp4", "ts", "dts", "atmos", "aac", "ac3", "dd", "ddp", "truehd", "org",
+            "10bit", "8bit", "hdr", "sdr", "dv", "remux", "esub", "msub",
+        )
+
+        /** Words that already say what kind of track a descriptor names. */
+        private val NEXUS_AUDIO_WORDS = listOf("dub", "sub", "audio")
 
         /**
          * Stream hosts that require the site Referer, matched on the
