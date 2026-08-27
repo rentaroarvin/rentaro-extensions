@@ -1590,22 +1590,37 @@ class RentaroExtractor(
             "hdhub4u", // 4k-bk   - MKV, 2/3
             "holly", // Lolly   - MP4, 1/5
             "ophim", // Ophm    - kept by request; 0/3 when tested
+            // Citadel - HLS, 10/11 titles. Was written off against Western
+            // probes; it is an Indian-catalogue provider and answers for
+            // Bollywood and South Indian cinema with up to 12 per-language
+            // sources. Its segments are MPEG-TS behind image/jpeg, like Jay's
+            // Nebula.
+            "rive-citadel",
         )
 
         /**
-         * Scrapers that returned no playable source for any probe title, so a
-         * note can distinguish "off by choice" from "known not to work".
+         * Scrapers that returned no playable source, so a note can distinguish
+         * "off by choice" from "known not to work".
+         *
+         * Retested against region-matched content - Bollywood, South Indian,
+         * Korean, Chinese, Spanish and cartoons - rather than the Western titles
+         * the first pass used, because most of these names are region-specific.
+         * That reclassified two of them:
+         *
+         *  - rive-citadel is now enabled: it is an Indian-catalogue provider,
+         *    playable for 10 of 11 titles once probed with the right content.
+         *  - mbox, nitro and rive-flowcast do carry non-Western titles and
+         *    return many sources, but every host answers 403 on three
+         *    consecutive attempts, so they stay off as [NEXUS_UPSTREAM_BLOCKED].
+         *
+         * The rest answer nothing whatever the region.
          */
         private val NEXUS_KNOWN_DEAD = setOf(
-            "nitro", // valid playlist, every segment an ad CDN
             "watchout",
             "imovr",
             "awsind",
-            "rive-citadel",
             "yomovies",
             "rive-primevids",
-            "mbox",
-            "rive-flowcast",
             "rive-hindicast",
             "rive-asiacloud",
             "levi",
@@ -1616,10 +1631,21 @@ class RentaroExtractor(
             "em-8",
         )
 
+        /**
+         * Scrapers that resolve real sources but whose CDN refuses the request.
+         *
+         * Distinguished from [NEXUS_KNOWN_DEAD] because the catalogue is there -
+         * nitro answers for 10 of 15 region-matched titles, mbox for 12 with up
+         * to 31 sources - and only the fetch fails. nitro additionally serves ad
+         * CDN segments when it does answer. Worth revisiting if the block lifts.
+         */
+        private val NEXUS_UPSTREAM_BLOCKED = setOf("nitro", "mbox", "rive-flowcast")
+
         /** Entry labels for the provider preference, ordered as the list is. */
         fun nexusProviderEntries(): List<String> = NEXUS_PROVIDERS.map { provider ->
             val note = when {
                 provider.scraper in NEXUS_PROVIDER_DEFAULT -> ""
+                provider.scraper in NEXUS_UPSTREAM_BLOCKED -> " - host refuses playback"
                 provider.scraper in NEXUS_KNOWN_DEAD -> " - no video when tested"
                 else -> ""
             }
