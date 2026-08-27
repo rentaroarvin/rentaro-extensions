@@ -1334,12 +1334,13 @@ class RentaroExtractor(
         private val OCTET_STREAM = "application/octet-stream".toMediaType()
 
         /**
-         * The CineJoy upstream servers offered in settings.
+         * The CineJoy upstream servers offered in settings, with the region the
+         * backend's own `/servers` flag reports.
          *
          * Hard-coded rather than read from `/servers` so the preference list can
          * be built without a network call, matching how the Art providers are
          * handled. Verified against the live endpoint, which returned exactly
-         * these eight.
+         * these eight: six US, one JP, one BR.
          */
         val CINEJOY_SERVERS: List<String> = listOf(
             "Lisbon",
@@ -1352,28 +1353,31 @@ class RentaroExtractor(
             "Canaias",
         )
 
+        /** Region each server reports, for the picker note. */
+        private val CINEJOY_SERVER_REGION = mapOf(
+            "Lisbon" to "US",
+            "Nebula" to "US",
+            "Solara" to "US",
+            "Castle" to "US",
+            "Athens" to "US",
+            "Joy" to "US",
+            "Sakura" to "JP",
+            "Canaias" to "BR",
+        )
+
         /**
          * Servers enabled out of the box: the ones that answered with a playlist
          * that actually serves.
          *
-         * Probed across Western live-action, anime and Brazilian titles, films
-         * and episodes. Lisbon, Nebula and Solara returned a working HLS master
-         * throughout; Castle for most, and it is the only server carrying
-         * captions.
+         * These are the four US servers that work, which makes the default
+         * effectively US-only. That is the backend's catalogue, not a choice:
+         * of the eight servers six are US, and the only two non-US options both
+         * answer with placeholders rather than addresses (see below). There is
+         * no non-US server available to enable.
          *
-         * The four excluded are not regional gaps in the probe set - each was
-         * retested against content matching its own flag:
-         *
-         *  - Athens and Joy answered nothing for any of eight varied titles.
-         *  - Sakura is anime-only and does respond there, but only ever as
-         *    `"playlist": "sub"` / `"dub"`: a SUB/DUB pair with no address.
-         *  - Canaias (BR) lists progressive files whose `url` is a slug such as
-         *    "redeflix-720p".
-         *
-         * So all four are advertised-but-unresolvable rather than merely absent,
-         * and [cineJoyVideosForStream] drops anything that is not an absolute
-         * URL. If the backend starts returning real addresses for these, they
-         * become usable by enabling them here - no other change needed.
+         * The defaults do carry anime despite the US flag - Lisbon and Solara
+         * returned a working ladder for every anime title tried, Castle for
+         * about half with subtitle tracks, Nebula for a third.
          */
         val CINEJOY_SERVER_DEFAULT: Set<String> = setOf(
             "Lisbon",
@@ -1383,24 +1387,41 @@ class RentaroExtractor(
         )
 
         /**
-         * Servers that never resolved to a playable address when tested.
+         * Servers that never resolved to a playable address, with the reason the
+         * backend itself gives. Each was retested against content matching its
+         * own region flag, so none of these is an artefact of the probe set:
          *
-         * Sakura is listed separately in the picker note because it is the one
-         * that does carry anime and may simply be unfinished upstream.
+         *  - Athens (US): answers `"Athens: empty mirror list for /e/movie/550"`
+         *    for all 20 titles tried. It has catalogue entries but no mirrors
+         *    behind them.
+         *  - Joy (US): answers `"Joy: no entry for movie 550"` for all 20.
+         *    Nothing catalogued.
+         *  - Canaias (BR): does carry Brazilian titles and dubbed Hollywood, but
+         *    every `qualities.url` is a slug ("redeflix-720p", "digitalplus").
+         *  - Sakura (JP): anime-only, and responds for most anime series, but
+         *    only ever as `"playlist": "sub"` / `"dub"`.
+         *
+         * The slugs are terminal: no resolver endpoint exists for them, and
+         * re-requesting with `&source=<slug>` returns the same slug list.
+         * [cineJoyVideosForStream] therefore drops anything that is not an
+         * absolute URL. If the backend starts returning real addresses, these
+         * become usable by enabling them here - no other change needed.
          */
-        private val CINEJOY_KNOWN_DEAD = setOf("Athens", "Joy", "Canaias")
+        private val CINEJOY_KNOWN_DEAD = setOf("Athens", "Joy")
 
-        /** Servers whose response is a placeholder rather than a URL. */
-        private val CINEJOY_PLACEHOLDER_ONLY = setOf("Sakura")
+        /** Servers whose response is a placeholder slug rather than a URL. */
+        private val CINEJOY_PLACEHOLDER_ONLY = setOf("Sakura", "Canaias")
 
         /** Entry labels for the CineJoy server preference, ordered as the list is. */
         fun cineJoyServerEntries(): List<String> = CINEJOY_SERVERS.map { server ->
+            val region = CINEJOY_SERVER_REGION[server]?.let { " ($it)" } ?: ""
             val note = when (server) {
-                in CINEJOY_PLACEHOLDER_ONLY -> " - anime only, no playable URL yet"
+                "Sakura" -> " - anime only, no playable URL yet"
+                in CINEJOY_PLACEHOLDER_ONLY -> " - no playable URL yet"
                 in CINEJOY_KNOWN_DEAD -> " - no video when tested"
                 else -> ""
             }
-            "$server$note"
+            "$server$region$note"
         }
 
         /**
