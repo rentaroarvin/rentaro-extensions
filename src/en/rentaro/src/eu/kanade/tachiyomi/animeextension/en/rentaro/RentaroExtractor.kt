@@ -560,7 +560,7 @@ class RentaroExtractor(
             if (source.isEmbed == true) return@mapNotNull null
             // Verified against the live API: these answer text/html landing
             // pages rather than media, so they would only fail in the player.
-            if (NEXUS_LANDING_MARKERS.any { it in rawUrl }) return@mapNotNull null
+            if (isNexusLandingPage(rawUrl)) return@mapNotNull null
 
             val url = sanitiseNexusUrl(rawUrl)
 
@@ -653,6 +653,35 @@ class RentaroExtractor(
     private fun needsNexusReferer(url: String): Boolean {
         val host = url.toHttpUrlOrNull()?.host ?: return false
         return NEXUS_REFERER_HOST_SUFFIXES.any { host == it || host.endsWith(".$it") }
+    }
+
+    /**
+     * Whether a Nexus source URL is a hubcloud landing page rather than a file.
+     *
+     * hubcloud rotates its registrable domain (`hubcloud.cx`, `.ist`, `.one`
+     * and `.fans` have all been seen; the site links between them and Nexus
+     * currently normalises to `.cx`), so the TLD cannot be part of the test.
+     * What is stable is the host label plus the first path segment:
+     *
+     *     drive  file listing, needs a further hop to reach media
+     *     tg     hands off to telegram.me/<bot>
+     *     none   a bare host, e.g. the `pixel.` and `gpdl2.` subdomains whose
+     *            `?id=` redirects to a worker that answers 500
+     *
+     * None of these carry media, yet the backend advertises them as `mp4`, so
+     * they would only fail once the player had already committed to them.
+     *
+     * A file is never served from the host root, so a URL with no path segment
+     * is a landing page whatever its query carries. Segments outside the
+     * blocklist are kept: the `re` redirect does reach a file.
+     */
+    private fun isNexusLandingPage(url: String): Boolean {
+        val parsed = url.toHttpUrlOrNull() ?: return false
+        if (parsed.host.split('.').none { it == "hubcloud" }) return false
+
+        val firstSegment = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
+            ?: return true
+        return firstSegment in NEXUS_LANDING_PATH_SEGMENTS
     }
 
     /** A Nexus source that passed filtering, before HLS expansion. */
@@ -1037,11 +1066,15 @@ class RentaroExtractor(
          * Hosts that answer an HTML landing page instead of media. Confirmed
          * against the live API, where these returned `text/html` for a source
          * the backend still advertised as a playable file.
+         *
+         * First path segments on a hubcloud host that mean "landing page", not
+         * "file". Matched against the host label rather than a full domain
+         * because hubcloud rotates its TLD - see [isNexusLandingPage].
+         *
+         * `drive` is a file listing needing another hop; `tg` is a Telegram
+         * hand-off that redirects out to telegram.me.
          */
-        private val NEXUS_LANDING_MARKERS = listOf(
-            "hubcloud.cx/?id=",
-            "hubcloud.cx/drive",
-        )
+        private val NEXUS_LANDING_PATH_SEGMENTS = setOf("drive", "tg")
 
         /** Keeps a verbose Nexus quality string from overflowing the picker. */
         private const val NEXUS_LABEL_LIMIT = 40
