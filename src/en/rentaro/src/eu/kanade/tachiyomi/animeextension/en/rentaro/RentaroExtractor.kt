@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.rentaro
 
 import android.os.Build
+import android.util.Base64
 import android.util.LruCache
 import androidx.annotation.RequiresApi
 import aniyomi.lib.playlistutils.PlaylistUtils
@@ -21,7 +22,9 @@ import kotlinx.serialization.json.put
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
@@ -56,6 +59,19 @@ class RentaroExtractor(
         val expiresAtMillis: Long,
     )
 
+    /**
+     * One list per backend, destructured at the call site.
+     *
+     * A data class rather than a Triple because there are four backends now, and
+     * a positional Quadruple would make the awaits easy to mismatch.
+     */
+    private data class BackendResults(
+        val videasy: List<Video>,
+        val vidLink: List<Video>,
+        val nexus: List<Video>,
+        val cineJoy: List<Video>,
+    )
+
     private data class FailureState(
         val count: Int,
         val lastFailureAtMillis: Long,
@@ -71,6 +87,7 @@ class RentaroExtractor(
         subLimit: Int,
         qualityPref: String,
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
+        enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
     ): List<Video> {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
@@ -83,8 +100,9 @@ class RentaroExtractor(
         }
         val vidLinkEnabled = VIDLINK_NAME in enabledServers
         val nexusEnabled = NEXUS_NAME in enabledServers
+        val cineJoyEnabled = CINEJOY_NAME in enabledServers
 
-        if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled) {
+        if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled && !cineJoyEnabled) {
             return emptyList()
         }
 
@@ -95,13 +113,13 @@ class RentaroExtractor(
             .set("Origin", PLAYER_ORIGIN)
             .build()
 
-        // The three backends are unrelated services, so they are resolved
+        // The four backends are unrelated services, so they are resolved
         // concurrently: the wait becomes the slowest of them rather than their
         // sum. Each keeps its own failure handling, since they differ.
         //
         // Servers *within* a backend were already parallel; it was only these
-        // three that ran one after another.
-        val (videasyVideos, vidLinkVideos, nexusVideos) = coroutineScope {
+        // that ran one after another.
+        val (videasyVideos, vidLinkVideos, nexusVideos, cineJoyVideos) = coroutineScope {
             val videasyTask = async {
                 if (eligibleServers.isEmpty()) {
                     emptyList()
@@ -154,7 +172,36 @@ class RentaroExtractor(
                 }
             }
 
-            Triple(videasyTask.await(), vidLinkTask.await(), nexusTask.await())
+            // CineJoy is a fourth independent backend, reached through its own
+            // encrypt/decrypt chain.
+            val cineJoyTask = async {
+                if (!cineJoyEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        cineJoyVideos(
+                            title,
+                            year,
+                            imdbId,
+                            tmdbId,
+                            seasonId,
+                            episodeId,
+                            isMovie,
+                            enabledCineJoyServers,
+                            subLimit,
+                        )
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            }
+
+            BackendResults(
+                videasyTask.await(),
+                vidLinkTask.await(),
+                nexusTask.await(),
+                cineJoyTask.await(),
+            )
         }
 
         // Grouped by server, best quality first inside each group.
@@ -166,12 +213,13 @@ class RentaroExtractor(
         // then orders entries within a group, not across the whole list.
         val serverRank = SERVER_ORDER_HINT.withIndex().associate { (index, name) -> name to index }
 
-        return (videasyVideos + vidLinkVideos + nexusVideos)
+        return (videasyVideos + vidLinkVideos + nexusVideos + cineJoyVideos)
             .groupBy { videoServerName(it.quality) }
             .toList()
             .sortedBy { (server, _) ->
-                // Art fans out to "Art/<provider>", so rank on the base name and
-                // keep its providers adjacent. Unknown names sort last, stably.
+                // Art and Jay fan out to "Art/<provider>" and "Jay/<server>", so
+                // rank on the base name and keep their entries adjacent. Unknown
+                // names sort last, stably.
                 serverRank[server.substringBefore('/')] ?: serverRank.size
             }
             .flatMap { (_, group) ->
@@ -431,6 +479,221 @@ class RentaroExtractor(
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
     }
+
+    // ======================= CineJoy (Jay) backend =======================
+
+    /**
+     * CineJoy is a fourth independent backend, and the only one whose request
+     * body has to be built remotely. Three calls per server:
+     *
+     *  1. `enc-cinejoy?url=…`  the query is handed to enc-dec.app, which
+     *     returns the opaque POST body plus the `state` needed to read the
+     *     reply.
+     *  2. `POST api.shegu.st/g`  the body from step 1, sent as raw bytes;
+     *     answers ciphertext.
+     *  3. `POST dec-cinejoy`  ciphertext plus `state` back to enc-dec.app,
+     *     which returns the stream list as plain JSON.
+     *
+     * Each upstream server is a separate chain, so they are resolved
+     * concurrently and one failing cannot lose the others.
+     */
+    private suspend fun cineJoyVideos(
+        title: String,
+        year: String,
+        imdbId: String,
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        enabledServers: Set<String>,
+        subLimit: Int,
+    ): List<Video> {
+        if (enabledServers.isEmpty()) return emptyList()
+
+        return CINEJOY_SERVERS.filter { it in enabledServers }.parallelCatchingFlatMap { server ->
+            cineJoyVideosForServer(
+                server,
+                title,
+                year,
+                imdbId,
+                tmdbId,
+                seasonId,
+                episodeId,
+                isMovie,
+                subLimit,
+            )
+        }
+    }
+
+    private suspend fun cineJoyVideosForServer(
+        server: String,
+        title: String,
+        year: String,
+        imdbId: String,
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        // The upstream query the backend expects, before encryption. Built with
+        // HttpUrl so a title needing escaping cannot break the URL, then handed
+        // to enc-dec.app as a single encoded `url` parameter.
+        val upstream = CINEJOY_API_BASE.toHttpUrl().newBuilder().apply {
+            addQueryParameter("title", title)
+            addQueryParameter("type", if (isMovie) "movie" else "series")
+            addQueryParameter("year", year)
+            addQueryParameter("imdb", imdbId)
+            addQueryParameter("tmdb", tmdbId)
+            addQueryParameter("server", server)
+            if (!isMovie) {
+                addQueryParameter("season", seasonId)
+                addQueryParameter("episode", episodeId)
+            }
+        }.build().toString()
+
+        // enc-dec.app sits behind Cloudflare and answers 403 (error 1010) to a
+        // request without a browser User-Agent; the shared headers carry one.
+        val encUrl = "$CINEJOY_ENC_URL?url=${URLEncoder.encode(upstream, "UTF-8")}"
+        val enc = client.newCall(GET(encUrl, headers))
+            .awaitSuccess()
+            .parseAs<CineJoyEncDto>()
+        if (enc.status != HTTP_OK) return emptyList()
+        val encResult = enc.result ?: return emptyList()
+        val payload = encResult.data?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val state = encResult.state ?: return emptyList()
+
+        // The site posts these bytes verbatim; it is ciphertext, not JSON, so it
+        // is sent as an octet-stream rather than through a JSON body helper.
+        val siteHeaders = headers.newBuilder()
+            .set("Referer", "$CINEJOY_ORIGIN/")
+            .set("Origin", CINEJOY_ORIGIN)
+            .build()
+        val encryptedBody = base64UrlDecode(payload)
+            .toRequestBody(OCTET_STREAM)
+        val encrypted = client.newCall(POST(CINEJOY_UPSTREAM_URL, siteHeaders, encryptedBody))
+            .awaitSuccess()
+            .body
+            .bytes()
+        if (encrypted.isEmpty()) return emptyList()
+
+        val decBody = buildJsonObject {
+            put("text", base64UrlEncode(encrypted))
+            put("state", state)
+        }.toString().toRequestBody(JSON_MEDIA_TYPE)
+        val dec = client.newCall(POST(CINEJOY_DEC_URL, headers, decBody))
+            .awaitSuccess()
+            .parseAs<CineJoyDecDto>()
+        if (dec.status != HTTP_OK) return emptyList()
+
+        // A server with no match for the title reports it by omitting `stream`
+        // rather than by status code.
+        val streams = dec.result?.data?.stream.orEmpty()
+        if (streams.isEmpty()) return emptyList()
+
+        return streams.flatMap { stream -> cineJoyVideosForStream(server, stream, subLimit) }
+    }
+
+    private fun cineJoyVideosForStream(
+        server: String,
+        stream: CineJoyStreamDto,
+        subLimit: Int,
+    ): List<Video> {
+        val subtitles = stream.captions
+            .mapNotNull { caption ->
+                val url = caption.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                Track(url, caption.language ?: "Unknown")
+            }
+            .take(subLimit.coerceAtLeast(0))
+
+        // Verified against the live API: the playlist and its segments serve
+        // without a Referer, but the site sends one and the CDN accepts it, so
+        // it is kept for consistency with the call that produced the URL.
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$CINEJOY_ORIGIN/")
+            .build()
+
+        stream.playlist?.takeIf { it.isNotBlank() }?.let { playlist ->
+            // Master playlists here carry up to 2160p plus several audio
+            // renditions, so they are expanded: handed over whole the player
+            // would offer one unselectable rendition.
+            val expanded = runCatching {
+                playlistUtils.extractFromHls(
+                    playlistUrl = playlist,
+                    videoNameGen = { variant ->
+                        cineJoyLabel(server, stream.id, variant, playlist, subtitles.size)
+                    },
+                    subtitleList = subtitles,
+                    masterHeaders = streamHeaders,
+                    videoHeaders = streamHeaders,
+                )
+            }.getOrDefault(emptyList())
+
+            return expanded.ifEmpty {
+                listOf(
+                    Video(
+                        url = playlist,
+                        quality = cineJoyLabel(server, stream.id, "Auto", playlist, subtitles.size),
+                        videoUrl = playlist,
+                        headers = streamHeaders,
+                        subtitleTracks = subtitles,
+                    ),
+                )
+            }
+        }
+
+        // Progressive entries advertise a quality map, but the live API returns
+        // a slug there ("redeflix-720p") rather than a URL. Anything that is not
+        // an absolute URL would fail in the player, so it is dropped here.
+        return stream.qualities.orEmpty().mapNotNull { (label, entry) ->
+            val videoUrl = entry.url?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+            val quality = if (label.all(Char::isDigit)) "${label}p" else label
+            Video(
+                url = videoUrl,
+                quality = cineJoyLabel(server, stream.id, quality, videoUrl, subtitles.size),
+                videoUrl = videoUrl,
+                headers = streamHeaders,
+                subtitleTracks = subtitles,
+            )
+        }
+    }
+
+    /**
+     * Builds a picker label, e.g. `Jay/Lisbon · 1080p · HLS · 2 subs`.
+     *
+     * The upstream stream id is only included when it adds something: every
+     * adaptive entry calls itself "primary", which would repeat in every row.
+     */
+    private fun cineJoyLabel(
+        server: String,
+        streamId: String?,
+        quality: String,
+        url: String,
+        subCount: Int,
+    ): String {
+        val parts = mutableListOf("$CINEJOY_NAME/$server")
+        streamId
+            ?.takeIf { it.isNotBlank() && !it.equals("primary", ignoreCase = true) }
+            ?.let { parts += it }
+        parts += quality
+        // The container comes from the URL; `quality` is a resolution such as
+        // "1080p" and never carries an extension.
+        val lower = url.lowercase()
+        when {
+            ".m3u8" in lower -> parts += "HLS"
+            ".mp4" in lower -> parts += "MP4"
+            ".mkv" in lower -> parts += "MKV"
+        }
+        if (subCount > 0) parts += "$subCount subs"
+        return parts.joinToString(" · ")
+    }
+
+    private fun base64UrlDecode(value: String): ByteArray {
+        val padded = value.padEnd(value.length + (4 - value.length % 4) % 4, '=')
+        return Base64.decode(padded, Base64.URL_SAFE)
+    }
+
+    private fun base64UrlEncode(value: ByteArray): String = Base64.encodeToString(value, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
 
     // ======================== Nexus (Art) backend ========================
 
@@ -1050,6 +1313,68 @@ class RentaroExtractor(
          */
         private const val VIDLINK_PLAYBACK_ENV = "dash-hevc"
 
+        // CineJoy: a fourth independent backend. Unlike the others its request
+        // body is built remotely, so a call needs enc-dec.app on the way out as
+        // well as on the way back.
+        private const val CINEJOY_NAME = "Jay"
+        private const val CINEJOY_API_BASE = "https://api.shegu.st/"
+        private const val CINEJOY_UPSTREAM_URL = "https://api.shegu.st/g"
+        private const val CINEJOY_SERVERS_URL = "https://api.shegu.st/servers"
+        private const val CINEJOY_ORIGIN = "https://cinejoy.to"
+        private const val CINEJOY_ENC_URL = "https://enc-dec.app/api/enc-cinejoy"
+        private const val CINEJOY_DEC_URL = "https://enc-dec.app/api/dec-cinejoy"
+
+        private const val HTTP_OK = 200
+
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val OCTET_STREAM = "application/octet-stream".toMediaType()
+
+        /**
+         * The CineJoy upstream servers offered in settings.
+         *
+         * Hard-coded rather than read from `/servers` so the preference list can
+         * be built without a network call, matching how the Art providers are
+         * handled. Verified against the live endpoint, which returned exactly
+         * these eight.
+         */
+        val CINEJOY_SERVERS: List<String> = listOf(
+            "Lisbon",
+            "Nebula",
+            "Solara",
+            "Castle",
+            "Athens",
+            "Joy",
+            "Sakura",
+            "Canaias",
+        )
+
+        /**
+         * Servers enabled out of the box: the ones that answered with a playlist
+         * that actually serves.
+         *
+         * Probed across three titles (two series, one film). Lisbon, Nebula and
+         * Solara returned a working HLS master for all three; Castle for two,
+         * and it is the only server carrying subtitles. The rest are excluded:
+         * Athens, Joy and Sakura returned no stream for any title, and Canaias
+         * advertises progressive files whose `url` is a slug ("redeflix-720p")
+         * rather than a URL, so nothing it offers is playable.
+         */
+        val CINEJOY_SERVER_DEFAULT: Set<String> = setOf(
+            "Lisbon",
+            "Nebula",
+            "Solara",
+            "Castle",
+        )
+
+        /** Servers that returned no playable stream for any probe title. */
+        private val CINEJOY_KNOWN_DEAD = setOf("Athens", "Joy", "Sakura", "Canaias")
+
+        /** Entry labels for the CineJoy server preference, ordered as the list is. */
+        fun cineJoyServerEntries(): List<String> = CINEJOY_SERVERS.map { server ->
+            val note = if (server in CINEJOY_KNOWN_DEAD) " - no video when tested" else ""
+            "$server$note"
+        }
+
         /**
          * Origin the progressive-file CDN allowlists. Only used for the
          * `qualities` fallback, since the DASH path authorises by cookie.
@@ -1314,11 +1639,12 @@ class RentaroExtractor(
         )
 
         /**
-         * Servers offered in settings. VidLink is not a Videasy backend, so it
-         * is appended rather than derived from [VIDEASY_SERVERS].
+         * Servers offered in settings. VidLink, Nexus and CineJoy are not
+         * Videasy backends, so they are appended rather than derived from
+         * [VIDEASY_SERVERS].
          */
         val SERVER_DISPLAY_NAMES: List<String> =
-            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME
+            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME + CINEJOY_NAME
 
         /**
          * Order the video list groups servers in. Mirrors [SERVER_DISPLAY_NAMES]
@@ -1338,6 +1664,7 @@ class RentaroExtractor(
         fun audioLabelFor(displayName: String): String = when (displayName) {
             VIDLINK_NAME -> "Original"
             NEXUS_NAME -> "Multi-Lang"
+            CINEJOY_NAME -> "Multi-Lang"
             else -> VIDEASY_SERVERS.firstOrNull { it.displayName == displayName }
                 ?.audioLabel ?: "Unknown"
         }

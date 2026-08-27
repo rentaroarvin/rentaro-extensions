@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.en.rentaro
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -280,9 +281,15 @@ data class NexusServerDto(
 
 @Serializable
 data class NexusSourcesDto(
-    val sources: List<NexusSourceDto> = emptyList(),
+    // Explicit JSON `null` here, not just an absent key, for a provider with no
+    // match: seen live from k4khdhub and hdhub4u. A non-null type would fail to
+    // deserialise and lose the whole response, so it is nullable and normalised.
+    @SerialName("sources")
+    val sourcesOrNull: List<NexusSourceDto>? = null,
     val error: String? = null,
-)
+) {
+    val sources: List<NexusSourceDto> get() = sourcesOrNull.orEmpty()
+}
 
 @Serializable
 data class NexusSourceDto(
@@ -305,3 +312,91 @@ data class NexusSourceDto(
 
     val label: String? get() = labelRaw?.contentOrNull
 }
+
+// ============================ CineJoy ============================
+// Fourth independent backend. Its API answers an encrypted body, so the flow is
+// three calls: enc-dec.app builds the request payload, api.shegu.st/g returns
+// the ciphertext, then enc-dec.app decrypts it. Only the decrypted shape and
+// the two enc-dec.app envelopes are modelled here.
+
+/** One upstream scraper CineJoy exposes, from `/servers`. */
+@Serializable
+data class CineJoyServerDto(
+    val name: String? = null,
+    val status: String? = null,
+    // Flag image URL rather than a language code, so it is only usable as a
+    // rough origin hint and is deliberately not surfaced in labels.
+    val language: String? = null,
+    val description: String? = null,
+    @SerialName("4k")
+    val is4k: Boolean = false,
+)
+
+@Serializable
+data class CineJoyServersDto(
+    val servers: List<CineJoyServerDto> = emptyList(),
+)
+
+/**
+ * `enc-cinejoy` response: the request body to POST upstream, plus the state
+ * needed to decrypt whatever comes back.
+ */
+@Serializable
+data class CineJoyEncDto(
+    val status: Int? = null,
+    val result: CineJoyEncResultDto? = null,
+    val error: String? = null,
+)
+
+@Serializable
+data class CineJoyEncResultDto(
+    // base64url, no padding: decoded to raw bytes for the upstream POST.
+    val data: String? = null,
+    // Opaque; echoed back to `dec-cinejoy` verbatim.
+    val state: JsonElement? = null,
+)
+
+/** `dec-cinejoy` response. */
+@Serializable
+data class CineJoyDecDto(
+    val status: Int? = null,
+    val result: CineJoyDecResultDto? = null,
+    val error: String? = null,
+)
+
+@Serializable
+data class CineJoyDecResultDto(
+    val data: CineJoyDataDto? = null,
+    val status: Int? = null,
+)
+
+@Serializable
+data class CineJoyDataDto(
+    // Absent, rather than empty, for a title the server has no source for.
+    val stream: List<CineJoyStreamDto> = emptyList(),
+)
+
+@Serializable
+data class CineJoyStreamDto(
+    // "hls" carries `playlist`; "file" carries `qualities`.
+    val type: String? = null,
+    // Upstream label, e.g. "primary" or "RedeFlix 720p".
+    val id: String? = null,
+    val playlist: String? = null,
+    val qualities: Map<String, CineJoyQualityDto>? = null,
+    val captions: List<CineJoyCaptionDto> = emptyList(),
+)
+
+@Serializable
+data class CineJoyQualityDto(
+    val url: String? = null,
+    val type: String? = null,
+)
+
+@Serializable
+data class CineJoyCaptionDto(
+    val url: String? = null,
+    val language: String? = null,
+    val type: String? = null,
+    val id: String? = null,
+)

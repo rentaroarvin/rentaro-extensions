@@ -605,6 +605,7 @@ class Rentaro :
                 ?: PREF_SUB_LIMIT_DEFAULT.toInt(),
             qualityPref = preferences.qualityPref,
             enabledNexusProviders = preferences.enabledNexusProviders,
+            enabledCineJoyServers = preferences.enabledCineJoyServers,
         )
     }
 
@@ -636,6 +637,10 @@ class Rentaro :
     private val SharedPreferences.enabledNexusProviders: Set<String> by preferences.delegate(
         PREF_NEXUS_PROVIDERS_KEY,
         RentaroExtractor.NEXUS_PROVIDER_DEFAULT,
+    )
+    private val SharedPreferences.enabledCineJoyServers: Set<String> by preferences.delegate(
+        PREF_CINEJOY_SERVERS_KEY,
+        RentaroExtractor.CINEJOY_SERVER_DEFAULT,
     )
 
     private fun SharedPreferences.clearOldPrefs(): SharedPreferences {
@@ -768,6 +773,19 @@ class Rentaro :
                 "so enabling every one slows the video list. Only applies when " +
                 "Art is enabled above.",
         )
+
+        // Jay fans out to its backend's own upstream servers, each a separate
+        // three-call chain, so they are selectable rather than all-or-nothing.
+        screen.addSetPreference(
+            key = PREF_CINEJOY_SERVERS_KEY,
+            title = "Jay Servers",
+            entries = RentaroExtractor.cineJoyServerEntries(),
+            entryValues = RentaroExtractor.CINEJOY_SERVERS,
+            default = RentaroExtractor.CINEJOY_SERVER_DEFAULT,
+            summary = "Which upstream servers Jay queries. Each is a separate " +
+                "request, so enabling every one slows the video list. Only " +
+                "applies when Jay is enabled above.",
+        )
     }
 
     // ============================= Utilities ==============================
@@ -847,9 +865,11 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art")
+            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art", "Jay")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
+
+        private const val PREF_CINEJOY_SERVERS_KEY = "pref_cinejoy_servers"
 
         /**
          * One-shot marker for resetting the Art provider selection to the
@@ -879,6 +899,10 @@ class Rentaro :
             // one, and the original opt-in marker is already spent, so this
             // enables it once under the name the catalogue now uses.
             "pref_optin_art" to setOf("Art"),
+            // CineJoy shipped as "Jay" in v22. Pruning cannot add a new name, so
+            // without this it would stay switched off on every existing install
+            // despite being in PREF_SERVERS_DEFAULT.
+            "pref_optin_jay" to setOf("Jay"),
         )
 
         /**
