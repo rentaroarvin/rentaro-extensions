@@ -613,7 +613,11 @@ class RentaroExtractor(
             .set("Referer", "$CINEJOY_ORIGIN/")
             .build()
 
-        stream.playlist?.takeIf { it.isNotBlank() }?.let { playlist ->
+        // Only an absolute URL is usable. Sakura answers `"playlist": "sub"` and
+        // `"dub"` — a SUB/DUB pair it advertises as `hls` but never resolves to
+        // an address — and Canaias does the same in `qualities` with a slug like
+        // "redeflix-720p". Both would reach the player as an unresolvable host.
+        stream.playlist?.takeIf { it.startsWith("http") }?.let { playlist ->
             // Master playlists here carry up to 2160p plus several audio
             // renditions, so they are expanded: handed over whole the player
             // would offer one unselectable rendition.
@@ -1352,12 +1356,24 @@ class RentaroExtractor(
          * Servers enabled out of the box: the ones that answered with a playlist
          * that actually serves.
          *
-         * Probed across three titles (two series, one film). Lisbon, Nebula and
-         * Solara returned a working HLS master for all three; Castle for two,
-         * and it is the only server carrying subtitles. The rest are excluded:
-         * Athens, Joy and Sakura returned no stream for any title, and Canaias
-         * advertises progressive files whose `url` is a slug ("redeflix-720p")
-         * rather than a URL, so nothing it offers is playable.
+         * Probed across Western live-action, anime and Brazilian titles, films
+         * and episodes. Lisbon, Nebula and Solara returned a working HLS master
+         * throughout; Castle for most, and it is the only server carrying
+         * captions.
+         *
+         * The four excluded are not regional gaps in the probe set - each was
+         * retested against content matching its own flag:
+         *
+         *  - Athens and Joy answered nothing for any of eight varied titles.
+         *  - Sakura is anime-only and does respond there, but only ever as
+         *    `"playlist": "sub"` / `"dub"`: a SUB/DUB pair with no address.
+         *  - Canaias (BR) lists progressive files whose `url` is a slug such as
+         *    "redeflix-720p".
+         *
+         * So all four are advertised-but-unresolvable rather than merely absent,
+         * and [cineJoyVideosForStream] drops anything that is not an absolute
+         * URL. If the backend starts returning real addresses for these, they
+         * become usable by enabling them here - no other change needed.
          */
         val CINEJOY_SERVER_DEFAULT: Set<String> = setOf(
             "Lisbon",
@@ -1366,12 +1382,24 @@ class RentaroExtractor(
             "Castle",
         )
 
-        /** Servers that returned no playable stream for any probe title. */
-        private val CINEJOY_KNOWN_DEAD = setOf("Athens", "Joy", "Sakura", "Canaias")
+        /**
+         * Servers that never resolved to a playable address when tested.
+         *
+         * Sakura is listed separately in the picker note because it is the one
+         * that does carry anime and may simply be unfinished upstream.
+         */
+        private val CINEJOY_KNOWN_DEAD = setOf("Athens", "Joy", "Canaias")
+
+        /** Servers whose response is a placeholder rather than a URL. */
+        private val CINEJOY_PLACEHOLDER_ONLY = setOf("Sakura")
 
         /** Entry labels for the CineJoy server preference, ordered as the list is. */
         fun cineJoyServerEntries(): List<String> = CINEJOY_SERVERS.map { server ->
-            val note = if (server in CINEJOY_KNOWN_DEAD) " - no video when tested" else ""
+            val note = when (server) {
+                in CINEJOY_PLACEHOLDER_ONLY -> " - anime only, no playable URL yet"
+                in CINEJOY_KNOWN_DEAD -> " - no video when tested"
+                else -> ""
+            }
             "$server$note"
         }
 
