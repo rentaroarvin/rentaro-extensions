@@ -36,6 +36,43 @@ the index repository.
 | --- | --- |
 | Rentaro | en |
 
+## Progressive stream resolution
+
+Rentaro resolves four unrelated backends for every episode. They differ widely in
+cost — one typically answers in well under a second while another needs a
+three-hop encrypt/decrypt chain — so returning a single finished list means a
+stream that was ready immediately is withheld until the slowest backend has
+finished.
+
+The extension therefore also implements `ProgressiveVideoSource`, which reports
+streams as each backend answers:
+
+```kotlin
+interface ProgressiveVideoSource : AnimeSource {
+    fun getVideoListFlow(episode: SEpisode): Flow<List<Video>>
+}
+```
+
+Every emission is cumulative and fully ordered, so a host can treat the latest as
+the whole list without merging anything. Playback can start on whichever backend
+lands first, and the picker fills in as the others report.
+
+This is **opt-in and detected with `is`**, exactly as `ConfigurableAnimeSource`
+already is. A host that does not know the interface keeps calling
+`getVideoList`, which returns the flow's terminal emission — the same list, in
+the same order. Support currently exists in
+[WatchBox](https://github.com/nicartjay/watchbox) 4.12.0 and later.
+
+The interface is declared in `lib/hostapi` because `aniyomi-extensions-lib` does
+not ship it. That module is consumed with `compileOnly`, so the class is
+*referenced* by the extension and *defined* only by the host — the same
+arrangement as the rest of the `eu.kanade.tachiyomi` ABI. Bundling a copy would
+be worse than omitting it: the host's interface and a packaged duplicate are
+different types to the classloader, the `is` check would never match, and the
+extension would silently fall back to the blocking path. `assembleDebug` output
+can be checked with `dexdump` to confirm nothing under
+`eu/kanade/tachiyomi/animesource` is ever defined in the APK.
+
 ## Building
 
 Requires a JDK (17 matches CI; 21 also works) and the Android SDK.

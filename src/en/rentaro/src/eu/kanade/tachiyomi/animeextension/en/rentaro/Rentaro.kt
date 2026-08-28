@@ -6,6 +6,7 @@ import android.text.InputType
 import androidx.annotation.RequiresApi
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.ProgressiveVideoSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -24,6 +25,8 @@ import keiyoushi.utils.parallelCatchingMapNotNull
 import keiyoushi.utils.parallelMapNotNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.last
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
@@ -34,7 +37,8 @@ import java.util.Locale
 
 class Rentaro :
     AnimeHttpSource(),
-    ConfigurableAnimeSource {
+    ConfigurableAnimeSource,
+    ProgressiveVideoSource {
 
     override val name = "Rentaro"
 
@@ -589,13 +593,25 @@ class Rentaro :
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException("Not used")
 
     // ============================ Video Links ============================
+
+    /**
+     * Streams for [episode], emitted as each backend answers.
+     *
+     * Four unrelated backends are resolved concurrently and they differ widely in
+     * cost, so joining them all before returning withholds a stream that was
+     * ready in under a second until the slowest one finishes. Hosts that
+     * recognise [ProgressiveVideoSource] collect this instead and can start
+     * playback on whichever lands first.
+     *
+     * Emissions are cumulative and fully ordered; [getVideoList] is the last one.
+     */
     @RequiresApi(Build.VERSION_CODES.N)
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+    override fun getVideoListFlow(episode: SEpisode): Flow<List<Video>> {
         val (path, extraDataEncoded) = episode.url.split("#", limit = 2)
         val (title, year, imdbId) =
             extraDataEncoded.parseAs<Triple<String, String, String>>()
 
-        return extractor.videosFromUrl(
+        return extractor.videosFlowFromUrl(
             path = path,
             title = title,
             year = year,
@@ -608,6 +624,15 @@ class Rentaro :
             enabledCineJoyServers = preferences.enabledCineJoyServers,
         )
     }
+
+    /**
+     * The finished list, for hosts that do not know about [getVideoListFlow].
+     *
+     * Delegates to the flow's terminal emission so the ordering rules are not
+     * duplicated: both paths return the same list in the same order.
+     */
+    @RequiresApi(Build.VERSION_CODES.N)
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListFlow(episode).last()
 
     // ============================== Settings ==============================
     private val SharedPreferences.popularListPref by preferences.delegate(

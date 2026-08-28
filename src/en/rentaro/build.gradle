@@ -1,7 +1,7 @@
 ext {
     extName = 'Rentaro'
     extClass = '.Rentaro'
-    extVersionCode = 27
+    extVersionCode = 28
     isNsfw = true
 }
 
@@ -9,4 +9,8 @@ apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
     implementation(project(':lib:playlistutils'))
+    // Declarations of host-owned interfaces. compileOnly on purpose: the classes
+    // must be referenced by this dex and defined only by the host, or an `is`
+    // check would compare against a bundled duplicate and never match.
+    compileOnly(project(':lib:hostapi'))
 }

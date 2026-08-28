@@ -15,7 +15,11 @@ import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.last
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -59,24 +63,18 @@ class RentaroExtractor(
         val expiresAtMillis: Long,
     )
 
-    /**
-     * One list per backend, destructured at the call site.
-     *
-     * A data class rather than a Triple because there are four backends now, and
-     * a positional Quadruple would make the awaits easy to mismatch.
-     */
-    private data class BackendResults(
-        val videasy: List<Video>,
-        val vidLink: List<Video>,
-        val nexus: List<Video>,
-        val cineJoy: List<Video>,
-    )
-
     private data class FailureState(
         val count: Int,
         val lastFailureAtMillis: Long,
     )
 
+    /**
+     * Resolves every enabled backend and returns the finished list.
+     *
+     * Kept as the terminal value of [videosFlowFromUrl] so the ordering rules
+     * live in one place: a host that cannot collect a flow gets exactly what a
+     * host that can would see last.
+     */
     @RequiresApi(Build.VERSION_CODES.N)
     suspend fun videosFromUrl(
         path: String,
@@ -88,7 +86,47 @@ class RentaroExtractor(
         qualityPref: String,
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
-    ): List<Video> {
+    ): List<Video> = videosFlowFromUrl(
+        path,
+        title,
+        year,
+        imdbId,
+        enabledServers,
+        subLimit,
+        qualityPref,
+        enabledNexusProviders,
+        enabledCineJoyServers,
+    ).last()
+
+    /**
+     * Resolves every enabled backend, emitting the list again each time one
+     * answers.
+     *
+     * The four backends are unrelated services and differ enormously in cost -
+     * Nexus answers a title in well under a second while CineJoy's three-hop
+     * enc-dec chain takes several, and neither has a circuit breaker, so a hung
+     * backend costs its full timeout on every episode. Waiting for all four
+     * before returning anything means a stream that was ready immediately is
+     * withheld for as long as the slowest one takes.
+     *
+     * Emissions are cumulative and fully ordered, per the [ProgressiveVideoSource]
+     * contract: each one carries every stream found so far, so a collector can
+     * treat the latest as the whole list. Ordering is recomputed each time rather
+     * than appended, because a backend that lands late still belongs in its
+     * catalogue position - but nothing already emitted is ever removed.
+     */
+    @RequiresApi(Build.VERSION_CODES.N)
+    fun videosFlowFromUrl(
+        path: String,
+        title: String,
+        year: String,
+        imdbId: String,
+        enabledServers: Set<String>,
+        subLimit: Int,
+        qualityPref: String,
+        enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
+        enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
+    ): Flow<List<Video>> = channelFlow {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
         val tmdbId = pathParts[1]
@@ -102,8 +140,11 @@ class RentaroExtractor(
         val nexusEnabled = NEXUS_NAME in enabledServers
         val cineJoyEnabled = CINEJOY_NAME in enabledServers
 
+        // Emitted even when nothing is enabled: the contract asks for at least
+        // one emission so the host can tell "none found" from "still working".
         if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled && !cineJoyEnabled) {
-            return emptyList()
+            send(emptyList())
+            return@channelFlow
         }
 
         // The Videasy backends ignore Referer/Origin entirely, but the stream
@@ -113,54 +154,67 @@ class RentaroExtractor(
             .set("Origin", PLAYER_ORIGIN)
             .build()
 
-        // The four backends are unrelated services, so they are resolved
-        // concurrently: the wait becomes the slowest of them rather than their
-        // sum. Each keeps its own failure handling, since they differ.
-        //
-        // Servers *within* a backend were already parallel; it was only these
-        // that ran one after another.
-        val (videasyVideos, vidLinkVideos, nexusVideos, cineJoyVideos) = coroutineScope {
-            val videasyTask = async {
+        val found = mutableListOf<Video>()
+        val lock = Mutex()
+        var published = false
+
+        suspend fun publish(batch: List<Video>) {
+            lock.withLock {
+                // An empty batch from the last outstanding backend still has to
+                // produce an emission when no other backend found anything.
+                if (batch.isEmpty() && published) return
+                found += batch
+                published = true
+                send(orderVideos(found, qualityPref))
+            }
+        }
+
+        // Servers *within* a backend are already resolved in parallel; these four
+        // run concurrently with each other and report independently.
+        val tasks = listOf(
+            async {
                 if (eligibleServers.isEmpty()) {
                     emptyList()
                 } else {
-                    videasyVideos(
-                        eligibleServers,
-                        path,
-                        title,
-                        year,
-                        imdbId,
-                        tmdbId,
-                        seasonId,
-                        episodeId,
-                        isMovie,
-                        backendHeaders,
-                        subLimit,
-                    )
+                    // Videasy is the one backend whose own failures are not
+                    // absorbed per server, so a bad seed or enc-dec.app being
+                    // down would otherwise propagate and cancel the siblings.
+                    runCatching {
+                        videasyVideos(
+                            eligibleServers,
+                            path,
+                            title,
+                            year,
+                            imdbId,
+                            tmdbId,
+                            seasonId,
+                            episodeId,
+                            isMovie,
+                            backendHeaders,
+                            subLimit,
+                        )
+                    }.getOrDefault(emptyList())
                 }
-            }
-
-            // VidLink is an independent backend, so a Videasy-wide failure (a
-            // bad seed, enc-dec.app being down) must not take it with it.
+            },
+            // VidLink is an independent backend, so a Videasy-wide failure must
+            // not take it with it.
             //
-            // Only IOException is absorbed here. A blanket catch previously hid
-            // a NoSuchFieldError thrown during token class-init on older
-            // devices, so the server silently vanished instead of surfacing the
-            // fault.
-            val vidLinkTask = async {
+            // Only IOException is absorbed here. A blanket catch previously hid a
+            // NoSuchFieldError thrown during token class-init on older devices,
+            // so the server silently vanished instead of surfacing the fault.
+            async {
                 if (!vidLinkEnabled) {
                     emptyList()
                 } else {
                     try {
                         vidLinkVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
-                    } catch (e: IOException) {
+                    } catch (_: IOException) {
                         emptyList()
                     }
                 }
-            }
-
+            },
             // Nexus is a third independent backend with its own encrypted API.
-            val nexusTask = async {
+            async {
                 if (!nexusEnabled) {
                     emptyList()
                 } else {
@@ -170,11 +224,11 @@ class RentaroExtractor(
                         emptyList()
                     }
                 }
-            }
-
+            },
             // CineJoy is a fourth independent backend, reached through its own
-            // encrypt/decrypt chain.
-            val cineJoyTask = async {
+            // encrypt/decrypt chain. Usually the slowest, which is the whole
+            // reason the others are not made to wait for it.
+            async {
                 if (!cineJoyEnabled) {
                     emptyList()
                 } else {
@@ -194,26 +248,27 @@ class RentaroExtractor(
                         emptyList()
                     }
                 }
-            }
+            },
+        )
 
-            BackendResults(
-                videasyTask.await(),
-                vidLinkTask.await(),
-                nexusTask.await(),
-                cineJoyTask.await(),
-            )
-        }
+        // Whichever finishes first is published first, so the picker fills in as
+        // the backends report rather than all at once at the end.
+        tasks.forEach { task -> publish(task.await()) }
+    }
 
-        // Grouped by server, best quality first inside each group.
-        //
-        // Every label is built as "<server> · <detail>…", so the leading segment
-        // identifies the group. Server order follows the catalogue rather than
-        // the alphabet, which keeps a preferred server near the top instead of
-        // scattering one server's entries through the list. Preferred Quality
-        // then orders entries within a group, not across the whole list.
+    /**
+     * Groups by server, best quality first inside each group.
+     *
+     * Every label is built as "<server> · <detail>…", so the leading segment
+     * identifies the group. Server order follows the catalogue rather than the
+     * alphabet, which keeps a preferred server near the top instead of scattering
+     * one server's entries through the list. Preferred Quality then orders
+     * entries within a group, not across the whole list.
+     */
+    private fun orderVideos(videos: List<Video>, qualityPref: String): List<Video> {
         val serverRank = SERVER_ORDER_HINT.withIndex().associate { (index, name) -> name to index }
 
-        return (videasyVideos + vidLinkVideos + nexusVideos + cineJoyVideos)
+        return videos
             .groupBy { videoServerName(it.quality) }
             .toList()
             .sortedBy { (server, _) ->
