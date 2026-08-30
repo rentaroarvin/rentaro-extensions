@@ -13,7 +13,6 @@ import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonRequestBody
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -35,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Resolves Videasy embeds for a Rentaro episode/movie: double-encoded
- * /sources-with-title request → enc-dec.app decrypt → HLS expansion +
+ * /sources-with-title request → in-process `enc=2` decrypt → HLS expansion +
  * subtitle/quality formatting.
  */
 class RentaroExtractor(
@@ -357,12 +356,17 @@ class RentaroExtractor(
                     GET(serverUrl.toString(), backendHeaders),
                 ).awaitSuccess().bodyString()
 
-                val requestBody = mapOf("text" to encryptedText, "id" to tmdbId, "seed" to seed)
-                    .toJsonRequestBody()
-                val decrypted = client.newCall(POST(DECRYPTION_API_URL, body = requestBody))
-                    .awaitSuccess()
-                    .parseAs<VideasyDecryptionDto>()
-                    .result
+                // Decrypted in-process rather than by enc-dec.app. That service
+                // ran the player's own algorithm — its failure string is the
+                // same literal found in the site bundle — so the round trip
+                // added a dependency without adding capability.
+                val plaintext = VideasyCipher.decrypt(
+                    payload = encryptedText.trim().trim('"'),
+                    seed = seed,
+                    mediaId = tmdbId.toIntOrNull() ?: throw IOException("bad tmdbId: $tmdbId"),
+                ) ?: throw IOException("videasy decrypt failed for ${server.displayName}")
+
+                val decrypted = plaintext.parseAs<VideasyDecryptedResult>()
 
                 synchronized(resultCacheLock) {
                     resultCache.put(cacheKey, CachedResult(decrypted, now + CACHE_TTL_MS))
@@ -1488,7 +1492,6 @@ class RentaroExtractor(
         private const val PLAYER_ORIGIN = "https://player.videasy.to"
 
         private const val VIDEASY_API_BASE = "https://api.speedracelight.com"
-        private const val DECRYPTION_API_URL = "https://enc-dec.app/api/dec-videasy"
 
         // VidLink: a second, independent backend. It signs its own requests and
         // needs no external decryption service, so it keeps working even if the

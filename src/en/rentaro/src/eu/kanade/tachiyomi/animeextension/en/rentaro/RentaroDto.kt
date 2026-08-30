@@ -142,12 +142,8 @@ data class SeedDto(
 )
 
 // ============================ Videasy Decryption ============================
-@Serializable
-data class VideasyDecryptionDto(
-    val status: Int,
-    val result: VideasyDecryptedResult,
-)
-
+// The `enc=2` payload is decrypted in-process by VideasyCipher, so only the
+// plaintext shape is modelled; there is no longer a remote envelope to unwrap.
 @Serializable
 data class VideasyDecryptedResult(
     // Current shape (mb-flix, cdn, myflixerzupcloud, 1movies, lamovie, ...):
