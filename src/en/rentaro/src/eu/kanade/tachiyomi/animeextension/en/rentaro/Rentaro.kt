@@ -890,7 +890,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art", "Jay")
+            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art", "Jay", "Dave")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -928,6 +928,8 @@ class Rentaro :
             // without this it would stay switched off on every existing install
             // despite being in PREF_SERVERS_DEFAULT.
             "pref_optin_jay" to setOf("Jay"),
+            // CineFlix shipped as "Dave" in v30, on the same one-shot basis.
+            "pref_optin_dave" to setOf("Dave"),
         )
 
         /**

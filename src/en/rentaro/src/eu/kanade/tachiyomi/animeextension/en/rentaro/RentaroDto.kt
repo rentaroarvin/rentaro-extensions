@@ -396,3 +396,60 @@ data class CineJoyCaptionDto(
     val type: String? = null,
     val id: String? = null,
 )
+
+// ============================= CineFlix =============================
+// Fifth independent backend. Plain JSON throughout: a suggestions endpoint
+// resolves a title to the slug its playback API needs, then a proof of work
+// releases the stream. No external decryption service is involved.
+@Serializable
+data class CineFlixSuggestionsDto(
+    val items: List<CineFlixSuggestionDto> = emptyList(),
+)
+
+@Serializable
+data class CineFlixSuggestionDto(
+    // Trailing token of the slug; the slug itself arrives in `href`.
+    val id: String? = null,
+    val href: String? = null,
+    val title: String? = null,
+    // "movie" or "series" — the only signal separating the two, since a query
+    // readily returns both.
+    val type: String? = null,
+    val year: Int? = null,
+    // TMDB path, which is unique per title and so confirms the match.
+    val posterUrl: String? = null,
+) {
+    /** Slug the playback API expects, taken from `href` and verified. */
+    val slug: String?
+        get() = href?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+}
+
+@Serializable
+data class CineFlixChallengeDto(
+    val challengeId: String? = null,
+    val challenge: String? = null,
+    val difficulty: Int? = null,
+    val expiresAt: Long? = null,
+)
+
+@Serializable
+data class CineFlixStreamResponseDto(
+    val stream: CineFlixStreamDto? = null,
+    val tracks: List<CineFlixTrackDto> = emptyList(),
+)
+
+@Serializable
+data class CineFlixStreamDto(
+    val url: String? = null,
+    // "hls" for every stream seen so far.
+    val type: String? = null,
+)
+
+@Serializable
+data class CineFlixTrackDto(
+    // "captions" for subtitles; other kinds are ignored.
+    val kind: String? = null,
+    val file: String? = null,
+    val language: String? = null,
+    val label: String? = null,
+)

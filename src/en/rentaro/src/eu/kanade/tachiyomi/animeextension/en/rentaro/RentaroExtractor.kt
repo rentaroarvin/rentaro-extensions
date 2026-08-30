@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.last
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Headers
@@ -138,10 +139,13 @@ class RentaroExtractor(
         val vidLinkEnabled = VIDLINK_NAME in enabledServers
         val nexusEnabled = NEXUS_NAME in enabledServers
         val cineJoyEnabled = CINEJOY_NAME in enabledServers
+        val cineFlixEnabled = CINEFLIX_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
-        if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled && !cineJoyEnabled) {
+        if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled &&
+            !cineJoyEnabled && !cineFlixEnabled
+        ) {
             send(emptyList())
             return@channelFlow
         }
@@ -243,6 +247,19 @@ class RentaroExtractor(
                             enabledCineJoyServers,
                             subLimit,
                         )
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // CineFlix is a fifth independent backend, and the cheapest: plain
+            // JSON both ways, with a proof of work solved in-process.
+            async {
+                if (!cineFlixEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        cineFlixVideos(title, year, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -789,6 +806,180 @@ class RentaroExtractor(
             ".mp4" in lower -> parts += "MP4"
             ".mkv" in lower -> parts += "MKV"
         }
+        if (subCount > 0) parts += "$subCount subs"
+        return parts.joinToString(" · ")
+    }
+
+    /**
+     * Resolves a title through CineFlix.
+     *
+     * Three plain-JSON hops, with no external decryption service anywhere:
+     *
+     *  1. `/api/search/suggestions?q=` maps the title to the slug its playback
+     *     API needs. That slug ends in a ten-character id which is the site's
+     *     own and cannot be derived from TMDB data, so the lookup is required.
+     *  2. `/api/playback/challenge` issues a challenge and a difficulty.
+     *  3. `/api/playback/stream` releases the stream for a counter that clears
+     *     it, solved in-process by [CineFlixProof].
+     *
+     * The challenge endpoint accepts any slug, so a wrong one is not caught
+     * until step three answers `P003`; the match is therefore verified before
+     * the proof is attempted rather than after.
+     */
+    private suspend fun cineFlixVideos(
+        title: String,
+        year: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val slug = cineFlixSlug(title, year, isMovie) ?: return emptyList()
+
+        val apiHeaders = headers.newBuilder()
+            .set("Referer", "$CINEFLIX_ORIGIN/")
+            .set("Origin", CINEFLIX_ORIGIN)
+            .set("Accept", "application/json")
+            .build()
+
+        val challengeBody = buildJsonObject {
+            put("slug", slug)
+            // Both are null for a film; the API distinguishes on their presence.
+            if (isMovie) {
+                put("season", JsonNull)
+                put("episode", JsonNull)
+            } else {
+                put("season", seasonId.toIntOrNull() ?: 1)
+                put("episode", episodeId.toIntOrNull() ?: 1)
+            }
+        }.toString().toRequestBody(JSON_MEDIA_TYPE)
+
+        val challenge = client.newCall(
+            POST("$CINEFLIX_API_BASE/api/playback/challenge", apiHeaders, challengeBody),
+        ).awaitSuccess().parseAs<CineFlixChallengeDto>()
+
+        val challengeId = challenge.challengeId?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val puzzle = challenge.challenge?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val counter = CineFlixProof.solve(puzzle, challenge.difficulty ?: 0) ?: return emptyList()
+
+        val streamBody = buildJsonObject {
+            put("challengeId", challengeId)
+            put("counter", counter)
+        }.toString().toRequestBody(JSON_MEDIA_TYPE)
+
+        val response = client.newCall(
+            POST("$CINEFLIX_API_BASE/api/playback/stream", apiHeaders, streamBody),
+        ).awaitSuccess().parseAs<CineFlixStreamResponseDto>()
+
+        val playlist = response.stream?.url?.takeIf { it.startsWith("http") } ?: return emptyList()
+
+        val subtitles = response.tracks
+            .filter { it.kind.equals("captions", ignoreCase = true) }
+            .mapNotNull { track ->
+                val file = track.file?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                Track(file, track.label ?: track.language ?: "Unknown")
+            }
+            .take(subLimit.coerceAtLeast(0))
+
+        // Same CDN the Art backend already streams from, which serves the
+        // playlist and its segments without a Referer.
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$CINEFLIX_ORIGIN/")
+            .build()
+
+        val expanded = runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = playlist,
+                videoNameGen = { variant -> cineFlixLabel(variant, playlist, subtitles.size) },
+                subtitleList = subtitles,
+                masterHeaders = streamHeaders,
+                videoHeaders = streamHeaders,
+            )
+        }.getOrDefault(emptyList())
+
+        // This CDN disguises HLS as images: the variant playlists are named
+        // "playlist.jpg", their segments "playlist_NNN.jpg", and every one is
+        // served as image/jpeg. The media is genuine fMP4, so only a player that
+        // picks its parser from the URL is misled.
+        //
+        // A "#.m3u8" fragment makes the URL self-describing without altering the
+        // request, since a fragment is never sent to the server and relative
+        // segment URIs still resolve against the same base.
+        return expanded.map { video ->
+            val hinted = hlsHintedUrl(video.videoUrl ?: video.url)
+            if (hinted == null) {
+                video
+            } else {
+                Video(
+                    url = hinted,
+                    quality = video.quality,
+                    videoUrl = hinted,
+                    headers = video.headers,
+                    subtitleTracks = video.subtitleTracks,
+                    audioTracks = video.audioTracks,
+                )
+            }
+        }.ifEmpty {
+            listOf(
+                Video(
+                    url = playlist,
+                    quality = cineFlixLabel("Auto", playlist, subtitles.size),
+                    videoUrl = playlist,
+                    headers = streamHeaders,
+                    subtitleTracks = subtitles,
+                ),
+            )
+        }
+    }
+
+    /**
+     * Finds the CineFlix slug for a title.
+     *
+     * Suggestions are a fuzzy match that readily returns both a film and a
+     * series for one query, so the result is filtered by kind and then scored:
+     * an exact title with the right year beats a looser match, and a candidate
+     * is only accepted if something corroborates it. Ordering alone is not
+     * trusted, because a wrong slug still yields a challenge and only fails two
+     * requests later.
+     */
+    private suspend fun cineFlixSlug(title: String, year: String, isMovie: Boolean): String? {
+        val url = "$CINEFLIX_API_BASE/api/search/suggestions".toHttpUrl().newBuilder()
+            .addQueryParameter("q", title)
+            .build()
+
+        val items = client.newCall(GET(url.toString(), headers))
+            .awaitSuccess()
+            .parseAs<CineFlixSuggestionsDto>()
+            .items
+
+        val wanted = if (isMovie) "movie" else "series"
+        val candidates = items.filter { it.type.equals(wanted, ignoreCase = true) }
+        if (candidates.isEmpty()) return null
+
+        val normalisedTitle = normaliseTitle(title)
+        val wantedYear = year.take(4).toIntOrNull()
+
+        return candidates
+            .maxByOrNull { candidate ->
+                var score = 0
+                if (normaliseTitle(candidate.title ?: "") == normalisedTitle) score += 2
+                if (wantedYear != null && candidate.year == wantedYear) score += 1
+                score
+            }
+            ?.takeIf { candidate ->
+                // Require corroboration: an exact title, or the right year.
+                normaliseTitle(candidate.title ?: "") == normalisedTitle ||
+                    (wantedYear != null && candidate.year == wantedYear)
+            }
+            ?.slug
+    }
+
+    /** Lowercases and drops punctuation so titles compare on words alone. */
+    private fun normaliseTitle(value: String): String = value.lowercase().filter { it.isLetterOrDigit() || it == ' ' }.trim()
+
+    private fun cineFlixLabel(quality: String, url: String, subCount: Int): String {
+        val parts = mutableListOf(CINEFLIX_NAME, quality)
+        if (".m3u8" in url.lowercase()) parts += "HLS"
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
     }
@@ -1521,6 +1712,13 @@ class RentaroExtractor(
         private const val CINEJOY_ENC_URL = "https://enc-dec.app/api/enc-cinejoy"
         private const val CINEJOY_DEC_URL = "https://enc-dec.app/api/dec-cinejoy"
 
+        // CineFlix: a fifth independent backend, and the only one whose whole
+        // chain is plain JSON. Its proof of work is solved in-process, so it
+        // needs no external decryption service and no browser runtime.
+        private const val CINEFLIX_NAME = "Dave"
+        private const val CINEFLIX_API_BASE = "https://cineflix.st"
+        private const val CINEFLIX_ORIGIN = "https://cineflix.st"
+
         private const val HTTP_OK = 200
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -1943,7 +2141,8 @@ class RentaroExtractor(
          * [VIDEASY_SERVERS].
          */
         val SERVER_DISPLAY_NAMES: List<String> =
-            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME + CINEJOY_NAME
+            VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME +
+                CINEJOY_NAME + CINEFLIX_NAME
 
         /**
          * Order the video list groups servers in. Mirrors [SERVER_DISPLAY_NAMES]
@@ -1964,6 +2163,7 @@ class RentaroExtractor(
             VIDLINK_NAME -> "Original"
             NEXUS_NAME -> "Multi-Lang"
             CINEJOY_NAME -> "Multi-Lang"
+            CINEFLIX_NAME -> "Original"
             else -> VIDEASY_SERVERS.firstOrNull { it.displayName == displayName }
                 ?.audioLabel ?: "Unknown"
         }
