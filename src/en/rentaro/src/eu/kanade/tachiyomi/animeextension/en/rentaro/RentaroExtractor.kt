@@ -560,15 +560,18 @@ class RentaroExtractor(
 
     /**
      * CineJoy is a fourth independent backend, and the only one whose request
-     * body has to be built remotely. Three calls per server:
+     * body has to be built remotely. Two calls per server:
      *
      *  1. `enc-cinejoy?url=…`  the query is handed to enc-dec.app, which
-     *     returns the opaque POST body plus the `state` needed to read the
-     *     reply.
+     *     returns the opaque POST body plus the key and additional data needed
+     *     to read the reply.
      *  2. `POST api.shegu.st/g`  the body from step 1, sent as raw bytes;
-     *     answers ciphertext.
-     *  3. `POST dec-cinejoy`  ciphertext plus `state` back to enc-dec.app,
-     *     which returns the stream list as plain JSON.
+     *     answers ciphertext, which [CineJoyCipher] decrypts here.
+     *
+     * The site builds the request body in a WASM module, which is why step 1
+     * is still remote. The reply needs no such help: it is ordinary
+     * AES-256-GCM and the key arrives in plain, so decrypting in-process drops
+     * a round trip that used to sit on the critical path.
      *
      * Each upstream server is a separate chain, so they are resolved
      * concurrently and one failing cannot lose the others.
@@ -637,7 +640,18 @@ class RentaroExtractor(
         if (enc.status != HTTP_OK) return emptyList()
         val encResult = enc.result ?: return emptyList()
         val payload = encResult.data?.takeIf { it.isNotBlank() } ?: return emptyList()
+
+        // Both are base64url and both are required: the key decrypts the reply,
+        // and the additional data binds it to this exact request.
         val state = encResult.state ?: return emptyList()
+        val responseKey = state.responseKey
+            ?.let { CineJoyCipher.decodeBase64(it) }
+            ?: return emptyList()
+        val requestBody = base64UrlDecode(payload)
+        val aad = state.aad
+            ?.let { CineJoyCipher.decodeBase64(it) }
+            ?: CineJoyCipher.aadFor(requestBody)
+            ?: return emptyList()
 
         // The site posts these bytes verbatim; it is ciphertext, not JSON, so it
         // is sent as an octet-stream rather than through a JSON body helper.
@@ -645,26 +659,23 @@ class RentaroExtractor(
             .set("Referer", "$CINEJOY_ORIGIN/")
             .set("Origin", CINEJOY_ORIGIN)
             .build()
-        val encryptedBody = base64UrlDecode(payload)
-            .toRequestBody(OCTET_STREAM)
-        val encrypted = client.newCall(POST(CINEJOY_UPSTREAM_URL, siteHeaders, encryptedBody))
+        val encrypted = client.newCall(
+            POST(CINEJOY_UPSTREAM_URL, siteHeaders, requestBody.toRequestBody(OCTET_STREAM)),
+        )
             .awaitSuccess()
             .body
             .bytes()
         if (encrypted.isEmpty()) return emptyList()
 
-        val decBody = buildJsonObject {
-            put("text", base64UrlEncode(encrypted))
-            put("state", state)
-        }.toString().toRequestBody(JSON_MEDIA_TYPE)
-        val dec = client.newCall(POST(CINEJOY_DEC_URL, headers, decBody))
-            .awaitSuccess()
-            .parseAs<CineJoyDecDto>()
-        if (dec.status != HTTP_OK) return emptyList()
+        // Null means the reply failed authentication, which a mismatched key or
+        // a truncated body would both cause.
+        val plaintext = CineJoyCipher.decrypt(encrypted, responseKey, aad)
+            ?: return emptyList()
+        val dec = plaintext.parseAs<CineJoyDecResultDto>()
 
         // A server with no match for the title reports it by omitting `stream`
         // rather than by status code.
-        val streams = dec.result?.data?.stream.orEmpty()
+        val streams = dec.data?.stream.orEmpty()
         if (streams.isEmpty()) return emptyList()
 
         return streams.flatMap { stream -> cineJoyVideosForStream(server, stream, subLimit) }
@@ -988,8 +999,6 @@ class RentaroExtractor(
         val padded = value.padEnd(value.length + (4 - value.length % 4) % 4, '=')
         return Base64.decode(padded, Base64.URL_SAFE)
     }
-
-    private fun base64UrlEncode(value: ByteArray): String = Base64.encodeToString(value, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
 
     // ======================== Nexus (Art) backend ========================
 
@@ -1702,15 +1711,14 @@ class RentaroExtractor(
         private const val VIDLINK_PLAYBACK_ENV = "dash-hevc"
 
         // CineJoy: a fourth independent backend. Unlike the others its request
-        // body is built remotely, so a call needs enc-dec.app on the way out as
-        // well as on the way back.
+        // body is built remotely, since the site assembles it in a WASM module.
+        // The reply needs no such help and is decrypted in-process.
         private const val CINEJOY_NAME = "Jay"
         private const val CINEJOY_API_BASE = "https://api.shegu.st/"
         private const val CINEJOY_UPSTREAM_URL = "https://api.shegu.st/g"
         private const val CINEJOY_SERVERS_URL = "https://api.shegu.st/servers"
         private const val CINEJOY_ORIGIN = "https://cinejoy.to"
         private const val CINEJOY_ENC_URL = "https://enc-dec.app/api/enc-cinejoy"
-        private const val CINEJOY_DEC_URL = "https://enc-dec.app/api/dec-cinejoy"
 
         // CineFlix: a fifth independent backend, and the only one whose whole
         // chain is plain JSON. Its proof of work is solved in-process, so it

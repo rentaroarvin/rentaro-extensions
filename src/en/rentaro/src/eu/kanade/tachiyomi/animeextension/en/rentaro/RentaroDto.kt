@@ -3,7 +3,6 @@ package eu.kanade.tachiyomi.animeextension.en.rentaro
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -310,10 +309,10 @@ data class NexusSourceDto(
 }
 
 // ============================ CineJoy ============================
-// Fourth independent backend. Its API answers an encrypted body, so the flow is
-// three calls: enc-dec.app builds the request payload, api.shegu.st/g returns
-// the ciphertext, then enc-dec.app decrypts it. Only the decrypted shape and
-// the two enc-dec.app envelopes are modelled here.
+// Fourth independent backend. Its API answers an encrypted body, so two calls
+// are needed: enc-dec.app builds the request payload, then api.shegu.st/g
+// returns the ciphertext. The reply is decrypted in-process by [CineJoyCipher],
+// since the enc step hands back the AES key and additional data in plain.
 
 /** One upstream scraper CineJoy exposes, from `/servers`. */
 @Serializable
@@ -348,16 +347,21 @@ data class CineJoyEncDto(
 data class CineJoyEncResultDto(
     // base64url, no padding: decoded to raw bytes for the upstream POST.
     val data: String? = null,
-    // Opaque; echoed back to `dec-cinejoy` verbatim.
-    val state: JsonElement? = null,
+    val state: CineJoyStateDto? = null,
 )
 
-/** `dec-cinejoy` response. */
+/**
+ * Decryption material for the reply, returned in plain by the enc step.
+ *
+ * `aad` binds the reply to the exact request that produced it, which is why it
+ * has to be carried through rather than reconstructed.
+ */
 @Serializable
-data class CineJoyDecDto(
-    val status: Int? = null,
-    val result: CineJoyDecResultDto? = null,
-    val error: String? = null,
+data class CineJoyStateDto(
+    // base64url: the 32-byte AES-256-GCM key.
+    val responseKey: String? = null,
+    // base64url: the additional data the reply authenticates against.
+    val aad: String? = null,
 )
 
 @Serializable
