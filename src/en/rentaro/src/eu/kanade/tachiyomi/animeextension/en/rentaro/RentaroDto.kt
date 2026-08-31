@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.en.rentaro
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -424,4 +425,100 @@ data class CineFlixTrackDto(
     val file: String? = null,
     val language: String? = null,
     val label: String? = null,
+)
+
+// ============================ VidFast ============================
+// Sixth backend, and the only one that still needs enc-dec.app.
+//
+// Its responses are encrypted by a bytecode VM embedded in the player bundle:
+// the payload is handed to an interpreter along with a virtualised global
+// environment, so there is no cipher to lift out and reimplement. The site also
+// detects devtools and stalls, which rules out capturing the algorithm from a
+// running page. Two calls per resolve therefore go through enc-dec.app — the
+// only remote dependency left in this extension.
+//
+// What *is* local: the CSRF token and the request base path are constants in the
+// bundle and are scraped by [RentaroExtractor.vidFastConstants], so only the two
+// cipher steps are remote. See VIDFAST_* in RentaroExtractor for what removing
+// the dependency would take.
+
+/** `enc-vidfast` response: the two request URLs plus the CSRF token. */
+@Serializable
+data class VidFastEncDto(
+    val status: Int? = null,
+    val result: VidFastEncResultDto? = null,
+    val error: String? = null,
+)
+
+@Serializable
+data class VidFastEncResultDto(
+    // Absolute URL the server list is POSTed to.
+    val servers: String? = null,
+    // Absolute URL prefix; the chosen server's `data` is appended as a segment.
+    val stream: String? = null,
+    // Echoed back as the X-CSRF-Token header on both POSTs.
+    val token: String? = null,
+)
+
+/** `dec-vidfast` response for the server list. */
+@Serializable
+data class VidFastServersDto(
+    val status: Int? = null,
+    val result: List<VidFastServerDto> = emptyList(),
+    val error: String? = null,
+)
+
+@Serializable
+data class VidFastServerDto(
+    // Upstream label, e.g. "vRapid" or "Cine".
+    val name: String? = null,
+    // Free text such as "Original audio, 4K" — the only 4K hint on the list
+    // itself, and sometimes hedged ("4K?"), so the stream's own flag wins.
+    val description: String? = null,
+    // Flag or badge image; unused, kept so the shape is documented.
+    val image: String? = null,
+    // Opaque; appended to the stream URL to resolve this server.
+    val data: String? = null,
+)
+
+/** `dec-vidfast` response for one server's stream. */
+@Serializable
+data class VidFastStreamResponseDto(
+    val status: Int? = null,
+    val result: VidFastStreamDto? = null,
+    val error: String? = null,
+)
+
+@Serializable
+data class VidFastStreamDto(
+    // HLS master playlist, or a progressive file when `mp4` is set.
+    val url: String? = null,
+    // True when the CDN rejects a Referer, so the header must be omitted.
+    val noReferrer: Boolean = false,
+    // True when `url` is a progressive MP4 rather than an HLS master.
+    val mp4: Boolean = false,
+    // Authoritative 4K flag; `description` only hints at it.
+    @SerialName("4kAvailable")
+    val is4k: Boolean = false,
+    // Always empty in every response observed so far, so the element shape is
+    // unverified. Modelled as raw JSON rather than guessed at: a wrong field
+    // name would fail deserialisation for whatever title finally carries one.
+    val tracks: List<JsonElement> = emptyList(),
+)
+
+/**
+ * One subtitle from `/wyzie`.
+ *
+ * That endpoint is plain JSON with no cipher and no CSRF token, so subtitles are
+ * fetched directly and are unaffected by the enc-dec.app dependency the stream
+ * chain carries. Files are SubRip rather than WebVTT.
+ */
+@Serializable
+data class VidFastSubtitleDto(
+    // Human-readable name, e.g. "English" or "Brazilian Portuguese".
+    val display: String? = null,
+    // Two-letter code, plus "pb" for Brazilian Portuguese.
+    val language: String? = null,
+    val url: String? = null,
+    val encoding: String? = null,
 )

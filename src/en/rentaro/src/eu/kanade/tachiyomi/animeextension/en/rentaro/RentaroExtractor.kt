@@ -20,7 +20,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.Headers
@@ -140,11 +143,12 @@ class RentaroExtractor(
         val nexusEnabled = NEXUS_NAME in enabledServers
         val cineJoyEnabled = CINEJOY_NAME in enabledServers
         val cineFlixEnabled = CINEFLIX_NAME in enabledServers
+        val vidFastEnabled = VIDFAST_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (eligibleServers.isEmpty() && !vidLinkEnabled && !nexusEnabled &&
-            !cineJoyEnabled && !cineFlixEnabled
+            !cineJoyEnabled && !cineFlixEnabled && !vidFastEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -260,6 +264,20 @@ class RentaroExtractor(
                 } else {
                     try {
                         cineFlixVideos(title, year, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // VidFast is a sixth backend and the only one still reached through
+            // enc-dec.app, so it is also the one most likely to fail outright.
+            // Isolating it here keeps that from costing the other five.
+            async {
+                if (!vidFastEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        vidFastVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -966,6 +984,234 @@ class RentaroExtractor(
     private fun cineFlixLabel(quality: String, url: String, subCount: Int): String {
         val parts = mutableListOf(CINEFLIX_NAME, quality)
         if (".m3u8" in url.lowercase()) parts += "HLS"
+        if (subCount > 0) parts += "$subCount subs"
+        return parts.joinToString(" · ")
+    }
+
+    // ======================== VidFast (Wave) backend ========================
+
+    /**
+     * VidFast is a sixth backend, and the only one that still needs
+     * enc-dec.app. Four calls per resolve:
+     *
+     *  1. `GET /movie/{tmdb}` (or `/tv/{tmdb}/{s}/{e}`)  the embed page, whose
+     *     HTML carries a short-lived token.
+     *  2. `enc-vidfast?text=…`  that token is handed to enc-dec.app, which
+     *     returns the two request URLs plus the CSRF token.
+     *  3. `POST {servers}`  answers the encrypted server list.
+     *  4. `POST {stream}/{data}`  answers one server's encrypted stream.
+     *
+     * Steps 3 and 4 are decrypted by `dec-vidfast`. That is unavoidable for now:
+     * the payloads are encrypted by a bytecode VM embedded in the player bundle,
+     * which is handed a virtualised global environment, so there is no cipher to
+     * lift out. The site also stalls when devtools are open, which rules out
+     * recovering the algorithm from a running page.
+     *
+     * Subtitles are the exception — `/wyzie` is plain JSON, so they are fetched
+     * directly and work regardless of enc-dec.app.
+     */
+    private suspend fun vidFastVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        if (tmdbId.isBlank()) return emptyList()
+
+        val path = if (isMovie) {
+            "movie/$tmdbId"
+        } else {
+            "tv/$tmdbId/$seasonId/$episodeId"
+        }
+
+        // The token lives in the embed page's inlined RSC payload, where it is
+        // JSON-escaped, hence the doubled quotes in the pattern.
+        val page = client.newCall(GET("$VIDFAST_ORIGIN/$path/", vidFastHeaders()))
+            .awaitSuccess()
+            .bodyString()
+        val token = VIDFAST_TOKEN_REGEX.find(page)?.groupValues?.get(1)
+            ?: return emptyList()
+
+        val encUrl = "$VIDFAST_ENC_URL?text=${URLEncoder.encode(token, "UTF-8")}"
+        val enc = client.newCall(GET(encUrl, headers))
+            .awaitSuccess()
+            .parseAs<VidFastEncDto>()
+        val parts = enc.result?.takeIf { enc.status == HTTP_OK } ?: return emptyList()
+        val serversUrl = parts.servers?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val streamBase = parts.stream?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val csrf = parts.token?.takeIf { it.isNotBlank() } ?: return emptyList()
+
+        // Both POSTs are unauthenticated apart from these headers, and both
+        // answer ciphertext as plain text rather than JSON.
+        val postHeaders = vidFastApiHeaders(csrf)
+
+        val serverList = vidFastDecrypt(serversUrl, postHeaders)
+            ?.let { runCatching { it.parseAs<List<VidFastServerDto>>() }.getOrNull() }
+            .orEmpty()
+        if (serverList.isEmpty()) return emptyList()
+
+        val subtitles = vidFastSubtitles(tmdbId, seasonId, episodeId, isMovie, subLimit)
+
+        // Servers are independent, so one failing must not lose the others.
+        return serverList.parallelCatchingFlatMap { server ->
+            val data = server.data?.takeIf { it.isNotBlank() }
+                ?: return@parallelCatchingFlatMap emptyList()
+            val stream = vidFastDecrypt("$streamBase/$data", postHeaders)
+                ?.let { runCatching { it.parseAs<VidFastStreamDto>() }.getOrNull() }
+                ?: return@parallelCatchingFlatMap emptyList()
+            vidFastVideosForStream(server, stream, subtitles)
+        }
+    }
+
+    /**
+     * POSTs to [url] and decrypts the reply through enc-dec.app.
+     *
+     * Returns the plaintext JSON, or null if either leg fails. The `result` of
+     * `dec-vidfast` is already-parsed JSON, so it is re-serialised for the
+     * caller to deserialise into a concrete shape.
+     */
+    private suspend fun vidFastDecrypt(url: String, postHeaders: Headers): String? {
+        val ciphertext = client.newCall(POST(url, postHeaders, VIDFAST_EMPTY_BODY))
+            .awaitSuccess()
+            .bodyString()
+            .trim()
+        if (ciphertext.isEmpty()) return null
+
+        val body = buildJsonObject { put("text", ciphertext) }
+            .toString()
+            .toRequestBody(JSON_MEDIA_TYPE)
+        val decrypted = client.newCall(POST(VIDFAST_DEC_URL, headers, body))
+            .awaitSuccess()
+            .parseAs<JsonObject>()
+        if (decrypted["status"]?.jsonPrimitive?.intOrNull != HTTP_OK) return null
+        return decrypted["result"]?.toString()
+    }
+
+    private fun vidFastVideosForStream(
+        server: VidFastServerDto,
+        stream: VidFastStreamDto,
+        subtitles: List<Track>,
+    ): List<Video> {
+        val url = stream.url?.takeIf { it.isNotBlank() } ?: return emptyList()
+
+        // Some CDNs reject a Referer outright, which the payload flags.
+        val playbackHeaders = if (stream.noReferrer) {
+            headers.newBuilder().removeAll("Referer").removeAll("Origin").build()
+        } else {
+            vidFastHeaders()
+        }
+
+        val name = server.name?.takeIf { it.isNotBlank() } ?: VIDFAST_NAME
+        // `4kAvailable` is authoritative; `description` only hints, and hedges
+        // with a question mark on some servers.
+        val quality = if (stream.is4k) "4K" else "Auto"
+        val label = vidFastLabel(name, quality, url, stream.mp4, subtitles.size)
+
+        // A progressive MP4 has no variants to expand, so it is offered as-is.
+        if (stream.mp4) {
+            return listOf(
+                Video(
+                    url = url,
+                    quality = label,
+                    videoUrl = url,
+                    headers = playbackHeaders,
+                    subtitleTracks = subtitles,
+                ),
+            )
+        }
+
+        return runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = url,
+                referer = if (stream.noReferrer) "" else "$VIDFAST_ORIGIN/",
+                videoNameGen = { res -> vidFastLabel(name, res, url, false, subtitles.size) },
+                subtitleList = subtitles,
+            )
+        }.getOrNull().orEmpty().ifEmpty {
+            listOf(
+                Video(
+                    url = url,
+                    quality = label,
+                    videoUrl = url,
+                    headers = playbackHeaders,
+                    subtitleTracks = subtitles,
+                ),
+            )
+        }
+    }
+
+    /**
+     * Fetches subtitles from `/wyzie`.
+     *
+     * Plain JSON, so this leg needs no decryption. English is preferred and the
+     * rest follow, matching how the other backends order their tracks.
+     */
+    private suspend fun vidFastSubtitles(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Track> {
+        if (subLimit <= 0) return emptyList()
+
+        val url = "$VIDFAST_ORIGIN/wyzie".toHttpUrl().newBuilder().apply {
+            addQueryParameter("id", tmdbId)
+            if (!isMovie) {
+                addQueryParameter("season", seasonId)
+                addQueryParameter("episode", episodeId)
+            }
+        }.build().toString()
+
+        val tracks = runCatching {
+            client.newCall(GET(url, vidFastHeaders()))
+                .awaitSuccess()
+                .parseAs<List<VidFastSubtitleDto>>()
+        }.getOrNull().orEmpty()
+
+        return tracks
+            .mapNotNull { track ->
+                val file = track.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val name = track.display?.takeIf { it.isNotBlank() }
+                    ?: track.language?.takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                Track(file, name)
+            }
+            .sortedBy { track -> if (track.lang.startsWith("English", true)) 0 else 1 }
+            .take(subLimit)
+    }
+
+    /**
+     * Headers for the embed page and the subtitle endpoint.
+     *
+     * `X-Requested-With` is deliberately absent: the embed page answers 403 to a
+     * request carrying it, even though the two ciphertext POSTs require it.
+     */
+    private fun vidFastHeaders(): Headers = headers.newBuilder()
+        .set("Referer", "$VIDFAST_ORIGIN/")
+        .set("Origin", VIDFAST_ORIGIN)
+        .build()
+
+    /** Headers for the two ciphertext POSTs, which do want `X-Requested-With`. */
+    private fun vidFastApiHeaders(csrf: String): Headers = vidFastHeaders().newBuilder()
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("X-CSRF-Token", csrf)
+        .build()
+
+    private fun vidFastLabel(
+        server: String,
+        quality: String,
+        url: String,
+        isMp4: Boolean,
+        subCount: Int,
+    ): String {
+        val parts = mutableListOf("$VIDFAST_NAME/$server", quality)
+        if (isMp4) {
+            parts += "MP4"
+        } else if (".m3u8" in url.lowercase()) {
+            parts += "HLS"
+        }
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
     }
@@ -1695,8 +1941,45 @@ class RentaroExtractor(
         private const val CINEFLIX_API_BASE = "https://cineflix.st"
         private const val CINEFLIX_ORIGIN = "https://cineflix.st"
 
+        // VidFast: a sixth backend, and the only one that is NOT independent.
+        //
+        // Its two payloads are encrypted by a bytecode VM embedded in the player
+        // bundle: a 15 KB high-entropy blob is executed by an interpreter that
+        // receives a virtualised global environment, so there is no cipher
+        // routine to lift out and reimplement. The site also detects devtools
+        // and stalls before the request fires, which rules out recovering the
+        // algorithm from a running page.
+        //
+        // Removing enc-dec.app from this backend would mean reversing that VM's
+        // instruction set and disassembling its bytecode. Everything else is
+        // already local: the CSRF token and request base path are constants in
+        // the bundle, and subtitles come from a plain-JSON endpoint.
+        private const val VIDFAST_NAME = "Wave"
+        private const val VIDFAST_ORIGIN = "https://vidfast.vc"
+        private const val VIDFAST_ENC_URL = "https://enc-dec.app/api/enc-vidfast"
+        private const val VIDFAST_DEC_URL = "https://enc-dec.app/api/dec-vidfast"
+
+        /**
+         * Pulls the page token out of the embed HTML.
+         *
+         * It sits in the inlined RSC payload under either `en` or `token`, where
+         * the quotes are JSON-escaped, hence the backslashes.
+         */
+        private val VIDFAST_TOKEN_REGEX = """\\"(?:en|token)\\":\\"(.*?)\\"""".toRegex()
+
+        /** Status field both enc-dec.app endpoints report success with. */
+        private const val HTTP_OK = 200
+
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val OCTET_STREAM = "application/octet-stream".toMediaType()
+
+        /**
+         * Both VidFast POSTs carry no body; only the CSRF header matters.
+         *
+         * Declared after [OCTET_STREAM] on purpose: companion properties
+         * initialise in source order, so referencing it earlier would read null.
+         */
+        private val VIDFAST_EMPTY_BODY = ByteArray(0).toRequestBody(OCTET_STREAM)
 
         /**
          * The CineJoy upstream servers offered in settings, with the region the
@@ -2110,13 +2393,13 @@ class RentaroExtractor(
         )
 
         /**
-         * Servers offered in settings. VidLink, Nexus and CineJoy are not
-         * Videasy backends, so they are appended rather than derived from
-         * [VIDEASY_SERVERS].
+         * Servers offered in settings. VidLink, Nexus, CineJoy, CineFlix and
+         * VidFast are not Videasy backends, so they are appended rather than
+         * derived from [VIDEASY_SERVERS].
          */
         val SERVER_DISPLAY_NAMES: List<String> =
             VIDEASY_SERVERS.map { it.displayName } + VIDLINK_NAME + NEXUS_NAME +
-                CINEJOY_NAME + CINEFLIX_NAME
+                CINEJOY_NAME + CINEFLIX_NAME + VIDFAST_NAME
 
         /**
          * Order the video list groups servers in. Mirrors [SERVER_DISPLAY_NAMES]
@@ -2138,6 +2421,7 @@ class RentaroExtractor(
             NEXUS_NAME -> "Multi-Lang"
             CINEJOY_NAME -> "Multi-Lang"
             CINEFLIX_NAME -> "Original"
+            VIDFAST_NAME -> "Multi-Lang"
             else -> VIDEASY_SERVERS.firstOrNull { it.displayName == displayName }
                 ?.audioLabel ?: "Unknown"
         }
