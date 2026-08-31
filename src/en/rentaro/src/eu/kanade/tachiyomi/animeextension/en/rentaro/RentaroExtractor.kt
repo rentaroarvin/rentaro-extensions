@@ -89,6 +89,7 @@ class RentaroExtractor(
         qualityPref: String,
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
+        enabledVidFastServers: Set<String> = VIDFAST_SERVER_DEFAULT,
     ): List<Video> = videosFlowFromUrl(
         path,
         title,
@@ -99,6 +100,7 @@ class RentaroExtractor(
         qualityPref,
         enabledNexusProviders,
         enabledCineJoyServers,
+        enabledVidFastServers,
     ).last()
 
     /**
@@ -129,6 +131,7 @@ class RentaroExtractor(
         qualityPref: String,
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
+        enabledVidFastServers: Set<String> = VIDFAST_SERVER_DEFAULT,
     ): Flow<List<Video>> = channelFlow {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
@@ -277,7 +280,14 @@ class RentaroExtractor(
                     emptyList()
                 } else {
                     try {
-                        vidFastVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+                        vidFastVideos(
+                            tmdbId,
+                            seasonId,
+                            episodeId,
+                            isMovie,
+                            enabledVidFastServers,
+                            subLimit,
+                        )
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -1015,9 +1025,10 @@ class RentaroExtractor(
         seasonId: String,
         episodeId: String,
         isMovie: Boolean,
+        enabledServers: Set<String>,
         subLimit: Int,
     ): List<Video> {
-        if (tmdbId.isBlank()) return emptyList()
+        if (tmdbId.isBlank() || enabledServers.isEmpty()) return emptyList()
 
         val path = if (isMovie) {
             "movie/$tmdbId"
@@ -1054,14 +1065,18 @@ class RentaroExtractor(
         val subtitles = vidFastSubtitles(tmdbId, seasonId, episodeId, isMovie, subLimit)
 
         // Servers are independent, so one failing must not lose the others.
-        return serverList.parallelCatchingFlatMap { server ->
-            val data = server.data?.takeIf { it.isNotBlank() }
-                ?: return@parallelCatchingFlatMap emptyList()
-            val stream = vidFastDecrypt("$streamBase/$data", postHeaders)
-                ?.let { runCatching { it.parseAs<VidFastStreamDto>() }.getOrNull() }
-                ?: return@parallelCatchingFlatMap emptyList()
-            vidFastVideosForStream(server, stream, subtitles)
-        }
+        // Filtered against the user's selection before any request is made, so a
+        // disabled server costs nothing.
+        return serverList
+            .filter { server -> (server.name ?: "") in enabledServers }
+            .parallelCatchingFlatMap { server ->
+                val data = server.data?.takeIf { it.isNotBlank() }
+                    ?: return@parallelCatchingFlatMap emptyList()
+                val stream = vidFastDecrypt("$streamBase/$data", postHeaders)
+                    ?.let { runCatching { it.parseAs<VidFastStreamDto>() }.getOrNull() }
+                    ?: return@parallelCatchingFlatMap emptyList()
+                vidFastVideosForStream(server, stream, subtitles)
+            }
     }
 
     /**
@@ -1966,6 +1981,68 @@ class RentaroExtractor(
          * the quotes are JSON-escaped, hence the backslashes.
          */
         private val VIDFAST_TOKEN_REGEX = """\\"(?:en|token)\\":\\"(.*?)\\"""".toRegex()
+
+        /**
+         * Upstream servers VidFast exposes, in the order it lists them.
+         *
+         * Fixed rather than fetched: the list is returned inside the encrypted
+         * payload, so discovering it would cost the very calls this preference
+         * exists to avoid. A name that disappears upstream simply never matches.
+         */
+        val VIDFAST_SERVERS: List<String> = listOf(
+            "vRapid",
+            "vEdge",
+            "Cobra",
+            "Horizon",
+            "Cine",
+            "vFast",
+            "Bravo",
+        )
+
+        /**
+         * Servers that answered with an empty body for every title tested.
+         *
+         * The upstream returns nothing at all, so enc-dec.app reports 400 rather
+         * than failing to decrypt. Kept selectable in case they come back.
+         */
+        private val VIDFAST_KNOWN_DEAD = setOf("Cine", "vFast", "Bravo")
+
+        /** Servers whose playlist carries several renditions rather than one. */
+        private val VIDFAST_MULTI_QUALITY = setOf("vRapid")
+
+        /**
+         * Servers enabled out of the box.
+         *
+         * Chosen by resolving eight titles per server — two western films, two
+         * western episodes, two anime films, two anime episodes — and only
+         * counting a server as working when its playlist resolved to real media
+         * bytes rather than merely a URL:
+         *
+         *   vEdge    8/8   single rendition, fMP4 or TS
+         *   vRapid   7/8   the only multi-quality server, up to 2160p
+         *   Cobra    4/8   western only; every anime title failed
+         *   Horizon  4/8   mixed, and served bad bytes on three titles
+         *   Cine     0/8   empty body
+         *   vFast    0/8   empty body
+         *   Bravo    0/8   empty body
+         *
+         * vEdge and vRapid cover both western and anime content between them, so
+         * they are the default. Cobra and Horizon are left off: each costs a
+         * request pair and neither adds a title the first two miss.
+         */
+        val VIDFAST_SERVER_DEFAULT: Set<String> = setOf("vRapid", "vEdge")
+
+        /** Picker entries, annotated with what each server was observed to do. */
+        fun vidFastServerEntries(): List<String> = VIDFAST_SERVERS.map { server ->
+            val note = when {
+                server in VIDFAST_KNOWN_DEAD -> " - no video when tested"
+                server in VIDFAST_MULTI_QUALITY -> " - up to 4K, multi-quality"
+                server == "Cobra" -> " - western only"
+                server == "Horizon" -> " - unreliable"
+                else -> " - single quality"
+            }
+            "$server$note"
+        }
 
         /** Status field both enc-dec.app endpoints report success with. */
         private const val HTTP_OK = 200

@@ -622,6 +622,7 @@ class Rentaro :
             qualityPref = preferences.qualityPref,
             enabledNexusProviders = preferences.enabledNexusProviders,
             enabledCineJoyServers = preferences.enabledCineJoyServers,
+            enabledVidFastServers = preferences.enabledVidFastServers,
         )
     }
 
@@ -666,6 +667,10 @@ class Rentaro :
     private val SharedPreferences.enabledCineJoyServers: Set<String> by preferences.delegate(
         PREF_CINEJOY_SERVERS_KEY,
         RentaroExtractor.CINEJOY_SERVER_DEFAULT,
+    )
+    private val SharedPreferences.enabledVidFastServers: Set<String> by preferences.delegate(
+        PREF_VIDFAST_SERVERS_KEY,
+        RentaroExtractor.VIDFAST_SERVER_DEFAULT,
     )
 
     private fun SharedPreferences.clearOldPrefs(): SharedPreferences {
@@ -811,6 +816,19 @@ class Rentaro :
                 "request, so enabling every one slows the video list. Only " +
                 "applies when Jay is enabled above.",
         )
+
+        // Wave fans out the same way, and each server costs a pair of requests
+        // through the decryption service, so they are selectable too.
+        screen.addSetPreference(
+            key = PREF_VIDFAST_SERVERS_KEY,
+            title = "Wave Servers",
+            entries = RentaroExtractor.vidFastServerEntries(),
+            entryValues = RentaroExtractor.VIDFAST_SERVERS,
+            default = RentaroExtractor.VIDFAST_SERVER_DEFAULT,
+            summary = "Which upstream servers Wave queries. Each is a separate " +
+                "request pair, so enabling every one slows the video list. Only " +
+                "applies when Wave is enabled above.",
+        )
     }
 
     // ============================= Utilities ==============================
@@ -895,6 +913,8 @@ class Rentaro :
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
         private const val PREF_CINEJOY_SERVERS_KEY = "pref_cinejoy_servers"
+
+        private const val PREF_VIDFAST_SERVERS_KEY = "pref_vidfast_servers"
 
         /**
          * One-shot marker for resetting the Art provider selection to the
