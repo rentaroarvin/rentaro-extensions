@@ -309,10 +309,9 @@ data class NexusSourceDto(
 }
 
 // ============================ CineJoy ============================
-// Fourth independent backend. Its API answers an encrypted body, so two calls
-// are needed: enc-dec.app builds the request payload, then api.shegu.st/g
-// returns the ciphertext. The reply is decrypted in-process by [CineJoyCipher],
-// since the enc step hands back the AES key and additional data in plain.
+// Fourth independent backend. Its API answers an encrypted body, so one call is
+// needed: api.shegu.st/g returns the ciphertext for a body that [CineJoyCipher]
+// seals and opens in-process, using standard P-256 ECDH, HKDF and AES-GCM.
 
 /** One upstream scraper CineJoy exposes, from `/servers`. */
 @Serializable
@@ -332,38 +331,7 @@ data class CineJoyServersDto(
     val servers: List<CineJoyServerDto> = emptyList(),
 )
 
-/**
- * `enc-cinejoy` response: the request body to POST upstream, plus the state
- * needed to decrypt whatever comes back.
- */
-@Serializable
-data class CineJoyEncDto(
-    val status: Int? = null,
-    val result: CineJoyEncResultDto? = null,
-    val error: String? = null,
-)
-
-@Serializable
-data class CineJoyEncResultDto(
-    // base64url, no padding: decoded to raw bytes for the upstream POST.
-    val data: String? = null,
-    val state: CineJoyStateDto? = null,
-)
-
-/**
- * Decryption material for the reply, returned in plain by the enc step.
- *
- * `aad` binds the reply to the exact request that produced it, which is why it
- * has to be carried through rather than reconstructed.
- */
-@Serializable
-data class CineJoyStateDto(
-    // base64url: the 32-byte AES-256-GCM key.
-    val responseKey: String? = null,
-    // base64url: the additional data the reply authenticates against.
-    val aad: String? = null,
-)
-
+/** The decrypted reply from `api.shegu.st/g`. */
 @Serializable
 data class CineJoyDecResultDto(
     val data: CineJoyDataDto? = null,
