@@ -104,15 +104,14 @@ class RentaroExtractor(
     ).last()
 
     /**
-     * Resolves every enabled backend, emitting the list again each time one
-     * answers.
+     * Resolves every enabled backend, emitting the list again as family results
+     * are collected.
      *
-     * The four backends are unrelated services and differ enormously in cost -
-     * Nexus answers a title in well under a second while CineJoy fans out across
-     * its upstream servers and takes several, and neither has a circuit breaker,
-     * so a hung backend costs its full timeout on every episode. Waiting for all
-     * four before returning anything means a stream that was ready immediately is
-     * withheld for as long as the slowest one takes.
+     * Six backend families are started concurrently and differ enormously in
+     * cost. Some make one request while others fan out across selectable upstream
+     * servers or encrypted request chains. Waiting for every family before
+     * returning anything would withhold usable streams until the slowest enabled
+     * path completes.
      *
      * Emissions are cumulative and fully ordered, per the [ProgressiveVideoSource]
      * contract: each one carries every stream found so far, so a collector can
@@ -179,16 +178,16 @@ class RentaroExtractor(
             }
         }
 
-        // Servers *within* a backend are already resolved in parallel; these four
-        // run concurrently with each other and report independently.
+        // Servers *within* a backend are already resolved in parallel; these six
+        // family tasks run concurrently and report independently.
         val tasks = listOf(
             async {
                 if (eligibleServers.isEmpty()) {
                     emptyList()
                 } else {
                     // Videasy is the one backend whose own failures are not
-                    // absorbed per server, so a bad seed or enc-dec.app being
-                    // down would otherwise propagate and cancel the siblings.
+                    // absorbed per server, so a bad seed or upstream-wide
+                    // failure would otherwise propagate and cancel the siblings.
                     runCatching {
                         videasyVideos(
                             eligibleServers,
@@ -223,7 +222,7 @@ class RentaroExtractor(
                     }
                 }
             },
-            // Nexus is a third independent backend with its own encrypted API.
+            // Nexus is an independent backend with its own encrypted API.
             async {
                 if (!nexusEnabled) {
                     emptyList()
@@ -235,7 +234,7 @@ class RentaroExtractor(
                     }
                 }
             },
-            // CineJoy is a fourth independent backend, reached through its own
+            // CineJoy is an independent backend, reached through its own
             // encrypt/decrypt chain. Usually the slowest, which is the whole
             // reason the others are not made to wait for it.
             async {
@@ -259,7 +258,7 @@ class RentaroExtractor(
                     }
                 }
             },
-            // CineFlix is a fifth independent backend, and the cheapest: plain
+            // CineFlix is an independent backend, and the cheapest: plain
             // JSON both ways, with a proof of work solved in-process.
             async {
                 if (!cineFlixEnabled) {
@@ -272,7 +271,7 @@ class RentaroExtractor(
                     }
                 }
             },
-            // VidFast is a sixth backend and the only one still reached through
+            // VidFast is the only backend still reached through
             // enc-dec.app, so it is also the one most likely to fail outright.
             // Isolating it here keeps that from costing the other five.
             async {
@@ -295,8 +294,8 @@ class RentaroExtractor(
             },
         )
 
-        // Whichever finishes first is published first, so the picker fills in as
-        // the backends report rather than all at once at the end.
+        // All family tasks begin concurrently. Their cumulative results are
+        // published as the task list is collected rather than only once at the end.
         tasks.forEach { task -> publish(task.await()) }
     }
 
@@ -587,7 +586,7 @@ class RentaroExtractor(
     // ======================= CineJoy (Jay) backend =======================
 
     /**
-     * CineJoy is a fourth independent backend. One call per server:
+     * CineJoy is an independent backend. One call per server:
      * `POST api.shegu.st/g` carrying a sealed body, answering ciphertext.
      *
      * The site assembles that body in a WASM module, which is why this used to
@@ -1001,7 +1000,7 @@ class RentaroExtractor(
     // ======================== VidFast (Wave) backend ========================
 
     /**
-     * VidFast is a sixth backend, and the only one that still needs
+     * VidFast is the only backend that still needs
      * enc-dec.app. Four calls per resolve:
      *
      *  1. `GET /movie/{tmdb}` (or `/tv/{tmdb}/{s}/{e}`)  the embed page, whose
@@ -1267,7 +1266,7 @@ class RentaroExtractor(
     }.toString()
 
     /**
-     * Nexus is a third independent backend, encrypted symmetrically in both
+     * Nexus is an independent backend, encrypted symmetrically in both
      * directions. /api/servers lists the scrapers carrying the title and
      * /api/sources resolves each one to direct files.
      *
@@ -1924,9 +1923,9 @@ class RentaroExtractor(
 
         private const val VIDEASY_API_BASE = "https://api.speedracelight.com"
 
-        // VidLink: a second, independent backend. It signs its own requests and
+        // VidLink is an independent backend. It signs its own requests and
         // needs no external decryption service, so it keeps working even if the
-        // Videasy chain (seed -> enc=2 -> enc-dec.app) breaks.
+        // Videasy seed or enc=2 flow breaks.
         private const val VIDLINK_NAME = "Orion"
         private const val VIDLINK_API_BASE = "https://vidlink.pro"
         private const val VIDLINK_ORIGIN = "https://vidlink.pro"
@@ -1941,7 +1940,7 @@ class RentaroExtractor(
          */
         private const val VIDLINK_PLAYBACK_ENV = "dash-hevc"
 
-        // CineJoy: a fourth independent backend. The site builds its request body
+        // CineJoy is an independent backend. The site builds its request body
         // in a WASM module, but the construction underneath is standard P-256
         // ECDH plus HKDF and AES-GCM, so [CineJoyCipher] does it in-process.
         private const val CINEJOY_NAME = "Jay"
@@ -1949,14 +1948,14 @@ class RentaroExtractor(
         private const val CINEJOY_SERVERS_URL = "https://api.shegu.st/servers"
         private const val CINEJOY_ORIGIN = "https://cinejoy.to"
 
-        // CineFlix: a fifth independent backend, and the only one whose whole
+        // CineFlix is an independent backend, and the only one whose whole
         // chain is plain JSON. Its proof of work is solved in-process, so it
         // needs no external decryption service and no browser runtime.
         private const val CINEFLIX_NAME = "Dave"
         private const val CINEFLIX_API_BASE = "https://cineflix.st"
         private const val CINEFLIX_ORIGIN = "https://cineflix.st"
 
-        // VidFast: a sixth backend, and the only one that is NOT independent.
+        // VidFast is the only backend that is not fully independent.
         //
         // Its two payloads are encrypted by a bytecode VM embedded in the player
         // bundle: a 15 KB high-entropy blob is executed by an interpreter that
@@ -2155,7 +2154,7 @@ class RentaroExtractor(
          */
         private const val VIDLINK_CDN_ORIGIN = "https://filmboom.top"
 
-        // Nexus: third independent backend (web.nxsha.app). Encrypted API, no
+        // Nexus is an independent backend (web.nxsha.app). Encrypted API, no
         // external decryption service needed.
         private const val NEXUS_NAME = "Art"
         private const val NEXUS_API_BASE = "https://web.nxsha.app"

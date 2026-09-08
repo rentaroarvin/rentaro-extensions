@@ -237,7 +237,7 @@ data class VidLinkCaptionDto(
 )
 
 // ============================= Nexus =============================
-// Second independent backend. Its API is symmetrically encrypted, so both the
+// Independent Nexus backend. Its API is symmetrically encrypted, so both the
 // request and the response bodies are opaque strings; these model the decrypted
 // JSON rather than the wire format.
 @Serializable
@@ -310,7 +310,7 @@ data class NexusSourceDto(
 }
 
 // ============================ CineJoy ============================
-// Fourth independent backend. Its API answers an encrypted body, so one call is
+// Independent CineJoy backend. Its API answers an encrypted body, so one call is
 // needed: api.shegu.st/g returns the ciphertext for a body that [CineJoyCipher]
 // seals and opens in-process, using standard P-256 ECDH, HKDF and AES-GCM.
 
@@ -371,7 +371,7 @@ data class CineJoyCaptionDto(
 )
 
 // ============================= CineFlix =============================
-// Fifth independent backend. Plain JSON throughout: a suggestions endpoint
+// Independent CineFlix backend. Plain JSON throughout: a suggestions endpoint
 // resolves a title to the slug its playback API needs, then a proof of work
 // releases the stream. No external decryption service is involved.
 @Serializable
@@ -428,7 +428,7 @@ data class CineFlixTrackDto(
 )
 
 // ============================ VidFast ============================
-// Sixth backend, and the only one that still needs enc-dec.app.
+// VidFast backend, and the only one that still needs enc-dec.app.
 //
 // Its responses are encrypted by a bytecode VM embedded in the player bundle:
 // the payload is handed to an interpreter along with a virtualised global
@@ -437,10 +437,10 @@ data class CineFlixTrackDto(
 // running page. Two calls per resolve therefore go through enc-dec.app — the
 // only remote dependency left in this extension.
 //
-// What *is* local: the CSRF token and the request base path are constants in the
-// bundle and are scraped by [RentaroExtractor.vidFastConstants], so only the two
-// cipher steps are remote. See VIDFAST_* in RentaroExtractor for what removing
-// the dependency would take.
+// What *is* local: the request flow, CSRF handling, server selection, subtitle
+// lookup, and stream formatting. Only the two cipher transformations are
+// delegated. See the VIDFAST_* declarations in [RentaroExtractor] for the
+// endpoints and protocol notes.
 
 /** `enc-vidfast` response: the two request URLs plus the CSRF token. */
 @Serializable

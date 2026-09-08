@@ -12,6 +12,9 @@ This repository contains a personal extension catalogue for the
 [Anikku](https://github.com/komikku-app/anikku) or
 [Aniyomi](https://github.com/aniyomiorg/aniyomi) forks.
 
+Rentaro supports browsing movies and TV shows, filters, quality preferences,
+subtitle limits, and progressive stream discovery on compatible hosts.
+
 ## How to add the repo
 
 * Tap one of the install buttons above, or
@@ -38,14 +41,11 @@ the index repository.
 
 ## Progressive stream resolution
 
-Rentaro resolves four unrelated backends for every episode. They differ widely in
-cost — one typically answers in well under a second while another needs a
-three-hop encrypt/decrypt chain — so returning a single finished list means a
-stream that was ready immediately is withheld until the slowest backend has
-finished.
+Stream providers can differ widely in response time. Returning only one finished
+list would withhold usable streams until every enabled provider had completed.
 
 The extension therefore also implements `ProgressiveVideoSource`, which reports
-streams as each backend answers:
+the cumulative stream list as provider results are collected:
 
 ```kotlin
 interface ProgressiveVideoSource : AnimeSource {
@@ -54,8 +54,8 @@ interface ProgressiveVideoSource : AnimeSource {
 ```
 
 Every emission is cumulative and fully ordered, so a host can treat the latest as
-the whole list without merging anything. Playback can start on whichever backend
-lands first, and the picker fills in as the others report.
+the whole list without merging anything. Playback can begin before every enabled
+provider has finished, and the picker fills in as more results are published.
 
 This is **opt-in and detected with `is`**, exactly as `ConfigurableAnimeSource`
 already is. A host that does not know the interface keeps calling
@@ -73,6 +73,18 @@ extension would silently fall back to the blocking path. `assembleDebug` output
 can be checked with `dexdump` to confirm nothing under
 `eu/kanade/tachiyomi/animesource` is ever defined in the APK.
 
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/en/rentaro` | Rentaro source, filters, DTOs, stream extraction, and protocol implementations |
+| `lib/playlistutils` | HLS and DASH playlist expansion shared by the extension |
+| `lib/hostapi` | Compile-only declarations for host-owned optional interfaces |
+| `core` | Shared networking, serialization, preferences, URL, and coroutine utilities |
+| `gradle/build-logic` | Android extension and formatting convention plugins |
+| `.github/workflows/build_push.yml` | Signed release build and repository publication |
+| `.github/scripts/create-repo.py` | APK/icon collection and index generation |
+
 ## Building
 
 Requires a JDK (17 matches CI; 21 also works) and the Android SDK.
@@ -85,12 +97,31 @@ echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties
 ./gradlew assembleRelease                   # signed
 ```
 
+If `java` is installed but Gradle reports that no runtime is available, set
+`JAVA_HOME` explicitly before invoking the wrapper. On Apple Silicon with
+Homebrew OpenJDK 21, the path is commonly `/opt/homebrew/opt/openjdk@21`.
+
 Release signing reads `signingkey.jks` from the repo root plus the `ALIAS`,
 `KEY_STORE_PASSWORD`, and `KEY_PASSWORD` environment variables.
 
+Useful checks:
+
+```bash
+./gradlew spotlessCheck
+./gradlew :src:en:rentaro:assembleDebug
+```
+
+The debug APK is written under
+`src/en/rentaro/build/outputs/apk/debug/`. Its `v14.<code>` suffix is derived
+from the extension library major version and `extVersionCode`.
+
+## Publishing
+
 Pushing to `main` builds signed APKs and publishes the index automatically.
 Bumping `extVersionCode` in `src/en/rentaro/build.gradle` is what signals an
-update to clients.
+update to clients. The workflow verifies each APK signature, regenerates
+`index.json`, `index.min.json`, and `repo.json`, then pushes the artifacts to the
+`repo` branch of the separate index repository.
 
 ## License
 

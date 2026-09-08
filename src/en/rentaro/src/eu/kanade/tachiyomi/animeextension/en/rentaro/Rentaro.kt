@@ -595,13 +595,13 @@ class Rentaro :
     // ============================ Video Links ============================
 
     /**
-     * Streams for [episode], emitted as each backend answers.
+     * Streams for [episode], emitted as backend results are collected.
      *
-     * Four unrelated backends are resolved concurrently and they differ widely in
-     * cost, so joining them all before returning withholds a stream that was
-     * ready in under a second until the slowest one finishes. Hosts that
-     * recognise [ProgressiveVideoSource] collect this instead and can start
-     * playback on whichever lands first.
+     * Six backend families are started concurrently and differ widely in cost,
+     * so joining them all before returning can withhold usable streams until the
+     * slowest enabled path finishes. Hosts that recognise
+     * [ProgressiveVideoSource] collect this instead and can start playback
+     * before every backend has completed.
      *
      * Emissions are cumulative and fully ordered; [getVideoList] is the last one.
      */
