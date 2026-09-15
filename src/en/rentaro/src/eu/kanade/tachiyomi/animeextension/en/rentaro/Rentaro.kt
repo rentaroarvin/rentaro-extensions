@@ -32,6 +32,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
@@ -557,7 +558,8 @@ class Rentaro :
                     ).awaitSuccess().parseAs<TvSeasonDetailDto>()
                     seasonDetail.episodes.map { episode ->
                         SEpisode.create().apply {
-                            name = "S${season.seasonNumber} E${episode.episodeNumber} - ${episode.name}"
+                            name = "S${season.seasonNumber} E${episode.episodeNumber} - " +
+                                "${episode.name}${scheduledNote(episode.airDate, isMovie = false)}"
                             episode_number = episode.episodeNumber.toFloat()
                             scanlator = "Season ${season.seasonNumber}"
                             date_upload = parseDate(episode.airDate)
@@ -581,7 +583,7 @@ class Rentaro :
             val extraDataEncoded = extraData.toJsonString()
             listOf(
                 SEpisode.create().apply {
-                    name = "Movie"
+                    name = "Movie${scheduledNote(movie.releaseDate, isMovie = true)}"
                     episode_number = 1.0f
                     date_upload = parseDate(movie.releaseDate)
                     url = "movie/${movie.id}#$extraDataEncoded"
@@ -860,6 +862,43 @@ class Rentaro :
         }
     }.getOrDefault(0L)
 
+    /**
+     * Suffix marking an entry whose date has not arrived yet.
+     *
+     * TMDB lists episodes as soon as they are announced, so a season in progress
+     * carries entries that no backend can resolve. Flagging them keeps the list
+     * honest without hiding them, since the announced date is usually the thing
+     * worth knowing.
+     *
+     * The note goes in the name rather than the scanlator: episode ordering
+     * parses the scanlator as "Season N", so anything appended there would sort
+     * the episode to the end.
+     *
+     * Returns an empty string when the date has passed, and when it is missing —
+     * an absent date means the schedule is unknown, not that the entry is
+     * upcoming.
+     */
+    private fun scheduledNote(dateStr: String?, isMovie: Boolean): String {
+        val raw = dateStr?.takeIf { it.isNotBlank() } ?: return ""
+        val parsed = runCatching {
+            synchronized(DATE_FORMATTER) { DATE_FORMATTER.parse(raw) }
+        }.getOrNull() ?: return ""
+
+        // Compared at day granularity against local midnight, so something
+        // airing today reads as out rather than upcoming.
+        val startOfToday = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.time
+        if (!parsed.after(startOfToday)) return ""
+
+        val verb = if (isMovie) "Releases" else "Airs"
+        val shown = synchronized(DISPLAY_FORMATTER) { DISPLAY_FORMATTER.format(parsed) }
+        return " · $verb $shown"
+    }
+
     companion object {
         // Deep-link prefix shared with RentaroUrlActivity.
         const val PREFIX_ID = "id:"
@@ -869,6 +908,9 @@ class Rentaro :
         private val animeUrlRegex = Regex("""/(movie|tv)/(\d+)""")
 
         private val DATE_FORMATTER by lazy { SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH) }
+
+        /** Human-readable form of an upcoming date, e.g. "20 Sep 2026". */
+        private val DISPLAY_FORMATTER by lazy { SimpleDateFormat("d MMM yyyy", Locale.ENGLISH) }
 
         private const val ANIMATION_GENRE_ID = 16
 
