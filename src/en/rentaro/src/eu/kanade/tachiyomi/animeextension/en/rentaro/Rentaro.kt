@@ -638,7 +638,7 @@ class Rentaro :
             qualityPref = preferences.qualityPref,
             enabledNexusProviders = preferences.enabledNexusProviders,
             enabledCineJoyServers = preferences.enabledCineJoyServers,
-            enabledVidFastServers = preferences.enabledVidFastServers,
+            enabledVidLoveProviders = preferences.enabledVidLoveProviders,
         )
     }
 
@@ -684,9 +684,9 @@ class Rentaro :
         PREF_CINEJOY_SERVERS_KEY,
         RentaroExtractor.CINEJOY_SERVER_DEFAULT,
     )
-    private val SharedPreferences.enabledVidFastServers: Set<String> by preferences.delegate(
-        PREF_VIDFAST_SERVERS_KEY,
-        RentaroExtractor.VIDFAST_SERVER_DEFAULT,
+    private val SharedPreferences.enabledVidLoveProviders: Set<String> by preferences.delegate(
+        PREF_VIDLOVE_PROVIDERS_KEY,
+        RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT,
     )
 
     private fun SharedPreferences.clearOldPrefs(): SharedPreferences {
@@ -745,12 +745,13 @@ class Rentaro :
             }.apply()
         }
 
-        // All VidFast choices except Bravo were removed. Reset once so an existing install
-        // whose stored set only names vRapid/vEdge does not silently query nothing.
-        if (!getBoolean(PREF_VIDFAST_SERVERS_RESET_KEY, false)) {
+        // Wave now has exactly one usable server (Bravo), so its old nested selection is no
+        // longer a setting. Remove the stale value and migration marker; playback always uses
+        // Bravo whenever Wave itself is enabled.
+        if (contains(PREF_VIDFAST_SERVERS_KEY) || contains(PREF_VIDFAST_SERVERS_RESET_KEY)) {
             edit().apply {
-                putStringSet(PREF_VIDFAST_SERVERS_KEY, RentaroExtractor.VIDFAST_SERVER_DEFAULT)
-                putBoolean(PREF_VIDFAST_SERVERS_RESET_KEY, true)
+                remove(PREF_VIDFAST_SERVERS_KEY)
+                remove(PREF_VIDFAST_SERVERS_RESET_KEY)
             }.apply()
         }
 
@@ -851,17 +852,16 @@ class Rentaro :
                 "applies when Jay is enabled above.",
         )
 
-        // Wave fans out the same way, and each server costs a pair of requests
-        // through the decryption service, so they are selectable too.
+        // VidLove exposes seven independent source providers. Keep them selectable because
+        // coverage differs by title and every enabled provider is a separate API request.
         screen.addSetPreference(
-            key = PREF_VIDFAST_SERVERS_KEY,
-            title = "Wave Servers",
-            entries = RentaroExtractor.vidFastServerEntries(),
-            entryValues = RentaroExtractor.VIDFAST_SERVERS,
-            default = RentaroExtractor.VIDFAST_SERVER_DEFAULT,
-            summary = "Which upstream servers Wave queries. Each is a separate " +
-                "request pair, so enabling every one slows the video list. Only " +
-                "applies when Wave is enabled above.",
+            key = PREF_VIDLOVE_PROVIDERS_KEY,
+            title = "Yoru Providers",
+            entries = RentaroExtractor.vidLoveProviderEntries(),
+            entryValues = RentaroExtractor.vidLoveProviderValues(),
+            default = RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT,
+            summary = "Which VidLove providers Yoru queries. Enabling every provider improves " +
+                "coverage but sends more requests. Only applies when Yoru is enabled above.",
         )
     }
 
@@ -997,7 +997,10 @@ class Rentaro :
 
         private const val PREF_CINEJOY_SERVERS_KEY = "pref_cinejoy_servers"
 
+        /** Legacy Wave sub-setting, removed now that Bravo is the only usable choice. */
         private const val PREF_VIDFAST_SERVERS_KEY = "pref_vidfast_servers"
+
+        private const val PREF_VIDLOVE_PROVIDERS_KEY = "pref_vidlove_providers"
 
         /**
          * One-shot marker for resetting the Art provider selection to the
@@ -1012,7 +1015,7 @@ class Rentaro :
         /** One-shot migration to the current wing.st CineJoy provider list. */
         private const val PREF_CINEJOY_SERVERS_RESET_KEY = "pref_cinejoy_servers_wing_v1"
 
-        /** One-shot migration after removing every VidFast server except Bravo. */
+        /** Legacy Wave migration marker, cleared with the removed nested setting. */
         private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"
 
         /**

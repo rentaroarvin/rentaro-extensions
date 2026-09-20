@@ -78,7 +78,7 @@ class RentaroExtractor(
         qualityPref: String,
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
-        enabledVidFastServers: Set<String> = VIDFAST_SERVER_DEFAULT,
+        enabledVidLoveProviders: Set<String> = VIDLOVE_PROVIDER_DEFAULT,
     ): List<Video> = videosFlowFromUrl(
         path,
         title,
@@ -89,7 +89,7 @@ class RentaroExtractor(
         qualityPref,
         enabledNexusProviders,
         enabledCineJoyServers,
-        enabledVidFastServers,
+        enabledVidLoveProviders,
     ).last()
 
     /**
@@ -119,7 +119,7 @@ class RentaroExtractor(
         qualityPref: String,
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
-        enabledVidFastServers: Set<String> = VIDFAST_SERVER_DEFAULT,
+        enabledVidLoveProviders: Set<String> = VIDLOVE_PROVIDER_DEFAULT,
     ): Flow<List<Video>> = channelFlow {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
@@ -239,7 +239,6 @@ class RentaroExtractor(
                             seasonId,
                             episodeId,
                             isMovie,
-                            enabledVidFastServers,
                             subLimit,
                         )
                     } catch (_: IOException) {
@@ -254,7 +253,14 @@ class RentaroExtractor(
                     emptyList()
                 } else {
                     try {
-                        vidLoveVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+                        vidLoveVideos(
+                            tmdbId,
+                            seasonId,
+                            episodeId,
+                            isMovie,
+                            enabledVidLoveProviders,
+                            subLimit,
+                        )
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -1003,9 +1009,10 @@ class RentaroExtractor(
         seasonId: String,
         episodeId: String,
         isMovie: Boolean,
+        enabledProviders: Set<String>,
         subLimit: Int,
     ): List<Video> = coroutineScope {
-        if (tmdbId.isBlank()) return@coroutineScope emptyList()
+        if (tmdbId.isBlank() || enabledProviders.isEmpty()) return@coroutineScope emptyList()
 
         // The source replies sometimes omit subtitles even when the dedicated endpoint has a
         // full catalogue. Fetch that endpoint alongside the source fan-out so one sparse source
@@ -1014,30 +1021,32 @@ class RentaroExtractor(
             vidLoveSubtitles(tmdbId, seasonId, episodeId, isMovie, subLimit)
         }
 
-        val resolved = VIDLOVE_SOURCES.parallelCatchingFlatMap { provider ->
-            val normal = vidLoveResponse(
-                provider = provider,
-                tmdbId = tmdbId,
-                seasonId = seasonId,
-                episodeId = episodeId,
-                isMovie = isMovie,
-                hevc = false,
-            )
-            val response = if (normal.source != null || !provider.hevcFallback || !supportsHevc) {
-                normal
-            } else {
-                vidLoveResponse(
+        val resolved = VIDLOVE_SOURCES
+            .filter { provider -> provider.key in enabledProviders }
+            .parallelCatchingFlatMap { provider ->
+                val normal = vidLoveResponse(
                     provider = provider,
                     tmdbId = tmdbId,
                     seasonId = seasonId,
                     episodeId = episodeId,
                     isMovie = isMovie,
-                    hevc = true,
+                    hevc = false,
                 )
+                val response = if (normal.source != null || !provider.hevcFallback || !supportsHevc) {
+                    normal
+                } else {
+                    vidLoveResponse(
+                        provider = provider,
+                        tmdbId = tmdbId,
+                        seasonId = seasonId,
+                        episodeId = episodeId,
+                        isMovie = isMovie,
+                        hevc = true,
+                    )
+                }
+                val source = response.source ?: return@parallelCatchingFlatMap emptyList()
+                listOf(VidLoveResolvedSource(provider, source))
             }
-            val source = response.source ?: return@parallelCatchingFlatMap emptyList()
-            listOf(VidLoveResolvedSource(provider, source))
-        }
         val subtitles = subtitleTask.await()
         if (resolved.isEmpty()) return@coroutineScope emptyList()
 
@@ -1321,10 +1330,9 @@ class RentaroExtractor(
         seasonId: String,
         episodeId: String,
         isMovie: Boolean,
-        enabledServers: Set<String>,
         subLimit: Int,
     ): List<Video> {
-        if (tmdbId.isBlank() || enabledServers.isEmpty()) return emptyList()
+        if (tmdbId.isBlank()) return emptyList()
 
         val path = if (isMovie) {
             "movie/$tmdbId"
@@ -1364,7 +1372,7 @@ class RentaroExtractor(
         // Filtered against the user's selection before any request is made, so a
         // disabled server costs nothing.
         return serverList
-            .filter { server -> (server.name ?: "") in enabledServers }
+            .filter { server -> server.name == VIDFAST_SERVER }
             .parallelCatchingFlatMap { server ->
                 val data = server.data?.takeIf { it.isNotBlank() }
                     ?: return@parallelCatchingFlatMap emptyList()
@@ -2038,6 +2046,13 @@ class RentaroExtractor(
             VidLoveProvider("vidapi", "Archer Queen"),
         )
 
+        /** Every current VidLove provider is enabled on a fresh install. */
+        val VIDLOVE_PROVIDER_DEFAULT: Set<String> = VIDLOVE_SOURCES.map { it.key }.toSet()
+
+        fun vidLoveProviderEntries(): List<String> = VIDLOVE_SOURCES.map { it.label }
+
+        fun vidLoveProviderValues(): List<String> = VIDLOVE_SOURCES.map { it.key }
+
         // VidFast is the only backend that is not fully independent.
         //
         // Its two payloads are encrypted by a bytecode VM embedded in the player
@@ -2065,18 +2080,13 @@ class RentaroExtractor(
         private val VIDFAST_TOKEN_REGEX = """\\"(?:en|token)\\":\\"(.*?)\\"""".toRegex()
 
         /**
-         * The only VidFast server still offered.
+         * The only VidFast server still offered, so no nested setting is needed.
          *
          * A live eight-title check on 20 September 2026 found Bravo playable for all four TV
          * episodes tested. Every other configured VidFast server was either consistently 403 or
          * returned no stream, so keeping them in the picker only offered known failures.
          */
-        val VIDFAST_SERVERS: List<String> = listOf("Bravo")
-
-        /** Bravo is the only available choice and therefore the default. */
-        val VIDFAST_SERVER_DEFAULT: Set<String> = setOf("Bravo")
-
-        fun vidFastServerEntries(): List<String> = listOf("Bravo - TV coverage")
+        private const val VIDFAST_SERVER = "Bravo"
 
         /** Status field both enc-dec.app endpoints report success with. */
         private const val HTTP_OK = 200
