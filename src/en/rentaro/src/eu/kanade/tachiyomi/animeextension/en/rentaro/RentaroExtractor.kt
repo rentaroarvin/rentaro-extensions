@@ -567,7 +567,7 @@ class RentaroExtractor(
                     val url = caption.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                     Track(
                         subtitleHintedUrl(url, caption.type, caption.display),
-                        caption.language ?: caption.display ?: "Unknown",
+                        caption.display ?: caption.language ?: "Unknown",
                     )
                 } +
                 externalSubtitles
@@ -687,7 +687,7 @@ class RentaroExtractor(
                         ?: return@mapNotNull null
                     Track(
                         subtitleHintedUrl(file, subtitle.type, subtitle.display),
-                        subtitle.language ?: subtitle.display ?: "Unknown",
+                        subtitle.display ?: subtitle.language ?: "Unknown",
                     )
                 }
                 .sortedBy { track ->
