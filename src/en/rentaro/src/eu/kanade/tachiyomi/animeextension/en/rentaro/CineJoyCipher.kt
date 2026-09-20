@@ -32,14 +32,15 @@ import javax.crypto.spec.SecretKeySpec
  *
  * Wire format, for a 107-byte plaintext giving 202 bytes:
  *
- *     [0:2]     02 01        version / suite
+ *     [0:2]     02 02        version / rotating server-key id
  *     [2:67]    04 X Y       ephemeral P-256 public key, SEC1 uncompressed
  *     [67:79]   nonce        12 bytes
  *     [79:..]   ciphertext   same length as the plaintext
  *     [..:+16]  tag
  *
- * Verified by reproducing a captured live request byte-for-byte, and by sealing
- * fresh requests that the API accepts and answers.
+ * The key and id below were recovered from `api.wing.st/crush.wasm` on
+ * 20 September 2026. A fresh request using them was accepted, decrypted and
+ * returned a live HLS playlist.
  */
 internal object CineJoyCipher {
 
@@ -76,6 +77,9 @@ internal object CineJoyCipher {
     /** Direction byte the reply binds into its additional data. */
     private const val DIRECTION_REPLY: Byte = 2
 
+    /** Key selector carried in the wire header alongside the protocol version. */
+    private const val SERVER_KEY_ID: Byte = 2
+
     /**
      * The server's static P-256 public key, as `X ++ Y`.
      *
@@ -83,8 +87,8 @@ internal object CineJoyCipher {
      * curve equation.
      */
     private const val SERVER_PUBLIC_KEY =
-        "83c7a82132b8516e3eb4061b82e9c881cc585593a4709001131bff7443eabc17" +
-            "01c1f0d50e23ac02b0b9a5979903dbd7e9055aab5e4a5532132d1d200707f5f2"
+        "5c88a0ae33c683a4872590b04b22f4774a4fe1c6ecf74785c74a919a71207ca" +
+            "94f9e6b5a7854c3aa3b44ee46bc444fea694b9f23bcd80f864ecbef48c1ef6e14"
 
     /** A sealed request, plus the key needed to read its reply. */
     class Sealed(val body: ByteArray, val replyKey: ByteArray, private val header: ByteArray) {
@@ -97,7 +101,7 @@ internal object CineJoyCipher {
     }
 
     /**
-     * Seals `plaintext` for `api.shegu.st/g`.
+     * Seals `plaintext` for `api.wing.st/g`.
      *
      * A fresh ephemeral key is generated per call, as the site does.
      *
@@ -126,7 +130,7 @@ internal object CineJoyCipher {
         val nonce = ByteArray(IV_SIZE).also { SecureRandom().nextBytes(it) }
         // The suite byte and public key are bound in, so a reply cannot be
         // replayed against a different request.
-        val header = byteArrayOf(2, 1) + publicKey
+        val header = byteArrayOf(2, SERVER_KEY_ID) + publicKey
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
             init(Cipher.ENCRYPT_MODE, SecretKeySpec(requestKey, "AES"), GCMParameterSpec(TAG_BITS, nonce))
             updateAAD(aad(DIRECTION_REQUEST, header))

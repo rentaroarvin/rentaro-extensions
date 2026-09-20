@@ -1,10 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.en.rentaro
 
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
@@ -136,61 +134,6 @@ data class EpisodeDto(
     val airDate: String? = null,
 )
 
-@Serializable
-data class SeedDto(
-    val seed: String,
-)
-
-// ============================ Videasy Decryption ============================
-// The `enc=2` payload is decrypted in-process by VideasyCipher, so only the
-// plaintext shape is modelled; there is no longer a remote envelope to unwrap.
-@Serializable
-data class VideasyDecryptedResult(
-    // Current shape (mb-flix, cdn, myflixerzupcloud, 1movies, lamovie, ...):
-    // each source is one playable URL with its own quality label.
-    val sources: List<VideasySourceDto>? = null,
-    // Legacy: single HLS playlist (some old server paths).
-    val url: String? = null,
-    // Legacy: multi-quality stream map (primebox, etc.).
-    val streams: Map<String, String>? = null,
-    // Subtitles for all response types
-    val subtitles: List<SubtitleDto> = emptyList(),
-)
-
-@Serializable
-data class VideasySourceDto(
-    val url: String,
-    val quality: String? = null,
-)
-
-// Subtitle field names vary by Videasy server. Observed/expected variants:
-//   {file, label}        — legacy JWPlayer-style
-//   {url, lang|language} — most current servers
-//   {src, name}          — occasional fallback
-@OptIn(ExperimentalSerializationApi::class)
-@Serializable
-data class SubtitleDto(
-    @JsonNames("file", "src")
-    val url: String? = null,
-    @JsonNames("label", "lang", "name")
-    val language: String? = null,
-)
-
-// ======================== Videasy Server ========================
-data class VideasyServer(
-    val displayName: String,
-    val apiBase: String,
-    val path: String,
-    // Sent as the ?language= query param to Videasy (some backends filter on it).
-    val language: String? = null,
-    val movieOnly: Boolean = false,
-    val mayHave4K: Boolean = false,
-    // Display-only audio-language hint shown in the video picker AND
-    // alongside each entry in the server preference list.
-    val audioLabel: String? = null,
-    val qualityFilter: String? = null,
-)
-
 // ============================ VidLink ============================
 // Independent backend: its own signed-token API, no external decryption
 // service. Responses carry either a per-quality map of progressive files or a
@@ -311,7 +254,7 @@ data class NexusSourceDto(
 
 // ============================ CineJoy ============================
 // Independent CineJoy backend. Its API answers an encrypted body, so one call is
-// needed: api.shegu.st/g returns the ciphertext for a body that [CineJoyCipher]
+// needed: api.wing.st/g returns the ciphertext for a body that [CineJoyCipher]
 // seals and opens in-process, using standard P-256 ECDH, HKDF and AES-GCM.
 
 /** One upstream scraper CineJoy exposes, from `/servers`. */
@@ -332,7 +275,7 @@ data class CineJoyServersDto(
     val servers: List<CineJoyServerDto> = emptyList(),
 )
 
-/** The decrypted reply from `api.shegu.st/g`. */
+/** The decrypted reply from `api.wing.st/g`. */
 @Serializable
 data class CineJoyDecResultDto(
     val data: CineJoyDataDto? = null,
@@ -366,8 +309,16 @@ data class CineJoyQualityDto(
 data class CineJoyCaptionDto(
     val url: String? = null,
     val language: String? = null,
+    val display: String? = null,
     val type: String? = null,
     val id: String? = null,
+)
+
+/** Plain-JSON subtitle catalogue served separately from the encrypted video API. */
+@Serializable
+data class CineJoySubtitleResponseDto(
+    val total: Int = 0,
+    val subtitles: List<CineJoyCaptionDto> = emptyList(),
 )
 
 // ============================= CineFlix =============================
@@ -470,7 +421,7 @@ data class VidFastServersDto(
 
 @Serializable
 data class VidFastServerDto(
-    // Upstream label, e.g. "vRapid" or "Cine".
+    // Upstream label. Only "Bravo" is retained by Rentaro.
     val name: String? = null,
     // Free text such as "Original audio, 4K" — the only 4K hint on the list
     // itself, and sometimes hedged ("4K?"), so the stream's own flag wins.

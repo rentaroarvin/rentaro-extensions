@@ -613,7 +613,7 @@ class Rentaro :
     /**
      * Streams for [episode], emitted as backend results are collected.
      *
-     * Six backend families are started concurrently and differ widely in cost,
+     * Five backend families are started concurrently and differ widely in cost,
      * so joining them all before returning can withhold usable streams until the
      * slowest enabled path finishes. Hosts that recognise
      * [ProgressiveVideoSource] collect this instead and can start playback
@@ -733,6 +733,24 @@ class Rentaro :
             edit().apply {
                 putStringSet(PREF_NEXUS_PROVIDERS_KEY, RentaroExtractor.NEXUS_PROVIDER_DEFAULT)
                 putBoolean(PREF_NEXUS_PROVIDERS_RESET_KEY, true)
+            }.apply()
+        }
+
+        // CineJoy moved to wing.st and now advertises four providers. Reset once so an
+        // existing installation does not retain removed names such as Castle or Sakura.
+        if (!getBoolean(PREF_CINEJOY_SERVERS_RESET_KEY, false)) {
+            edit().apply {
+                putStringSet(PREF_CINEJOY_SERVERS_KEY, RentaroExtractor.CINEJOY_SERVER_DEFAULT)
+                putBoolean(PREF_CINEJOY_SERVERS_RESET_KEY, true)
+            }.apply()
+        }
+
+        // All VidFast choices except Bravo were removed. Reset once so an existing install
+        // whose stored set only names vRapid/vEdge does not silently query nothing.
+        if (!getBoolean(PREF_VIDFAST_SERVERS_RESET_KEY, false)) {
+            edit().apply {
+                putStringSet(PREF_VIDFAST_SERVERS_KEY, RentaroExtractor.VIDFAST_SERVER_DEFAULT)
+                putBoolean(PREF_VIDFAST_SERVERS_RESET_KEY, true)
             }.apply()
         }
 
@@ -973,7 +991,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Yoru", "Cypher", "Orion", "Breach", "Vyse", "Art", "Jay", "Dave", "Wave")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -990,6 +1008,12 @@ class Rentaro :
          * already spent on installs that took the earlier set.
          */
         private const val PREF_NEXUS_PROVIDERS_RESET_KEY = "pref_nexus_providers_reset_v4"
+
+        /** One-shot migration to the current wing.st CineJoy provider list. */
+        private const val PREF_CINEJOY_SERVERS_RESET_KEY = "pref_cinejoy_servers_wing_v1"
+
+        /** One-shot migration after removing every VidFast server except Bravo. */
+        private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.
