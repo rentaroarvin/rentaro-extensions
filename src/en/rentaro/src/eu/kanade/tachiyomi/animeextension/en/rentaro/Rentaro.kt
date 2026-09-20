@@ -613,7 +613,7 @@ class Rentaro :
     /**
      * Streams for [episode], emitted as backend results are collected.
      *
-     * Five backend families are started concurrently and differ widely in cost,
+     * Six backend families are started concurrently and differ widely in cost,
      * so joining them all before returning can withhold usable streams until the
      * slowest enabled path finishes. Hosts that recognise
      * [ProgressiveVideoSource] collect this instead and can start playback
@@ -991,7 +991,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Orion", "Art", "Jay", "Dave", "Wave")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -1041,6 +1041,8 @@ class Rentaro :
             "pref_optin_dave" to setOf("Dave"),
             // VidFast shipped as "Wave" in v32, on the same one-shot basis.
             "pref_optin_wave" to setOf("Wave"),
+            // VidLove shipped as "Yoru" in v40, on the same one-shot basis.
+            "pref_optin_yoru" to setOf("Yoru"),
         )
 
         /**

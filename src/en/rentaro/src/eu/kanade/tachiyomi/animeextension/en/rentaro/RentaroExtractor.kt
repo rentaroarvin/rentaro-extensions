@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.en.rentaro
 
+import android.media.MediaCodecList
 import android.os.Build
 import androidx.annotation.RequiresApi
 import aniyomi.lib.playlistutils.PlaylistUtils
@@ -11,6 +12,8 @@ import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.last
@@ -37,7 +40,7 @@ import java.net.URLEncoder
 
 /**
  * Resolves Rentaro playback through the independent VidLink, Nexus, CineJoy,
- * CineFlix and VidFast backend families.
+ * CineFlix, VidFast and VidLove backend families.
  */
 class RentaroExtractor(
     private val client: OkHttpClient,
@@ -45,6 +48,17 @@ class RentaroExtractor(
 ) {
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+
+    /** Mirrors VidLove's own HEVC capability gate before asking for HEVC-only fallbacks. */
+    private val supportsHevc by lazy {
+        runCatching {
+            MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.any { info ->
+                !info.isEncoder && info.supportedTypes.any { type ->
+                    type.equals("video/hevc", ignoreCase = true)
+                }
+            }
+        }.getOrDefault(false)
+    }
 
     /**
      * Resolves every enabled backend and returns the finished list.
@@ -82,7 +96,7 @@ class RentaroExtractor(
      * Resolves every enabled backend, emitting the list again as family results
      * are collected.
      *
-     * Five backend families are started concurrently and differ enormously in
+     * Six backend families are started concurrently and differ enormously in
      * cost. Some make one request while others fan out across selectable upstream
      * servers or encrypted request chains. Waiting for every family before
      * returning anything would withhold usable streams until the slowest enabled
@@ -118,11 +132,12 @@ class RentaroExtractor(
         val cineJoyEnabled = CINEJOY_NAME in enabledServers
         val cineFlixEnabled = CINEFLIX_NAME in enabledServers
         val vidFastEnabled = VIDFAST_NAME in enabledServers
+        val vidLoveEnabled = VIDLOVE_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
-            !cineFlixEnabled && !vidFastEnabled
+            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -143,7 +158,7 @@ class RentaroExtractor(
             }
         }
 
-        // Servers *within* a backend are already resolved in parallel; these five
+        // Servers *within* a backend are already resolved in parallel; these six
         // family tasks run concurrently and report independently.
         val resolvers: List<suspend () -> List<Video>> = listOf(
             // VidLink is independent from the other backend families.
@@ -213,7 +228,7 @@ class RentaroExtractor(
             },
             // VidFast is the only backend still reached through
             // enc-dec.app, so it is also the one most likely to fail outright.
-            // Isolating it here keeps that from costing the other five.
+            // Isolating it here keeps that from costing the other families.
             {
                 if (!vidFastEnabled) {
                     emptyList()
@@ -227,6 +242,19 @@ class RentaroExtractor(
                             enabledVidFastServers,
                             subLimit,
                         )
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // VidLove exposes its source catalogue as plain JSON. Each upstream is queried
+            // independently, so one unavailable provider cannot hide the rest.
+            {
+                if (!vidLoveEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        vidLoveVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -942,6 +970,326 @@ class RentaroExtractor(
     private fun cineFlixLabel(quality: String, url: String, subCount: Int): String {
         val parts = mutableListOf(CINEFLIX_NAME, quality)
         if (".m3u8" in url.lowercase()) parts += "HLS"
+        if (subCount > 0) parts += "$subCount subs"
+        return parts.joinToString(" · ")
+    }
+
+    // ======================== VidLove (Yoru) backend ========================
+
+    /** One upstream exposed by VidLove under its own source selector. */
+    private data class VidLoveProvider(
+        val key: String,
+        val label: String,
+        /** These two sources only return some titles when the official HEVC flag is present. */
+        val hevcFallback: Boolean = false,
+    )
+
+    private data class VidLoveResolvedSource(
+        val provider: VidLoveProvider,
+        val source: VidLoveSourceDto,
+    )
+
+    /**
+     * Resolves VidLove's public JSON API.
+     *
+     * The official player gives every upstream its own `sources=` request and races them. Rentaro
+     * keeps all successful answers instead of stopping at the first, so the viewer has mirrors
+     * when one CDN fails. Mega Knight and MovieBox are retried with `hevc=1` only when their
+     * normal request has no source, matching the site's capability-gated fallback without
+     * forcing HEVC for titles that already have an ordinary stream.
+     */
+    private suspend fun vidLoveVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> = coroutineScope {
+        if (tmdbId.isBlank()) return@coroutineScope emptyList()
+
+        // The source replies sometimes omit subtitles even when the dedicated endpoint has a
+        // full catalogue. Fetch that endpoint alongside the source fan-out so one sparse source
+        // cannot remove tracks from every Yoru stream.
+        val subtitleTask = async {
+            vidLoveSubtitles(tmdbId, seasonId, episodeId, isMovie, subLimit)
+        }
+
+        val resolved = VIDLOVE_SOURCES.parallelCatchingFlatMap { provider ->
+            val normal = vidLoveResponse(
+                provider = provider,
+                tmdbId = tmdbId,
+                seasonId = seasonId,
+                episodeId = episodeId,
+                isMovie = isMovie,
+                hevc = false,
+            )
+            val response = if (normal.source != null || !provider.hevcFallback || !supportsHevc) {
+                normal
+            } else {
+                vidLoveResponse(
+                    provider = provider,
+                    tmdbId = tmdbId,
+                    seasonId = seasonId,
+                    episodeId = episodeId,
+                    isMovie = isMovie,
+                    hevc = true,
+                )
+            }
+            val source = response.source ?: return@parallelCatchingFlatMap emptyList()
+            listOf(VidLoveResolvedSource(provider, source))
+        }
+        val subtitles = subtitleTask.await()
+        if (resolved.isEmpty()) return@coroutineScope emptyList()
+
+        resolved.flatMap { item ->
+            vidLoveVideosForSource(item.provider, item.source, subtitles)
+        }
+    }
+
+    private suspend fun vidLoveSubtitles(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Track> {
+        if (subLimit <= 0) return emptyList()
+
+        val url = VIDLOVE_API_BASE.toHttpUrl().newBuilder().apply {
+            addPathSegment("subtitles")
+            addPathSegment(if (isMovie) "movie" else "tv")
+            addPathSegment(tmdbId)
+            if (!isMovie) {
+                addPathSegment(seasonId)
+                addPathSegment(episodeId)
+            }
+        }.build()
+
+        val apiHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .build()
+
+        return runCatching {
+            client.newCall(GET(url, apiHeaders))
+                .awaitSuccess()
+                .parseAs<List<VidLoveSubtitleDto>>()
+                .asSequence()
+                .mapNotNull { subtitle ->
+                    val file = subtitle.file?.toHttpUrlOrNull()?.toString()
+                        ?: return@mapNotNull null
+                    val label = subtitle.label?.takeIf { it.isNotBlank() } ?: "Unknown"
+                    Track(file, label)
+                }
+                .distinctBy { it.url }
+                .sortedBy { track -> if (track.lang.startsWith("English", true)) 0 else 1 }
+                .take(subLimit)
+                .toList()
+        }.getOrDefault(emptyList())
+    }
+
+    private suspend fun vidLoveResponse(
+        provider: VidLoveProvider,
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        hevc: Boolean,
+    ): VidLoveResponseDto {
+        val url = VIDLOVE_API_BASE.toHttpUrl().newBuilder().apply {
+            addPathSegment(if (isMovie) "movie" else "tv")
+            addQueryParameter("id", tmdbId)
+            if (!isMovie) {
+                addQueryParameter("season", seasonId)
+                addQueryParameter("episode", episodeId)
+            }
+            addQueryParameter("mode", "json")
+            addQueryParameter("sources", provider.key)
+            if (hevc) addQueryParameter("hevc", "1")
+        }.build()
+
+        val apiHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .build()
+
+        return client.newCall(GET(url, apiHeaders))
+            .awaitSuccess()
+            .parseAs()
+    }
+
+    private fun vidLoveVideosForSource(
+        provider: VidLoveProvider,
+        source: VidLoveSourceDto,
+        subtitles: List<Track>,
+    ): List<Video> {
+        val streamUrl = source.url?.takeIf { it.startsWith("http") } ?: return emptyList()
+        val sourceLabel = source.label?.takeIf { it.isNotBlank() } ?: provider.label
+        // The signed media proxy changes an HLS-playlist request into MP4 init bytes when the
+        // player origin is absent. These are therefore playback headers, not cosmetic CORS data.
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$VIDLOVE_ORIGIN/")
+            .set("Origin", VIDLOVE_ORIGIN)
+            .build()
+
+        // VidLove returns the HLS master inline. Its `url` is not that master: Mega Knight's
+        // URL, for example, answers an MP4 init fragment while the signed variant playlists live
+        // in `manifest`. Parse the inline master rather than asking PlaylistUtils to fetch the
+        // wrong resource.
+        val adaptive = source.manifest
+            ?.takeIf { it.trimStart().startsWith("#EXTM3U") }
+            ?.let { manifest ->
+                vidLoveManifestVideos(
+                    manifest = manifest,
+                    baseUrl = streamUrl,
+                    sourceLabel = sourceLabel,
+                    subtitles = subtitles,
+                    streamHeaders = streamHeaders,
+                )
+            }
+            .orEmpty()
+
+        val direct = if (adaptive.isEmpty()) {
+            // The official response uses `url` as the direct fallback when it supplies no
+            // master variants. These endpoints are extensionless, so the label declares MP4.
+            listOf(
+                Video(
+                    url = streamUrl,
+                    quality = vidLoveLabel(
+                        sourceLabel = sourceLabel,
+                        quality = "Auto",
+                        url = streamUrl,
+                        subCount = subtitles.size,
+                        isHls = false,
+                        isMp4 = true,
+                    ),
+                    videoUrl = streamUrl,
+                    headers = streamHeaders,
+                    subtitleTracks = subtitles,
+                ),
+            )
+        } else {
+            adaptive
+        }
+
+        val qualities = source.qualities.mapNotNull { quality ->
+            val url = quality.url?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+            val qualityIsHls = ".m3u8" in url.lowercase()
+            val hinted = if (qualityIsHls) hlsHintedUrl(url) ?: url else url
+            Video(
+                url = hinted,
+                quality = vidLoveLabel(
+                    sourceLabel = sourceLabel,
+                    quality = quality.quality ?: "Auto",
+                    url = url,
+                    subCount = subtitles.size,
+                    isHls = qualityIsHls,
+                    isMp4 = !qualityIsHls,
+                    codec = quality.codec,
+                ),
+                videoUrl = hinted,
+                headers = streamHeaders,
+                subtitleTracks = subtitles,
+            )
+        }
+
+        return (direct + qualities).distinctBy { video -> video.videoUrl ?: video.url }
+    }
+
+    /** Turns VidLove's inline HLS master into normal extension Video entries. */
+    private fun vidLoveManifestVideos(
+        manifest: String,
+        baseUrl: String,
+        sourceLabel: String,
+        subtitles: List<Track>,
+        streamHeaders: Headers,
+    ): List<Video> {
+        val lines = manifest.lineSequence().map(String::trim).toList()
+        val audioTracks = lines
+            .asSequence()
+            .filter { line -> line.startsWith("#EXT-X-MEDIA:") }
+            .mapNotNull { line ->
+                val attrs = vidLoveHlsAttributes(line)
+                if (!attrs["TYPE"].equals("AUDIO", ignoreCase = true)) return@mapNotNull null
+                val rawUrl = attrs["URI"] ?: return@mapNotNull null
+                val url = resolveVidLoveUrl(baseUrl, rawUrl) ?: return@mapNotNull null
+                val hinted = hlsHintedUrl(url) ?: url
+                Track(
+                    hinted,
+                    attrs["NAME"] ?: attrs["LANGUAGE"] ?: "Audio",
+                )
+            }
+            .distinctBy { it.url }
+            .toList()
+
+        return buildList {
+            lines.forEachIndexed { index, line ->
+                if (!line.startsWith("#EXT-X-STREAM-INF:")) return@forEachIndexed
+
+                val attrs = vidLoveHlsAttributes(line)
+                val rawUrl = lines.drop(index + 1)
+                    .firstOrNull { candidate -> candidate.isNotBlank() && !candidate.startsWith("#") }
+                    ?: return@forEachIndexed
+                val url = resolveVidLoveUrl(baseUrl, rawUrl) ?: return@forEachIndexed
+                val hinted = hlsHintedUrl(url) ?: url
+                val resolution = attrs["RESOLUTION"]?.split('x')
+                val width = resolution?.getOrNull(0)?.toIntOrNull() ?: 0
+                val height = resolution?.getOrNull(1)?.toIntOrNull() ?: 0
+                val quality = when {
+                    width >= 3_000 || height >= 1_800 -> "2160p"
+                    height > 0 -> "${height}p"
+                    else -> "Auto"
+                }
+
+                add(
+                    Video(
+                        url = hinted,
+                        quality = vidLoveLabel(
+                            sourceLabel = sourceLabel,
+                            quality = quality,
+                            url = url,
+                            subCount = subtitles.size,
+                            isHls = true,
+                            codec = attrs["CODECS"],
+                        ),
+                        videoUrl = hinted,
+                        headers = streamHeaders,
+                        subtitleTracks = subtitles,
+                        audioTracks = audioTracks,
+                    ),
+                )
+            }
+        }.distinctBy { video -> video.videoUrl ?: video.url }
+    }
+
+    private fun vidLoveHlsAttributes(line: String): Map<String, String> = VIDLOVE_HLS_ATTRIBUTE_REGEX.findAll(line.substringAfter(':'))
+        .associate { match ->
+            match.groupValues[1] to match.groupValues[2].trim().removeSurrounding("\"")
+        }
+
+    private fun resolveVidLoveUrl(baseUrl: String, value: String): String? = value.takeIf { it.startsWith("http") }
+        ?: baseUrl.toHttpUrlOrNull()?.resolve(value)?.toString()
+
+    private fun vidLoveLabel(
+        sourceLabel: String,
+        quality: String,
+        url: String,
+        subCount: Int,
+        isHls: Boolean,
+        isMp4: Boolean = false,
+        codec: String? = null,
+    ): String {
+        val parts = mutableListOf("$VIDLOVE_NAME/$sourceLabel", quality)
+        when {
+            isHls || ".m3u8" in url.lowercase() -> parts += "HLS"
+            isMp4 || ".mp4" in url.lowercase() -> parts += "MP4"
+        }
+        if (codec?.contains("hevc", ignoreCase = true) == true ||
+            codec?.contains("h265", ignoreCase = true) == true ||
+            codec?.contains("h.265", ignoreCase = true) == true ||
+            codec?.contains("hvc1", ignoreCase = true) == true ||
+            codec?.contains("hev1", ignoreCase = true) == true
+        ) {
+            parts += "HEVC"
+        }
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
     }
@@ -1676,6 +2024,20 @@ class RentaroExtractor(
         private const val CINEFLIX_NAME = "Dave"
         private const val CINEFLIX_API_BASE = "https://cineflix.st"
 
+        // VidLove is a plain-JSON backend with one request per selectable upstream.
+        private const val VIDLOVE_NAME = "Yoru"
+        private const val VIDLOVE_ORIGIN = "https://vidlove.cc"
+        private const val VIDLOVE_API_BASE = "https://api.vidlove.cc"
+        private val VIDLOVE_SOURCES = listOf(
+            VidLoveProvider("megaknight", "Mega Knight", hevcFallback = true),
+            VidLoveProvider("warden", "Grand Warden"),
+            VidLoveProvider("cinefreak", "P.E.K.K.A"),
+            VidLoveProvider("moviebox2", "Barbarian King 2.0", hevcFallback = true),
+            VidLoveProvider("ipcloud", "Royal Champion"),
+            VidLoveProvider("tcloud", "Ice Wizard"),
+            VidLoveProvider("vidapi", "Archer Queen"),
+        )
+
         // VidFast is the only backend that is not fully independent.
         //
         // Its two payloads are encrypted by a bytecode VM embedded in the player
@@ -1985,14 +2347,17 @@ class RentaroExtractor(
         // Their token embeds an expiry; the site itself signs ~2 minutes ahead.
         private const val VIDLINK_TOKEN_TTL_SECONDS = 120L
         private val qualityRegex = Regex("""(\d{3,4})[pP]?""")
+        private val VIDLOVE_HLS_ATTRIBUTE_REGEX =
+            Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
 
-        /** The five independent backend families offered in settings. */
+        /** The six independent backend families offered in settings. */
         val SERVER_DISPLAY_NAMES: List<String> = listOf(
             VIDLINK_NAME,
             NEXUS_NAME,
             CINEJOY_NAME,
             CINEFLIX_NAME,
             VIDFAST_NAME,
+            VIDLOVE_NAME,
         )
 
         /**
@@ -2016,6 +2381,7 @@ class RentaroExtractor(
             CINEJOY_NAME -> "Multi-Lang"
             CINEFLIX_NAME -> "Original"
             VIDFAST_NAME -> "Multi-Lang"
+            VIDLOVE_NAME -> "Original"
             else -> "Unknown"
         }
     }

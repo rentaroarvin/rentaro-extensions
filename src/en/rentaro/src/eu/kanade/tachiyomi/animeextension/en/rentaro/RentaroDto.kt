@@ -378,6 +378,41 @@ data class CineFlixTrackDto(
     val label: String? = null,
 )
 
+// ============================ VidLove ============================
+// VidLove's public JSON response. Metadata is intentionally omitted: Rentaro already owns the
+// TMDB title and only needs the source plus subtitle tracks.
+@Serializable
+data class VidLoveResponseDto(
+    val subtitles: List<VidLoveSubtitleDto> = emptyList(),
+    val source: VidLoveSourceDto? = null,
+)
+
+@Serializable
+data class VidLoveSourceDto(
+    val source: String? = null,
+    val label: String? = null,
+    val url: String? = null,
+    // Inline HLS master. Its signed variants are parsed directly because `url` may point to a
+    // progressive fallback or an MP4 init fragment rather than to this playlist.
+    val manifest: String? = null,
+    val qualities: List<VidLoveQualityDto> = emptyList(),
+)
+
+@Serializable
+data class VidLoveQualityDto(
+    val quality: String? = null,
+    val url: String? = null,
+    val codec: String? = null,
+)
+
+@Serializable
+data class VidLoveSubtitleDto(
+    val label: String? = null,
+    val file: String? = null,
+    val type: String? = null,
+    val source: String? = null,
+)
+
 // ============================ VidFast ============================
 // VidFast backend, and the only one that still needs enc-dec.app.
 //
