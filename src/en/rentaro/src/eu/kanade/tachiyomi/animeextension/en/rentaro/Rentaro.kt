@@ -755,6 +755,26 @@ class Rentaro :
             }.apply()
         }
 
+        // Keep zero-hit providers available in the pickers, but remove them once from existing
+        // selections as well as from fresh defaults. Subtracting only the tested zero-hit set
+        // preserves every other provider the user selected manually.
+        if (!getBoolean(PREF_NO_SOURCE_PROVIDERS_PRUNED_KEY, false)) {
+            val art = getStringSet(
+                PREF_NEXUS_PROVIDERS_KEY,
+                RentaroExtractor.NEXUS_PROVIDER_DEFAULT,
+            ).orEmpty() - RentaroExtractor.NEXUS_NO_SOURCE_PROVIDERS
+            val yoru = getStringSet(
+                PREF_VIDLOVE_PROVIDERS_KEY,
+                RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT,
+            ).orEmpty() - RentaroExtractor.VIDLOVE_NO_SOURCE_PROVIDERS
+
+            edit().apply {
+                putStringSet(PREF_NEXUS_PROVIDERS_KEY, art)
+                putStringSet(PREF_VIDLOVE_PROVIDERS_KEY, yoru)
+                putBoolean(PREF_NO_SOURCE_PROVIDERS_PRUNED_KEY, true)
+            }.apply()
+        }
+
         return this
     }
 
@@ -1017,6 +1037,10 @@ class Rentaro :
 
         /** Legacy Wave migration marker, cleared with the removed nested setting. */
         private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"
+
+        /** One-shot pruning of providers with zero results in the 20 September 2026 matrix. */
+        private const val PREF_NO_SOURCE_PROVIDERS_PRUNED_KEY =
+            "pref_no_source_providers_pruned_20260920"
 
         /**
          * Servers added after the initial release, keyed by a one-shot marker.

@@ -2046,8 +2046,16 @@ class RentaroExtractor(
             VidLoveProvider("vidapi", "Archer Queen"),
         )
 
-        /** Every current VidLove provider is enabled on a fresh install. */
-        val VIDLOVE_PROVIDER_DEFAULT: Set<String> = VIDLOVE_SOURCES.map { it.key }.toSet()
+        /**
+         * Providers that returned no source for all six regional/type probes on 20 September
+         * 2026. Kept selectable for future recovery, but not enabled by default.
+         */
+        val VIDLOVE_NO_SOURCE_PROVIDERS: Set<String> =
+            setOf("warden", "cinefreak", "ipcloud", "tcloud")
+
+        /** Providers that returned at least one playable movie or episode in that matrix. */
+        val VIDLOVE_PROVIDER_DEFAULT: Set<String> =
+            VIDLOVE_SOURCES.map { it.key }.toSet() - VIDLOVE_NO_SOURCE_PROVIDERS
 
         fun vidLoveProviderEntries(): List<String> = VIDLOVE_SOURCES.map { it.label }
 
@@ -2256,6 +2264,23 @@ class RentaroExtractor(
         )
 
         /**
+         * Art providers that returned no source for all six anime/Western/Korean movie and TV
+         * probes on 20 September 2026. They remain available to select manually.
+         */
+        val NEXUS_NO_SOURCE_PROVIDERS: Set<String> = setOf(
+            "holly",
+            "imovr",
+            "rive-hindicast",
+            "rive-asiacloud",
+            "levi",
+            "toonstream",
+            "tamilblasters",
+            "filmyfly",
+            "rive-guru",
+            "em-8",
+        )
+
+        /**
          * Scrapers enabled out of the box, chosen by hand rather than derived
          * from [NexusProvider.hitRate].
          *
@@ -2276,7 +2301,6 @@ class RentaroExtractor(
             "vidapi", // VidPi   - HLS, 4/6, rejects a Referer
             "stvv", // Stvvid  - MP4, 4/6
             "hdhub4u", // 4k-bk   - MKV, 2/3
-            "holly", // Lolly   - MP4, 1/5
             "ophim", // Ophm    - kept by request; 0/3 when tested
             // Citadel - HLS, 10/11 titles. Was written off against Western
             // probes; it is an Indian-catalogue provider and answers for
