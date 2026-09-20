@@ -560,7 +560,10 @@ class RentaroExtractor(
             stream.captions
                 .mapNotNull { caption ->
                     val url = caption.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    Track(url, caption.display ?: caption.language ?: "Unknown")
+                    Track(
+                        subtitleHintedUrl(url, caption.type, caption.display),
+                        caption.language ?: caption.display ?: "Unknown",
+                    )
                 } +
                 externalSubtitles
             )
@@ -678,8 +681,8 @@ class RentaroExtractor(
                     val file = subtitle.url?.takeIf { it.isNotBlank() }
                         ?: return@mapNotNull null
                     Track(
-                        file,
-                        subtitle.display ?: subtitle.language ?: "Unknown",
+                        subtitleHintedUrl(file, subtitle.type, subtitle.display),
+                        subtitle.language ?: subtitle.display ?: "Unknown",
                     )
                 }
                 .sortedBy { track ->
@@ -693,6 +696,32 @@ class RentaroExtractor(
                 }
                 .take(subLimit)
         }.getOrDefault(emptyList())
+    }
+
+    /**
+     * Makes an extensionless subtitle URL self-describing without changing its request.
+     *
+     * Wing returns SubRip from bare `/sub/<token>` URLs. Players choose WebVTT for those URLs,
+     * leaving the track selectable but unable to parse any cue. A URL fragment is local to the
+     * player and is never sent to the server, so `#.srt` safely selects the correct parser.
+     */
+    private fun subtitleHintedUrl(url: String, type: String?, display: String?): String {
+        if (url.isBlank() || "#" in url) return url
+
+        val path = url.substringBefore("?")
+        if (CINEJOY_SUBTITLE_FORMATS.any { path.endsWith(".$it", ignoreCase = true) }) {
+            return url
+        }
+
+        val declared = type?.trim()?.removePrefix(".")?.lowercase()
+        val displayed = display?.substringAfterLast(".", "")?.lowercase()
+        val format = when {
+            declared in CINEJOY_SUBTITLE_FORMATS -> declared
+            displayed in CINEJOY_SUBTITLE_FORMATS -> displayed
+            else -> null
+        }
+
+        return format?.let { "$url#.$it" } ?: url
     }
 
     /**
@@ -1634,6 +1663,7 @@ class RentaroExtractor(
         private const val CINEJOY_NAME = "Jay"
         private const val CINEJOY_UPSTREAM_URL = "https://api.wing.st/g"
         private const val CINEJOY_SUBTITLES_URL = "https://subs.wing.st/subtitles"
+        private val CINEJOY_SUBTITLE_FORMATS = setOf("srt", "vtt", "ass", "ssa", "ttml", "dfxp")
 
         // CineFlix is an independent backend, and the only one whose whole
         // chain is plain JSON. Its proof of work is solved in-process, so it
