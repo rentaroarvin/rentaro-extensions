@@ -47,11 +47,19 @@ class Rentaro :
         clearOldPrefs()
     }
 
-    // TMDB v3 mirror: API-compatible with api.themoviedb.org/3 but injects the
-    // API key server-side, so no key has to ship in the APK.
-    override val baseUrl = "https://db.speedracelight.com/3"
+    // Official TMDB v3 API.
+    //
+    // The previous speedracelight mirror began returning Cloudflare 1027 / HTTP 429 for
+    // catalogue, search and detail requests. The v3 key is necessarily public in a client APK,
+    // so this uses the same working public key as the WatchBox host rather than depending on an
+    // unofficial proxy for all metadata.
+    override val baseUrl = "https://api.themoviedb.org/3"
 
     private val apiUrl = baseUrl
+
+    /** Starts an official TMDB request with the v3 API key already attached. */
+    private fun tmdbUrlBuilder(): HttpUrl.Builder = apiUrl.toHttpUrl().newBuilder()
+        .addQueryParameter("api_key", TMDB_API_KEY)
 
     override val lang = "en"
     override val supportsLatest = true
@@ -109,7 +117,7 @@ class Rentaro :
     private fun recentlyReleasedRequest(page: Int, mediaType: String): Request {
         val isMovie = mediaType == "movie"
         val dateField = if (isMovie) "primary_release_date" else "first_air_date"
-        val url = apiUrl.toHttpUrl().newBuilder().apply {
+        val url = tmdbUrlBuilder().apply {
             addPathSegment("discover")
             addPathSegment(mediaType)
             addQueryParameter("language", "en-US")
@@ -215,7 +223,7 @@ class Rentaro :
     /** Curated list endpoints omit `media_type`; fall back to the title field. */
     private fun isMovieItem(media: MediaItemDto): Boolean = media.mediaType?.let { it == "movie" } ?: (media.title != null)
 
-    private fun listUrl(path: List<String>, page: Int): HttpUrl = apiUrl.toHttpUrl().newBuilder().apply {
+    private fun listUrl(path: List<String>, page: Int): HttpUrl = tmdbUrlBuilder().apply {
         path.forEach(::addPathSegment)
         addQueryParameter("language", "en-US")
         addQueryParameter("page", page.toString())
@@ -231,7 +239,7 @@ class Rentaro :
     override fun searchAnimeParse(response: Response): AnimesPage = parseMediaPage(response)
 
     private fun textSearchRequest(page: Int, query: String, mediaType: String): Request {
-        val url = apiUrl.toHttpUrl().newBuilder().apply {
+        val url = tmdbUrlBuilder().apply {
             addPathSegment("search")
             addPathSegment(mediaType)
             addQueryParameter("language", "en-US")
@@ -327,7 +335,7 @@ class Rentaro :
             ?.joinToString("|") { it.id }
             .orEmpty()
 
-        val url = apiUrl.toHttpUrl().newBuilder().apply {
+        val url = tmdbUrlBuilder().apply {
             addPathSegment("discover")
             addPathSegment(mediaType)
             addQueryParameter("sort_by", sortBy)
@@ -423,7 +431,7 @@ class Rentaro :
 
     override fun animeDetailsRequest(anime: SAnime): Request {
         val (type, id) = animeUrlToId(anime)
-        val url = apiUrl.toHttpUrl().newBuilder().apply {
+        val url = tmdbUrlBuilder().apply {
             addPathSegment(type)
             addPathSegment(id)
             addQueryParameter("append_to_response", "external_ids")
@@ -529,7 +537,7 @@ class Rentaro :
     // ========================== Related Titles ============================
     override fun relatedAnimeListRequest(anime: SAnime): Request {
         val (type, id) = animeUrlToId(anime)
-        val url = apiUrl.toHttpUrl().newBuilder().apply {
+        val url = tmdbUrlBuilder().apply {
             addPathSegment(type)
             addPathSegment(id)
             addPathSegment("recommendations")
@@ -553,9 +561,15 @@ class Rentaro :
             tv.seasons
                 .filter { it.seasonNumber > 0 }
                 .parallelCatchingFlatMap { season ->
-                    val seasonDetail = client.newCall(
-                        GET("$apiUrl/tv/${tv.id}/season/${season.seasonNumber}"),
-                    ).awaitSuccess().parseAs<TvSeasonDetailDto>()
+                    val seasonUrl = tmdbUrlBuilder().apply {
+                        addPathSegment("tv")
+                        addPathSegment(tv.id.toString())
+                        addPathSegment("season")
+                        addPathSegment(season.seasonNumber.toString())
+                    }.build()
+                    val seasonDetail = client.newCall(GET(seasonUrl))
+                        .awaitSuccess()
+                        .parseAs<TvSeasonDetailDto>()
                     seasonDetail.episodes.map { episode ->
                         SEpisode.create().apply {
                             name = "S${season.seasonNumber} E${episode.episodeNumber} - " +
@@ -921,6 +935,15 @@ class Rentaro :
 
         // Where "Open in browser" sends the user. TMDB ids are native here.
         private const val TMDB_WEB_URL = "https://www.themoviedb.org"
+
+        /**
+         * TMDB v3 client key.
+         *
+         * API keys embedded in an Android client are public by design. This is the same
+         * published key used by WatchBox's artwork client, verified against the official API
+         * on 20 September 2026.
+         */
+        private const val TMDB_API_KEY = "d8cd4489c203c5e8c8efb70aa8e33565"
 
         // Hosts accepted when a URL is pasted into search. Kept in sync with
         // the intent filter in AndroidManifest.xml.
