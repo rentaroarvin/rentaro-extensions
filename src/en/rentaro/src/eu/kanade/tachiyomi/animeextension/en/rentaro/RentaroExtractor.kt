@@ -11,10 +11,11 @@ import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
-import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.last
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
@@ -144,13 +145,13 @@ class RentaroExtractor(
 
         // Servers *within* a backend are already resolved in parallel; these five
         // family tasks run concurrently and report independently.
-        val tasks = listOf(
+        val resolvers: List<suspend () -> List<Video>> = listOf(
             // VidLink is independent from the other backend families.
             //
             // Only IOException is absorbed here. A blanket catch previously hid a
             // NoSuchFieldError thrown during token class-init on older devices,
             // so the server silently vanished instead of surfacing the fault.
-            async {
+            {
                 if (!vidLinkEnabled) {
                     emptyList()
                 } else {
@@ -162,7 +163,7 @@ class RentaroExtractor(
                 }
             },
             // Nexus is an independent backend with its own encrypted API.
-            async {
+            {
                 if (!nexusEnabled) {
                     emptyList()
                 } else {
@@ -176,7 +177,7 @@ class RentaroExtractor(
             // CineJoy is an independent backend, reached through its own
             // encrypt/decrypt chain. Usually the slowest, which is the whole
             // reason the others are not made to wait for it.
-            async {
+            {
                 if (!cineJoyEnabled) {
                     emptyList()
                 } else {
@@ -199,7 +200,7 @@ class RentaroExtractor(
             },
             // CineFlix is an independent backend, and the cheapest: plain
             // JSON both ways, with a proof of work solved in-process.
-            async {
+            {
                 if (!cineFlixEnabled) {
                     emptyList()
                 } else {
@@ -213,7 +214,7 @@ class RentaroExtractor(
             // VidFast is the only backend still reached through
             // enc-dec.app, so it is also the one most likely to fail outright.
             // Isolating it here keeps that from costing the other five.
-            async {
+            {
                 if (!vidFastEnabled) {
                     emptyList()
                 } else {
@@ -233,9 +234,13 @@ class RentaroExtractor(
             },
         )
 
-        // All family tasks begin concurrently. Their cumulative results are
-        // published as the task list is collected rather than only once at the end.
-        tasks.forEach { task -> publish(task.await()) }
+        // Publish inside each child rather than awaiting the resolver list in catalogue order.
+        // Awaiting Orion first created head-of-line blocking: a finished Dave or Jay result sat
+        // hidden until every earlier entry had been collected, after which several batches were
+        // emitted back-to-back and appeared to arrive together.
+        resolvers
+            .map { resolver -> launch { publish(resolver()) } }
+            .joinAll()
     }
 
     /**
