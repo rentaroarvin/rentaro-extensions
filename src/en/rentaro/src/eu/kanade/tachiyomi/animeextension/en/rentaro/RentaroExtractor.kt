@@ -609,8 +609,14 @@ class RentaroExtractor(
             .distinctBy { it.url }
             .take(subLimit.coerceAtLeast(0))
 
-        // The current browser requests the wing.st playlist and segments directly.
-        val streamHeaders = headers
+        // The browser fetches every stream cross-site from cinejoy.pk, and two CDNs now enforce
+        // it: Solara (cheaptruckrepairs.cc) 403s the master, variants and segments without the
+        // site Origin/Referer, and Nebula (bright67.online) 404s the init/segments of some titles
+        // without the Origin. Lisbon accepts the same headers, so they apply to every stream.
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$CINEJOY_ORIGIN/")
+            .set("Origin", CINEJOY_ORIGIN)
+            .build()
 
         // Only an absolute URL is usable. A placeholder label from an upstream provider would
         // otherwise reach the player as an unresolvable host.
@@ -2024,6 +2030,9 @@ class RentaroExtractor(
         private const val CINEJOY_NAME = "Jay"
         private const val CINEJOY_UPSTREAM_URL = "https://api.wing.st/g"
         private const val CINEJOY_SUBTITLES_URL = "https://subs.wing.st/subtitles"
+
+        /** Site origin the Solara and Nebula CDNs allowlist for playlists and segments. */
+        private const val CINEJOY_ORIGIN = "https://cinejoy.pk"
         private val CINEJOY_SUBTITLE_FORMATS = setOf("srt", "vtt", "ass", "ssa", "ttml", "dfxp")
 
         // CineFlix is an independent backend, and the only one whose whole
