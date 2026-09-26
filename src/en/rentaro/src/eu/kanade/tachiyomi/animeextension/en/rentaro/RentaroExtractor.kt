@@ -1845,7 +1845,13 @@ class RentaroExtractor(
      */
     private fun isNexusLandingPage(url: String): Boolean {
         val parsed = url.toHttpUrlOrNull() ?: return false
-        if (parsed.host.split('.').none { it == "hubcloud" }) return false
+        val labels = parsed.host.split('.')
+        // HubStream (4k-bkl) is a web player, not a file. Of its three delivery routes the
+        // in-house one 403s and the Cloudflare one fails; the TikTok one serves MPEG-TS pieces
+        // behind a 120-byte PNG header that players reject, from a host ad-blocking DNS sinkholes.
+        // Played normally in a browser on 26 September 2026, none of six titles played at all.
+        if ("hubstream" in labels) return true
+        if (labels.none { it == "hubcloud" }) return false
 
         val firstSegment = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
             ?: return true
