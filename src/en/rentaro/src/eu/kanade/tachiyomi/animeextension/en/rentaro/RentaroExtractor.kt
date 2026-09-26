@@ -1907,14 +1907,27 @@ class RentaroExtractor(
 
         // 4k-bkl/4k-Hublink (and the hubcloud mirrors of 4k-bk/4k-Hub) point at hubcloud,
         // hubdrive and hubcdn download pages. Each is followed through to the files it offers.
-        val hubFiles = coroutineScope {
+        //
+        // A hubdrive page is only a pointer to a hubcloud drive, and 4k-Hublink lists both for
+        // the same release (Breaking Bad S1E1: "HubCloud | 8.94 GB" and "HubDrive | 8.94 GB"
+        // are one file). Pages are first reduced to the drive they lead to, so each file is
+        // resolved and listed once.
+        val hubDrives = coroutineScope {
             sourcesDto.sources
                 .mapNotNull { it.url?.trim()?.takeIf(::isHubPage) }
+                .distinct()
+                .map { page -> async { page to (runCatching { canonicalHubPage(page) }.getOrNull() ?: page) } }
+                .map { it.await() }
+                .toMap()
+        }
+        val hubFiles = coroutineScope {
+            hubDrives.values
                 .distinct()
                 .map { page -> async { page to runCatching { resolveHubPage(page) }.getOrDefault(emptyList()) } }
                 .map { it.await() }
                 .toMap()
         }
+        val listedHubDrives = mutableSetOf<String>()
 
         val playable = sourcesDto.sources.flatMap { source ->
             val rawUrl = source.url?.trim()?.takeIf { it.isNotBlank() } ?: return@flatMap emptyList()
@@ -1930,7 +1943,9 @@ class RentaroExtractor(
                 ?: "Auto"
 
             if (isHubPage(rawUrl)) {
-                return@flatMap hubFiles[rawUrl].orEmpty().map { file ->
+                val drive = hubDrives[rawUrl] ?: rawUrl
+                if (!listedHubDrives.add(drive)) return@flatMap emptyList()
+                return@flatMap hubFiles[drive].orEmpty().map { file ->
                     NexusCandidate(
                         url = file.url,
                         label = "${nexusLabel(serverName, quality, file.url, "mkv")} · ${file.mirror}",
@@ -2233,6 +2248,14 @@ class RentaroExtractor(
         }
     }
 
+    /** The hubcloud drive a hubdrive page points at, or the page itself for any other host. */
+    private suspend fun canonicalHubPage(pageUrl: String): String {
+        val page = pageUrl.toHttpUrlOrNull() ?: return pageUrl
+        if ("hubdrive" !in page.host.split('.')) return pageUrl
+        val html = fetchHubHtml(pageUrl) ?: return pageUrl
+        return HUBDRIVE_CLOUD_LINK_REGEX.find(html)?.groupValues?.get(1) ?: pageUrl
+    }
+
     private suspend fun resolveHubCloud(driveUrl: String): List<HubFile> {
         val drive = fetchHubHtml(driveUrl) ?: return emptyList()
         val generatorUrl = HUBCLOUD_GENERATOR_REGEX.find(drive)?.groupValues?.get(1) ?: return emptyList()
@@ -2417,6 +2440,8 @@ class RentaroExtractor(
         // "1080P - HEVC (Telugu)" is not read as one opaque tag.
         val tags = quality.split('|', '-', '(', ')').map { it.trim() }
         NEXUS_RELEASE_TAGS.firstOrNull { tag -> tags.any { it.equals(tag, ignoreCase = true) } }
+            ?.let { parts += it }
+        NEXUS_AUDIO_CODEC_TAGS.firstOrNull { codec -> tags.any { it.equals(codec, ignoreCase = true) } }
             ?.let { parts += it }
         if (tags.any { it.equals("HEVC", ignoreCase = true) || it.equals("x265", ignoreCase = true) }) {
             parts += "HEVC"
@@ -2876,7 +2901,17 @@ class RentaroExtractor(
             "hevc", "avc", "x264", "x265", "h264", "h265", "h.264", "h.265", "av1", "vp9",
             "mkv", "mp4", "ts", "dts", "atmos", "aac", "ac3", "dd", "ddp", "truehd", "org",
             "10bit", "8bit", "hdr", "sdr", "dv", "remux", "esub", "msub",
+            // 4k-Hublink leads its quality string with the file host ("HubDrive | 11.4 GB | …"),
+            // which otherwise read as a language: "HubCloud, Hindi, English audio".
+            "hubcloud", "hubdrive", "hubcdn", "gdflix", "pixeldrain", "filepress", "gofile",
+            "direct", "10gbps",
         )
+
+        /**
+         * Audio codec tags worth showing, most specific first. They separate releases that
+         * share a height and languages, e.g. 4k-Hublink's DTS BluRay from its AAC encode.
+         */
+        private val NEXUS_AUDIO_CODEC_TAGS = listOf("TrueHD", "Atmos", "DTS", "DDP", "EAC3", "AC3", "DD", "AAC", "Opus")
 
         /** Words that already say what kind of track a descriptor names. */
         private val NEXUS_AUDIO_WORDS = listOf("dub", "sub", "audio")
