@@ -1999,7 +1999,8 @@ class RentaroExtractor(
 
             NexusCandidate(
                 url = url,
-                label = nexusLabel(serverName, quality, url, source.type),
+                label = nexusLabel(serverName, quality, url, source.type) +
+                    if (isNoSeekHost(url)) " · 10Gbps · no seek" else "",
                 videoHeaders = videoHeaders,
                 type = source.type,
             ).let(::listOf)
@@ -2017,7 +2018,15 @@ class RentaroExtractor(
                 }
             }.mapNotNull { it.await() }
         }
-        val playable = probed
+        // Google's `video-downloads` host ignores Range and always answers 200 from byte 0, so
+        // a seek - including the one the player makes to read an MKV index stored at the end -
+        // means downloading everything before the target. On Interstellar's 21-34 GB files the
+        // player sat "loading" while 200 MB+ streamed in. Such a file is listed only when its
+        // release has no seekable mirror, and the label says so either way.
+        val playable = probed.filterNot { candidate ->
+            isNoSeekHost(candidate.url) &&
+                probed.any { other -> other !== candidate && !isNoSeekHost(other.url) && sameRelease(other, candidate) }
+        }
 
         // Distinct releases can still share a label once the same file is
         // offered on several hosts. Those mirrors are worth keeping as
@@ -2121,6 +2130,17 @@ class RentaroExtractor(
         val firstSegment = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
             ?: return true
         return firstSegment in NEXUS_LANDING_PATH_SEGMENTS
+    }
+
+    private fun isNoSeekHost(url: String): Boolean = url.toHttpUrlOrNull()?.host == "video-downloads.googleusercontent.com"
+
+    /**
+     * Whether two candidates are the same release on different mirrors. Their labels differ only
+     * in the trailing mirror name, so everything before it is compared.
+     */
+    private fun sameRelease(a: NexusCandidate, b: NexusCandidate): Boolean {
+        fun release(label: String) = label.substringBefore(" · Direct").substringBefore(" · 10Gbps").trim()
+        return release(a.label) == release(b.label)
     }
 
     /** Direct-file hosts whose links are worth a byte probe before they are listed. */
