@@ -2386,8 +2386,11 @@ class RentaroExtractor(
          *
          * Kept as an allowlist: VidPi's segment host serves media bare and
          * rejects the header outright, so this cannot be a global default.
+         *
+         * `itsnitrox.tech` fronts Multi-blue's (and Nitro's) masters: 403 bare, 200 with the
+         * Referer. Their segments sit on `workers.dev`, which already has it.
          */
-        private val NEXUS_REFERER_HOST_SUFFIXES = listOf("workers.dev")
+        private val NEXUS_REFERER_HOST_SUFFIXES = listOf("workers.dev", "itsnitrox.tech")
 
         /**
          * The scrapers the Nexus backend advertises, each a separate upstream
@@ -2409,7 +2412,7 @@ class RentaroExtractor(
             NexusProvider("vidapi", "VidPi", 4),
             NexusProvider("streamflix", "StremFx", 4),
             NexusProvider("nitro", "Nitro", 3),
-            NexusProvider("bkl-blast", "MbBlast", 3),
+            NexusProvider("bdxs", "Multi-blue", 3),
             NexusProvider("rive-citadel", "Citadel", 3),
             NexusProvider("watchout", "Multi-bill", 3),
             NexusProvider("rive-primevids", "Prvibd", 3),
@@ -2430,6 +2433,12 @@ class RentaroExtractor(
             NexusProvider("filmyfly", "FlyVid", 0),
             NexusProvider("rive-guru", "Gbru", 0),
             NexusProvider("em-8", "VidHindi", 0),
+            // Added to the backend by 26 September 2026. Off by default, see the sets below.
+            NexusProvider("vidking", "Vip-4K", 1),
+            NexusProvider("hdhub4u-direct", "4k-bkl", 3),
+            NexusProvider("k4khdhub-direct", "4k-Hublink", 4),
+            NexusProvider("rive-quasar", "Kutti", 0),
+            NexusProvider("filmyfly-direct", "FlyVid Direct", 0),
         )
 
         /**
@@ -2447,6 +2456,8 @@ class RentaroExtractor(
             "filmyfly",
             "rive-guru",
             "em-8",
+            "rive-quasar",
+            "filmyfly-direct",
         )
 
         /**
@@ -2464,7 +2475,10 @@ class RentaroExtractor(
         val NEXUS_PROVIDER_DEFAULT: Set<String> = setOf(
             "castle", // CastVid - HLS, 9/9 sources
             "streamflix", // StremFx - MKV, 2/2
-            "bkl-blast", // MbBlast - MKV, 3/3
+            // Multi-blue - HLS, 4/6 titles on 26 September 2026, multi-audio (Hindi, English,
+            // Tamil, Telugu, ...). Its master host needs the site Referer, see
+            // [NEXUS_REFERER_HOST_SUFFIXES].
+            "bdxs",
             "mhbox", // MhPly   - DASH, 3/3, what the site's own player uses
             "k4khdhub", // 4k-Hub  - MKV, 5/14, the only 2160p source
             "vidapi", // VidPi   - HLS, 4/6, rejects a Referer
@@ -2510,6 +2524,12 @@ class RentaroExtractor(
             "filmyfly",
             "rive-guru",
             "em-8",
+            "rive-quasar",
+            "filmyfly-direct",
+            // Both answer with hubcloud/hubdrive/hubcdn landing pages for every source (plus
+            // hdstream4u, which 4k-bk already resolves), never a media file.
+            "hdhub4u-direct",
+            "k4khdhub-direct",
         )
 
         /**
@@ -2520,7 +2540,10 @@ class RentaroExtractor(
          * to 31 sources - and only the fetch fails. nitro additionally serves ad
          * CDN segments when it does answer. Worth revisiting if the block lifts.
          */
-        private val NEXUS_UPSTREAM_BLOCKED = setOf("nitro", "mbox", "rive-flowcast")
+        //
+        // vidking (Vip-4K) masters answer "Access Denied: Blocked by upstream provider nitrox"
+        // with or without the site Referer, the only one on itsnitrox.tech still refused.
+        private val NEXUS_UPSTREAM_BLOCKED = setOf("nitro", "mbox", "rive-flowcast", "vidking")
 
         /** Entry labels for the provider preference, ordered as the list is. */
         fun nexusProviderEntries(): List<String> = NEXUS_PROVIDERS.map { provider ->

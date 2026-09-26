@@ -775,6 +775,19 @@ class Rentaro :
             }.apply()
         }
 
+        // MbBlast (bkl-blast) was removed: every mbaccess.site host is dead at the CDN (Fastly
+        // "unknown domain"). Its replacement Multi-blue (bdxs) is added to existing selections
+        // once; the rest of the user's choice is left as it is.
+        if (!getBoolean(PREF_NEXUS_MBBLAST_SWAP_KEY, false)) {
+            val stored = getStringSet(PREF_NEXUS_PROVIDERS_KEY, null)
+            edit().apply {
+                if (stored != null) {
+                    putStringSet(PREF_NEXUS_PROVIDERS_KEY, stored - "bkl-blast" + "bdxs")
+                }
+                putBoolean(PREF_NEXUS_MBBLAST_SWAP_KEY, true)
+            }.apply()
+        }
+
         return this
     }
 
@@ -1034,6 +1047,9 @@ class Rentaro :
 
         /** One-shot migration to the current wing.st CineJoy provider list. */
         private const val PREF_CINEJOY_SERVERS_RESET_KEY = "pref_cinejoy_servers_wing_v1"
+
+        /** One-shot swap of the dead Art MbBlast for Multi-blue in stored selections. */
+        private const val PREF_NEXUS_MBBLAST_SWAP_KEY = "pref_nexus_mbblast_to_bdxs_v1"
 
         /** Legacy Wave migration marker, cleared with the removed nested setting. */
         private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"
