@@ -1089,6 +1089,7 @@ class RentaroExtractor(
             .filterNot { (_, stream) -> stream.downloadOnly }
             .mapNotNull { (server, stream) ->
                 val url = stream.url?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+                if (isScreenscapeDeadHost(url) || isExpiredSignedUrl(url)) return@mapNotNull null
                 val language = screenscapeLanguage(stream)
                 if (screenscapeLanguageGroup(language) !in enabledLanguages) return@mapNotNull null
                 screenscapeVideo(server, stream, url, language)
@@ -1172,6 +1173,9 @@ class RentaroExtractor(
             resolution ?: stream.quality?.takeIf { it.isNotBlank() && !it.equals("auto", true) } ?: "Auto",
             language,
             container,
+            // HEVC (often 10-bit, with EAC3 audio) needs a hardware decoder many phones lack;
+            // Viduki's English files are both. Flagged so a failure reads as the device, not Sun.
+            "HEVC".takeIf { SCREENSCAPE_HEVC_REGEX.containsMatchIn("$url ${stream.name.orEmpty()}") },
             stream.size?.takeIf { it.isNotBlank() && it != "-" },
         ).joinToString(" · ")
 
@@ -1181,6 +1185,25 @@ class RentaroExtractor(
             videoUrl = playable,
             headers = streamHeaders,
         )
+    }
+
+    /**
+     * Hosts whose links cannot play on the device, checked on Breaking Bad and five other
+     * titles on 26 September 2026:
+     *
+     *  - hunts439kow: the playlist path embeds the IP of the Screenscape server that fetched it
+     *    and the CDN answers 404 to anyone else. This is every ALICE stream and most of
+     *    Viduki's, HBOX's and Mune's English/Tamil/Telugu entries.
+     *  - tiktoks.animanga.fun (HBOX "Catflix"): master plays, but every segment 403s with
+     *    "bad signature" from a proxy that also times out.
+     *  - goodstream.cc (HBOX "Prime"): 403 on every request.
+     *
+     * Dropping them is what made HBOX look like it was "only loading": it was being handed
+     * nothing but these.
+     */
+    private fun isScreenscapeDeadHost(url: String): Boolean {
+        val host = url.toHttpUrlOrNull()?.host ?: return true
+        return SCREENSCAPE_DEAD_HOSTS.any { host == it || host.endsWith(".$it") }
     }
 
     /**
@@ -1897,6 +1920,10 @@ class RentaroExtractor(
             val rawUrl = source.url?.trim()?.takeIf { it.isNotBlank() } ?: return@flatMap emptyList()
             // Embeds are player pages, not streams.
             if (source.isEmbed == true) return@flatMap emptyList()
+            // Citadel (and other Castle mirrors) can hand back a cached link whose signature has
+            // already lapsed: Breaking Bad S1E1 arrived three hours past its `expire=` on
+            // 26 September 2026 and every request answered "Sign expired".
+            if (isExpiredSignedUrl(rawUrl)) return@flatMap emptyList()
 
             val quality = source.quality?.takeIf { it.isNotBlank() }
                 ?: source.label?.takeIf { it.isNotBlank() }
@@ -2057,11 +2084,24 @@ class RentaroExtractor(
         // behind a 120-byte PNG header that players reject, from a host ad-blocking DNS sinkholes.
         // Played normally in a browser on 26 September 2026, none of six titles played at all.
         if ("hubstream" in labels) return true
+        // pixeldrain `/u/<id>` is the viewer page, not the file, and every id seen (4k-Hub's
+        // Breaking Bad mirror included) now 404s anyway.
+        if ("pixeldrain" in labels) return true
         if (labels.none { it == "hubcloud" }) return false
 
         val firstSegment = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
             ?: return true
         return firstSegment in NEXUS_LANDING_PATH_SEGMENTS
+    }
+
+    /**
+     * Whether a signed URL carries an `expire=` / `expires=` timestamp that has already passed.
+     * Both seconds and milliseconds are in use, told apart by magnitude.
+     */
+    private fun isExpiredSignedUrl(url: String): Boolean {
+        val raw = SIGNED_EXPIRY_REGEX.find(url)?.groupValues?.get(1)?.toLongOrNull() ?: return false
+        val expiresAtMs = if (raw > 100_000_000_000L) raw else raw * 1000
+        return expiresAtMs < System.currentTimeMillis()
     }
 
     /** A Nexus source that passed filtering, before HLS expansion. */
@@ -2151,8 +2191,9 @@ class RentaroExtractor(
         val labels = parsed.host.split('.')
         val first = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
         return when {
-            // A bare pixel.hubcloud ?id= link (4k-bk hands these out) is the 10Gbps mirror.
-            "hubcloud" in labels && parsed.host.startsWith("pixel.") -> true
+            // A bare pixel./gpdl. hubcloud ?id= link (4k-bk and 4k-Hub hand these out) is the
+            // 10Gbps mirror.
+            "hubcloud" in labels && isHubDirectHost(parsed.host) -> true
             "hubcloud" in labels -> first == "drive"
             "hubdrive" in labels || "hubcdn" in labels -> first == "file"
             else -> false
@@ -2181,7 +2222,7 @@ class RentaroExtractor(
         val labels = page.host.split('.')
         return when {
             "hubcdn" in labels -> listOfNotNull(resolveHubCdn(pageUrl))
-            page.host.startsWith("pixel.") ->
+            isHubDirectHost(page.host) ->
                 listOfNotNull(resolveGoogleDownload(pageUrl)?.let { HubFile(it, "10Gbps · no seek") })
             "hubdrive" in labels -> {
                 val html = fetchHubHtml(pageUrl) ?: return emptyList()
@@ -2202,7 +2243,7 @@ class RentaroExtractor(
             val host = href.toHttpUrlOrNull()?.host ?: return@mapNotNull null
             when {
                 host.endsWith("workers.dev") -> HubFile(href, "Direct")
-                host.split('.').let { "hubcloud" in it } && host.startsWith("pixel.") ->
+                host.split('.').let { "hubcloud" in it } && isHubDirectHost(host) ->
                     resolveGoogleDownload(href)?.let { HubFile(it, "10Gbps · no seek") }
                 else -> null
             }
@@ -2224,7 +2265,14 @@ class RentaroExtractor(
         return linkParameter(decoded)?.let { HubFile(it, "10Gbps · no seek") }
     }
 
-    /** Follows the pixel.hubcloud redirect chain to the `link=` media URL it ends on. */
+    /**
+     * The hubcloud subdomains whose `?id=` redirects to `dl.php?link=<file>`. `gpdl.` joined
+     * `pixel.` by 26 September 2026 and is now the only mirror some Breaking Bad pages offer,
+     * so skipping it left 4k-Hub and 4k-Hublink with nothing playable.
+     */
+    private fun isHubDirectHost(host: String): Boolean = host.startsWith("pixel.") || host.startsWith("gpdl")
+
+    /** Follows the pixel./gpdl. hubcloud redirect chain to the `link=` media URL it ends on. */
     private suspend fun resolveGoogleDownload(pixelUrl: String): String? {
         val response = client.newCall(GET(pixelUrl, hubHeaders(pixelUrl))).awaitSuccess()
         val finalUrl = response.use { it.request.url.toString() }
@@ -2599,6 +2647,10 @@ class RentaroExtractor(
             ScreenscapeServer("awsind", "ALICE"),
         )
 
+        private val SCREENSCAPE_HEVC_REGEX = Regex("""(?i)\b(h\.?265|x265|hevc)\b|/h265/""")
+
+        private val SCREENSCAPE_DEAD_HOSTS = listOf("hunts439kow.com", "animanga.fun", "goodstream.cc")
+
         /** Languages the site names in stream titles when the language field is unset. */
         private val SCREENSCAPE_NAMED_LANGUAGES = listOf(
             "Hindi", "English", "Tamil", "Telugu", "Bengali", "Malayalam", "Kannada",
@@ -2738,6 +2790,8 @@ class RentaroExtractor(
          * hand-off that redirects out to telegram.me.
          */
         private val NEXUS_LANDING_PATH_SEGMENTS = setOf("drive", "tg")
+
+        private val SIGNED_EXPIRY_REGEX = Regex("""[?&]expires?=(\d{10,13})(?:&|$)""", RegexOption.IGNORE_CASE)
 
         /** VidHide mirrors 4k-bk links as player pages rather than files. */
         private val VIDHIDE_HOSTS = listOf("hdstream4u.com")
