@@ -1929,7 +1929,7 @@ class RentaroExtractor(
         }
         val listedHubDrives = mutableSetOf<String>()
 
-        val playable = sourcesDto.sources.flatMap { source ->
+        val resolvedCandidates = sourcesDto.sources.flatMap { source ->
             val rawUrl = source.url?.trim()?.takeIf { it.isNotBlank() } ?: return@flatMap emptyList()
             // Embeds are player pages, not streams.
             if (source.isEmbed == true) return@flatMap emptyList()
@@ -2004,6 +2004,20 @@ class RentaroExtractor(
                 type = source.type,
             ).let(::listOf)
         }
+
+        // Direct file mirrors die in two ways the API cannot see: Google Drive answers 403
+        // "download quota exceeded" once a file is popular, and some workers.dev mirrors serve
+        // the MKV wrapped in a deflated ZIP. Interstellar on 26 September 2026 had both, and
+        // every such row failed in the player. The first bytes tell them apart, so each direct
+        // file is probed once, in parallel, and dropped unless it starts like media.
+        val probed = coroutineScope {
+            resolvedCandidates.map { candidate ->
+                async {
+                    candidate.takeIf { !needsMediaProbe(it) || isPlayableMediaFile(it.url, it.videoHeaders) }
+                }
+            }.mapNotNull { it.await() }
+        }
+        val playable = probed
 
         // Distinct releases can still share a label once the same file is
         // offered on several hosts. Those mirrors are worth keeping as
@@ -2107,6 +2121,45 @@ class RentaroExtractor(
         val firstSegment = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
             ?: return true
         return firstSegment in NEXUS_LANDING_PATH_SEGMENTS
+    }
+
+    /** Direct-file hosts whose links are worth a byte probe before they are listed. */
+    private fun needsMediaProbe(candidate: NexusCandidate): Boolean {
+        if (candidate.type.equals("hls", true) || candidate.type.equals("m3u8", true)) return false
+        val host = candidate.url.toHttpUrlOrNull()?.host ?: return false
+        return host.endsWith("workers.dev") || host.endsWith("googleusercontent.com")
+    }
+
+    /**
+     * Reads the first bytes of a direct file and accepts it only when it answers 2xx with a
+     * container signature: Matroska/WebM (`1A 45 DF A3`), MP4 (`ftyp` at offset 4) or MPEG-TS
+     * (`0x47`). An unreachable host is kept rather than dropped, so a slow probe never costs
+     * a working source.
+     */
+    private suspend fun isPlayableMediaFile(url: String, videoHeaders: Headers): Boolean {
+        val probeHeaders = videoHeaders.newBuilder().set("Range", "bytes=0-15").build()
+        val response = runCatching {
+            mediaProbeClient.newCall(GET(url, probeHeaders)).await()
+        }.getOrElse { return true }
+        return response.use {
+            if (!it.isSuccessful) return@use false
+            val head = runCatching { it.body.source().readByteArray(16L.coerceAtMost(it.body.contentLength().takeIf { n -> n > 0 } ?: 16L)) }
+                .getOrElse { ByteArray(0) }
+            isMediaSignature(head)
+        }
+    }
+
+    private fun isMediaSignature(head: ByteArray): Boolean {
+        if (head.size < 4) return false
+        val matroska = head[0] == 0x1A.toByte() && head[1] == 0x45.toByte() &&
+            head[2] == 0xDF.toByte() && head[3] == 0xA3.toByte()
+        val mp4 = head.size >= 8 && String(head, 4, 4, Charsets.US_ASCII) == "ftyp"
+        val mpegTs = head[0] == 0x47.toByte()
+        return matroska || mp4 || mpegTs
+    }
+
+    private val mediaProbeClient: OkHttpClient by lazy {
+        client.newBuilder().callTimeout(MEDIA_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
     }
 
     /**
@@ -2815,6 +2868,8 @@ class RentaroExtractor(
          * hand-off that redirects out to telegram.me.
          */
         private val NEXUS_LANDING_PATH_SEGMENTS = setOf("drive", "tg")
+
+        private const val MEDIA_PROBE_TIMEOUT_SECONDS = 8L
 
         private val SIGNED_EXPIRY_REGEX = Regex("""[?&]expires?=(\d{10,13})(?:&|$)""", RegexOption.IGNORE_CASE)
 
