@@ -36,6 +36,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -1675,26 +1676,53 @@ class RentaroExtractor(
                 .toMap()
         }
 
-        val playable = sourcesDto.sources.mapNotNull { source ->
-            val rawUrl = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        // 4k-bkl/4k-Hublink (and the hubcloud mirrors of 4k-bk/4k-Hub) point at hubcloud,
+        // hubdrive and hubcdn download pages. Each is followed through to the files it offers.
+        val hubFiles = coroutineScope {
+            sourcesDto.sources
+                .mapNotNull { it.url?.trim()?.takeIf(::isHubPage) }
+                .distinct()
+                .map { page -> async { page to runCatching { resolveHubPage(page) }.getOrDefault(emptyList()) } }
+                .map { it.await() }
+                .toMap()
+        }
+
+        val playable = sourcesDto.sources.flatMap { source ->
+            val rawUrl = source.url?.trim()?.takeIf { it.isNotBlank() } ?: return@flatMap emptyList()
             // Embeds are player pages, not streams.
-            if (source.isEmbed == true) return@mapNotNull null
-            // Verified against the live API: these answer text/html landing
-            // pages rather than media, so they would only fail in the player.
-            if (isNexusLandingPage(rawUrl)) return@mapNotNull null
+            if (source.isEmbed == true) return@flatMap emptyList()
 
             val quality = source.quality?.takeIf { it.isNotBlank() }
                 ?: source.label?.takeIf { it.isNotBlank() }
                 ?: "Auto"
 
-            if (isVidHidePage(rawUrl.trim())) {
-                val stream = vidHideStreams[rawUrl.trim()] ?: return@mapNotNull null
-                return@mapNotNull NexusCandidate(
-                    url = stream.url,
-                    label = nexusLabel(serverName, quality, stream.url, "hls"),
-                    videoHeaders = stream.headers,
-                    type = "hls",
-                    subtitles = stream.subtitles,
+            if (isHubPage(rawUrl)) {
+                return@flatMap hubFiles[rawUrl].orEmpty().map { file ->
+                    NexusCandidate(
+                        url = file.url,
+                        label = "${nexusLabel(serverName, quality, file.url, "mkv")} · ${file.mirror}",
+                        videoHeaders = headers.newBuilder()
+                            .apply { if (needsNexusReferer(file.url)) set("Referer", "$NEXUS_ORIGIN/") }
+                            .build(),
+                        type = "mkv",
+                    )
+                }
+            }
+
+            // Verified against the live API: these answer text/html landing
+            // pages rather than media, so they would only fail in the player.
+            if (isNexusLandingPage(rawUrl)) return@flatMap emptyList()
+
+            if (isVidHidePage(rawUrl)) {
+                val stream = vidHideStreams[rawUrl] ?: return@flatMap emptyList()
+                return@flatMap listOf(
+                    NexusCandidate(
+                        url = stream.url,
+                        label = nexusLabel(serverName, quality, stream.url, "hls"),
+                        videoHeaders = stream.headers,
+                        type = "hls",
+                        subtitles = stream.subtitles,
+                    ),
                 )
             }
 
@@ -1726,7 +1754,7 @@ class RentaroExtractor(
                 label = nexusLabel(serverName, quality, url, source.type),
                 videoHeaders = videoHeaders,
                 type = source.type,
-            )
+            ).let(::listOf)
         }
 
         // Distinct releases can still share a label once the same file is
@@ -1895,6 +1923,121 @@ class RentaroExtractor(
 
         return VidHideStream(streamUrl, streamHeaders, subtitles)
     }
+
+    /** A media file behind a hub download page, and which of its mirrors it came from. */
+    private class HubFile(val url: String, val mirror: String)
+
+    /**
+     * Whether a Nexus source URL is a hubcloud/hubdrive/hubcdn download page that
+     * [resolveHubPage] can follow. The families rotate TLDs, so the host label is matched.
+     *
+     * Only the `/drive/` (hubcloud) and `/file/` (hubdrive, hubcdn) pages carry a file;
+     * `/tg/` hands off to Telegram and stays with [isNexusLandingPage].
+     */
+    private fun isHubPage(url: String): Boolean {
+        val parsed = url.toHttpUrlOrNull() ?: return false
+        val labels = parsed.host.split('.')
+        val first = parsed.pathSegments.firstOrNull { it.isNotEmpty() }
+        return when {
+            // A bare pixel.hubcloud ?id= link (4k-bk hands these out) is the 10Gbps mirror.
+            "hubcloud" in labels && parsed.host.startsWith("pixel.") -> true
+            "hubcloud" in labels -> first == "drive"
+            "hubdrive" in labels || "hubcdn" in labels -> first == "file"
+            else -> false
+        }
+    }
+
+    /**
+     * Follows a hub download page to its media files. Traced on 26 September 2026:
+     *
+     *     hubdrive /file/<n>  page links one hubcloud /drive/<id>, or says "File not found"
+     *     hubcloud /drive/<id>  `var url = '…/hubcloud.php?…'`, a generator page whose buttons
+     *                          are the mirrors:
+     *                            - a `*.workers.dev/<token>/<file>.mkv` link: the file itself,
+     *                              with byte ranges (seekable)
+     *                            - `pixel.hubcloud…/?id=` (10Gbps): redirects to
+     *                              `…/dl.php?link=<googleusercontent URL>`, the file without
+     *                              byte ranges, so it plays but cannot seek
+     *                            - pixeldrain (404 on every title tried), Telegram: skipped
+     *     hubcdn /file/<id>   `var reurl = "…?r=<base64>"`, which decodes to
+     *                          `…/dl/?link=<googleusercontent URL>`, the same no-seek file
+     *
+     * Seekable workers.dev mirrors are listed first.
+     */
+    private suspend fun resolveHubPage(pageUrl: String): List<HubFile> {
+        val page = pageUrl.toHttpUrlOrNull() ?: return emptyList()
+        val labels = page.host.split('.')
+        return when {
+            "hubcdn" in labels -> listOfNotNull(resolveHubCdn(pageUrl))
+            page.host.startsWith("pixel.") ->
+                listOfNotNull(resolveGoogleDownload(pageUrl)?.let { HubFile(it, "10Gbps · no seek") })
+            "hubdrive" in labels -> {
+                val html = fetchHubHtml(pageUrl) ?: return emptyList()
+                val drive = HUBDRIVE_CLOUD_LINK_REGEX.find(html)?.groupValues?.get(1) ?: return emptyList()
+                resolveHubCloud(drive)
+            }
+            else -> resolveHubCloud(pageUrl)
+        }
+    }
+
+    private suspend fun resolveHubCloud(driveUrl: String): List<HubFile> {
+        val drive = fetchHubHtml(driveUrl) ?: return emptyList()
+        val generatorUrl = HUBCLOUD_GENERATOR_REGEX.find(drive)?.groupValues?.get(1) ?: return emptyList()
+        val generator = client.newCall(GET(generatorUrl, hubHeaders(driveUrl))).awaitSuccess().bodyString()
+
+        val files = HUBCLOUD_BUTTON_REGEX.findAll(generator).toList().mapNotNull { match ->
+            val href = match.groupValues[1].unescapeHtml().replace(" ", "%20")
+            val host = href.toHttpUrlOrNull()?.host ?: return@mapNotNull null
+            when {
+                host.endsWith("workers.dev") -> HubFile(href, "Direct")
+                host.split('.').let { "hubcloud" in it } && host.startsWith("pixel.") ->
+                    resolveGoogleDownload(href)?.let { HubFile(it, "10Gbps · no seek") }
+                else -> null
+            }
+        }.toList()
+        return files.sortedBy { if (it.mirror == "Direct") 0 else 1 }
+    }
+
+    private suspend fun resolveHubCdn(fileUrl: String): HubFile? {
+        val html = fetchHubHtml(fileUrl) ?: return null
+        val redirect = HUBCDN_REURL_REGEX.find(html)?.groupValues?.get(1) ?: return null
+        // Read raw: HttpUrl.queryParameter would turn a base64 '+' into a space.
+        val encoded = redirect.substringAfter("r=", "").substringBefore('&').takeIf { it.isNotEmpty() }
+            ?.let { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }
+            ?.let { it + "=".repeat((4 - it.length % 4) % 4) }
+            ?: return null
+        val decoded = runCatching {
+            String(android.util.Base64.decode(encoded, android.util.Base64.DEFAULT), Charsets.UTF_8)
+        }.getOrNull() ?: return null
+        return linkParameter(decoded)?.let { HubFile(it, "10Gbps · no seek") }
+    }
+
+    /** Follows the pixel.hubcloud redirect chain to the `link=` media URL it ends on. */
+    private suspend fun resolveGoogleDownload(pixelUrl: String): String? {
+        val response = client.newCall(GET(pixelUrl, hubHeaders(pixelUrl))).awaitSuccess()
+        val finalUrl = response.use { it.request.url.toString() }
+        return linkParameter(finalUrl)
+    }
+
+    /**
+     * The media URL after `link=` in a `dl.php?link=` / `dl/?link=` hand-off. Taken as the rest
+     * of the string, since the target is not encoded and could carry its own query.
+     */
+    private fun linkParameter(url: String): String? = url.substringAfter("link=", "")
+        .let { if (it.startsWith("http%3A") || it.startsWith("https%3A")) URLDecoder.decode(it, "UTF-8") else it }
+        .takeIf { it.startsWith("http") && it.toHttpUrlOrNull() != null }
+
+    private suspend fun fetchHubHtml(url: String): String? = runCatching {
+        client.newCall(GET(url, hubHeaders(null))).awaitSuccess().bodyString()
+    }.getOrNull()
+
+    private fun hubHeaders(referer: String?): Headers = headers.newBuilder()
+        .removeAll("Origin")
+        .apply { if (referer != null) set("Referer", referer) else removeAll("Referer") }
+        .build()
+
+    private fun String.unescapeHtml(): String = replace("&amp;", "&").replace("&quot;", "\"")
+        .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
 
     /** Short-timeout client for probing VidHide masters, whose CDNs can stall indefinitely. */
     private val vidHideProbeClient: OkHttpClient by lazy {
@@ -2326,6 +2469,18 @@ class RentaroExtractor(
 
         private const val HLS_PROBE_BYTES = 64L
 
+        /** The hubcloud /drive/ link on a hubdrive /file/ page; absent when the file is gone. */
+        private val HUBDRIVE_CLOUD_LINK_REGEX = Regex("""href="(https?://[^"]*hubcloud\.[a-z]+/drive/[A-Za-z0-9]+)"""")
+
+        /** hubcloud's hand-off to its link generator. */
+        private val HUBCLOUD_GENERATOR_REGEX = Regex("""var url\s*=\s*'(https?://[^']+)'""")
+
+        /** Mirror buttons on the hubcloud generator page. */
+        private val HUBCLOUD_BUTTON_REGEX = Regex("""<a[^>]+href="([^"]+)"[^>]*class="btn[^"]*"""")
+
+        /** hubcdn's redirect, carrying the destination base64-encoded in `r`. */
+        private val HUBCDN_REURL_REGEX = Regex("""var reurl\s*=\s*"([^"]+)"""")
+
         /** Keeps a verbose Nexus quality string from overflowing the picker. */
         private const val NEXUS_LABEL_LIMIT = 40
 
@@ -2491,6 +2646,11 @@ class RentaroExtractor(
             // sources. Its segments are MPEG-TS behind image/jpeg, like Jay's
             // Nebula.
             "rive-citadel",
+            // 4k-bkl / 4k-Hublink - MKV via hubcloud/hubdrive/hubcdn pages, followed through by
+            // resolveHubPage. 5 of 6 titles playable on 26 September 2026 (Breaking Bad was the
+            // miss: its only page is a deleted hubdrive file); 4k-Hublink is up to 2160p REMUX.
+            "hdhub4u-direct",
+            "k4khdhub-direct",
         )
 
         /**
@@ -2526,10 +2686,6 @@ class RentaroExtractor(
             "em-8",
             "rive-quasar",
             "filmyfly-direct",
-            // Both answer with hubcloud/hubdrive/hubcdn landing pages for every source (plus
-            // hdstream4u, which 4k-bk already resolves), never a media file.
-            "hdhub4u-direct",
-            "k4khdhub-direct",
         )
 
         /**

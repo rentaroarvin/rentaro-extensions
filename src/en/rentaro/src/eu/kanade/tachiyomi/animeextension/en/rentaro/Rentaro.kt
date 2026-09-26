@@ -788,6 +788,18 @@ class Rentaro :
             }.apply()
         }
 
+        // 4k-bkl and 4k-Hublink play now that their hub download pages are followed to the
+        // file, so they join existing Art selections once, as they do the fresh default.
+        if (!getBoolean(PREF_NEXUS_HUB_DIRECT_ADDED_KEY, false)) {
+            val stored = getStringSet(PREF_NEXUS_PROVIDERS_KEY, null)
+            edit().apply {
+                if (stored != null) {
+                    putStringSet(PREF_NEXUS_PROVIDERS_KEY, stored + "hdhub4u-direct" + "k4khdhub-direct")
+                }
+                putBoolean(PREF_NEXUS_HUB_DIRECT_ADDED_KEY, true)
+            }.apply()
+        }
+
         return this
     }
 
@@ -1050,6 +1062,9 @@ class Rentaro :
 
         /** One-shot swap of the dead Art MbBlast for Multi-blue in stored selections. */
         private const val PREF_NEXUS_MBBLAST_SWAP_KEY = "pref_nexus_mbblast_to_bdxs_v1"
+
+        /** One-shot addition of the hub-resolved 4k-bkl and 4k-Hublink to stored selections. */
+        private const val PREF_NEXUS_HUB_DIRECT_ADDED_KEY = "pref_nexus_hub_direct_added_v1"
 
         /** Legacy Wave migration marker, cleared with the removed nested setting. */
         private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"
