@@ -639,6 +639,7 @@ class Rentaro :
             enabledNexusProviders = preferences.enabledNexusProviders,
             enabledCineJoyServers = preferences.enabledCineJoyServers,
             enabledVidLoveProviders = preferences.enabledVidLoveProviders,
+            enabledScreenscapeLanguages = preferences.enabledScreenscapeLanguages,
         )
     }
 
@@ -687,6 +688,10 @@ class Rentaro :
     private val SharedPreferences.enabledVidLoveProviders: Set<String> by preferences.delegate(
         PREF_VIDLOVE_PROVIDERS_KEY,
         RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT,
+    )
+    private val SharedPreferences.enabledScreenscapeLanguages: Set<String> by preferences.delegate(
+        PREF_SCREENSCAPE_LANGUAGES_KEY,
+        RentaroExtractor.SCREENSCAPE_LANGUAGE_DEFAULT,
     )
 
     private fun SharedPreferences.clearOldPrefs(): SharedPreferences {
@@ -934,6 +939,18 @@ class Rentaro :
             summary = "Which VidLove providers Yoru queries. Providers marked \"no video when " +
                 "tested\" are off by default. Only applies when Yoru is enabled above.",
         )
+
+        // Sun's servers lead with Hindi dubs, so the audio language is filtered rather than the
+        // server. Hindi is off by default; dual "Hindi + English" releases count as English.
+        screen.addSetPreference(
+            key = PREF_SCREENSCAPE_LANGUAGES_KEY,
+            title = "Sun Languages",
+            entries = RentaroExtractor.SCREENSCAPE_LANGUAGES,
+            entryValues = RentaroExtractor.SCREENSCAPE_LANGUAGES,
+            default = RentaroExtractor.SCREENSCAPE_LANGUAGE_DEFAULT,
+            summary = "Audio languages Sun lists. Hindi is off by default. Only applies when " +
+                "Sun is enabled above.",
+        )
     }
 
     // ============================= Utilities ==============================
@@ -1062,7 +1079,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -1072,6 +1089,8 @@ class Rentaro :
         private const val PREF_VIDFAST_SERVERS_KEY = "pref_vidfast_servers"
 
         private const val PREF_VIDLOVE_PROVIDERS_KEY = "pref_vidlove_providers"
+
+        private const val PREF_SCREENSCAPE_LANGUAGES_KEY = "pref_screenscape_languages"
 
         /**
          * One-shot marker for resetting the Art provider selection to the
@@ -1130,6 +1149,8 @@ class Rentaro :
             "pref_optin_wave" to setOf("Wave"),
             // VidLove shipped as "Yoru" in v40, on the same one-shot basis.
             "pref_optin_yoru" to setOf("Yoru"),
+            // Screenscape shipped as "Sun" in v49, on the same one-shot basis.
+            "pref_optin_sun" to setOf("Sun"),
         )
 
         /**

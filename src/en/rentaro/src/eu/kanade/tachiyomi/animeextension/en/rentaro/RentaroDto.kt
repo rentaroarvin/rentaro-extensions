@@ -508,3 +508,43 @@ data class VidFastSubtitleDto(
     val url: String? = null,
     val encoding: String? = null,
 )
+
+// ============================ Screenscape DTOs ============================
+
+/** Encrypted reply wrapper every Screenscape API route answers with. */
+@Serializable
+data class ScreenscapeEnvelopeDto(
+    val d: String? = null,
+    val s: String? = null,
+    val v: Int = 1,
+)
+
+/** Decrypted bootstrap reply: the per-session keys for every later call. */
+@Serializable
+data class ScreenscapeAuthDto(
+    val responseKey: String? = null,
+    val apiToken: String? = null,
+)
+
+/** Decrypted server reply. */
+@Serializable
+data class ScreenscapeStreamsDto(
+    val streams: List<ScreenscapeStreamDto> = emptyList(),
+)
+
+@Serializable
+data class ScreenscapeStreamDto(
+    val name: String? = null,
+    val url: String? = null,
+    val quality: String? = null,
+    val size: String? = null,
+    // "hls", "mp4", "mkv", "direct", "dash", "auto" or absent.
+    val type: String? = null,
+    val headers: Map<String, String>? = null,
+    // Absent or "Original" for many entries; the name then carries the language.
+    val language: String? = null,
+    val subServer: String? = null,
+    val provider: String? = null,
+    // Pixeldrain and similar pages the site offers only as downloads.
+    val downloadOnly: Boolean = false,
+)

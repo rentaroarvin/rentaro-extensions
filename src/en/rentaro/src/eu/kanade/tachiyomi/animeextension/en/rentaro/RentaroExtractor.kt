@@ -8,6 +8,7 @@ import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
@@ -81,6 +82,7 @@ class RentaroExtractor(
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
         enabledVidLoveProviders: Set<String> = VIDLOVE_PROVIDER_DEFAULT,
+        enabledScreenscapeLanguages: Set<String> = SCREENSCAPE_LANGUAGE_DEFAULT,
     ): List<Video> = videosFlowFromUrl(
         path,
         title,
@@ -92,6 +94,7 @@ class RentaroExtractor(
         enabledNexusProviders,
         enabledCineJoyServers,
         enabledVidLoveProviders,
+        enabledScreenscapeLanguages,
     ).last()
 
     /**
@@ -122,6 +125,7 @@ class RentaroExtractor(
         enabledNexusProviders: Set<String> = NEXUS_PROVIDER_DEFAULT,
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
         enabledVidLoveProviders: Set<String> = VIDLOVE_PROVIDER_DEFAULT,
+        enabledScreenscapeLanguages: Set<String> = SCREENSCAPE_LANGUAGE_DEFAULT,
     ): Flow<List<Video>> = channelFlow {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
@@ -135,11 +139,12 @@ class RentaroExtractor(
         val cineFlixEnabled = CINEFLIX_NAME in enabledServers
         val vidFastEnabled = VIDFAST_NAME in enabledServers
         val vidLoveEnabled = VIDLOVE_NAME in enabledServers
+        val screenscapeEnabled = SCREENSCAPE_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
-            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled
+            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -160,7 +165,7 @@ class RentaroExtractor(
             }
         }
 
-        // Servers *within* a backend are already resolved in parallel; these six
+        // Servers *within* a backend are already resolved in parallel; these
         // family tasks run concurrently and report independently.
         val resolvers: List<suspend () -> List<Video>> = listOf(
             // VidLink is independent from the other backend families.
@@ -262,6 +267,24 @@ class RentaroExtractor(
                             isMovie,
                             enabledVidLoveProviders,
                             subLimit,
+                        )
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // Screenscape is an independent aggregate behind its own encrypted API.
+            {
+                if (!screenscapeEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        screenscapeVideos(
+                            tmdbId,
+                            seasonId,
+                            episodeId,
+                            isMovie,
+                            enabledScreenscapeLanguages,
                         )
                     } catch (_: IOException) {
                         emptyList()
@@ -986,6 +1009,189 @@ class RentaroExtractor(
         if (".m3u8" in url.lowercase()) parts += "HLS"
         if (subCount > 0) parts += "$subCount subs"
         return parts.joinToString(" · ")
+    }
+
+    // ====================== Screenscape (Sun) backend =======================
+
+    /** Session keys from Screenscape's bootstrap call, valid for about four and a half minutes. */
+    private class ScreenscapeAuth(val responseKey: String, val apiToken: String, val expiresAt: Long)
+
+    @Volatile
+    private var screenscapeAuth: ScreenscapeAuth? = null
+    private val screenscapeAuthLock = Mutex()
+
+    private val screenscapeApiHeaders: Headers
+        get() = headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Referer", "$SCREENSCAPE_ORIGIN/")
+            .set("Origin", SCREENSCAPE_ORIGIN)
+            .set("x-screenscape-client", "web-player")
+            .build()
+
+    /** Returns live session keys, bootstrapping once and sharing them across concurrent calls. */
+    private suspend fun screenscapeAuth(forceRefresh: Boolean = false): ScreenscapeAuth? = screenscapeAuthLock.withLock {
+        screenscapeAuth
+            ?.takeIf { !forceRefresh && System.currentTimeMillis() < it.expiresAt }
+            ?.let { return@withLock it }
+
+        val bootstrap = ScreenscapeCipher.randomHex(24)
+        val path = "/api/${ScreenscapeCipher.tokenRouteCode(bootstrap)}"
+        val requestHeaders = screenscapeApiHeaders.newBuilder()
+            .set("x-screenscape-bootstrap", bootstrap)
+            .build()
+        val envelope = client.newCall(
+            POST("$SCREENSCAPE_ORIGIN$path", requestHeaders, ByteArray(0).toRequestBody(null)),
+        ).awaitSuccess().parseAs<ScreenscapeEnvelopeDto>()
+
+        val auth = screenscapeOpen(envelope, bootstrap, ScreenscapeCipher.cipherContext("POST", path, emptyList()))
+            ?.parseAs<ScreenscapeAuthDto>()
+        val responseKey = auth?.responseKey?.takeIf { it.isNotBlank() } ?: return@withLock null
+        val apiToken = auth.apiToken?.takeIf { it.isNotBlank() } ?: return@withLock null
+
+        ScreenscapeAuth(
+            responseKey = responseKey,
+            apiToken = apiToken,
+            // The site refreshes 30 s before its 270 s lifetime ends.
+            expiresAt = System.currentTimeMillis() + SCREENSCAPE_AUTH_TTL_MS,
+        ).also { screenscapeAuth = it }
+    }
+
+    private fun screenscapeOpen(envelope: ScreenscapeEnvelopeDto, key: String, context: String): String? {
+        val d = envelope.d ?: return null
+        val s = envelope.s ?: return null
+        return ScreenscapeCipher.open(d, s, envelope.v, key, context)
+    }
+
+    /**
+     * Screenscape aggregates many upstream servers behind one encrypted API. Only the ones
+     * that played in testing are queried, and streams are kept or dropped by audio language
+     * so that the Hindi-first servers still contribute their English and regional dubs.
+     */
+    private suspend fun screenscapeVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        enabledLanguages: Set<String>,
+    ): List<Video> {
+        if (tmdbId.isBlank() || enabledLanguages.isEmpty()) return emptyList()
+        if (screenscapeAuth() == null) return emptyList()
+
+        val season = if (isMovie) null else seasonId.toIntOrNull()
+        val episode = if (isMovie) null else episodeId.toIntOrNull()
+
+        val streams = SCREENSCAPE_SERVERS.parallelCatchingFlatMap { server ->
+            screenscapeServer(server, tmdbId, season, episode).map { server to it }
+        }
+
+        return streams
+            .asSequence()
+            .filterNot { (_, stream) -> stream.downloadOnly }
+            .mapNotNull { (server, stream) ->
+                val url = stream.url?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+                val language = screenscapeLanguage(stream)
+                if (screenscapeLanguageGroup(language) !in enabledLanguages) return@mapNotNull null
+                screenscapeVideo(server, stream, url, language)
+            }
+            .distinctBy { it.videoUrl ?: it.url }
+            .toList()
+    }
+
+    private suspend fun screenscapeServer(
+        server: ScreenscapeServer,
+        tmdbId: String,
+        season: Int?,
+        episode: Int?,
+        retried: Boolean = false,
+    ): List<ScreenscapeStreamDto> {
+        val auth = screenscapeAuth(forceRefresh = retried) ?: return emptyList()
+        val path = "/api/${ScreenscapeCipher.routeId(auth.responseKey)}/" +
+            ScreenscapeCipher.serverId(server.key, auth.responseKey)
+        val query = listOf(
+            "q" to ScreenscapeCipher.tmdbId(tmdbId, season, episode, auth.responseKey),
+            "type" to if (season != null && episode != null) "tv" else "movie",
+        )
+        val url = "$SCREENSCAPE_ORIGIN$path?" + query.joinToString("&") { (name, value) -> "$name=$value" }
+        val requestHeaders = screenscapeApiHeaders.newBuilder()
+            .set("x-api-token", auth.apiToken)
+            .build()
+
+        val response = client.newCall(GET(url, requestHeaders)).await()
+        // The token is renewed a little early, but a server restart still invalidates it.
+        if (response.code == 401 && !retried) {
+            response.close()
+            return screenscapeServer(server, tmdbId, season, episode, retried = true)
+        }
+        if (!response.isSuccessful) {
+            response.close()
+            return emptyList()
+        }
+
+        val envelope = response.parseAs<ScreenscapeEnvelopeDto>()
+        return screenscapeOpen(envelope, auth.responseKey, ScreenscapeCipher.cipherContext("GET", path, query))
+            ?.parseAs<ScreenscapeStreamsDto>()
+            ?.streams
+            .orEmpty()
+    }
+
+    private fun screenscapeVideo(
+        server: ScreenscapeServer,
+        stream: ScreenscapeStreamDto,
+        url: String,
+        language: String,
+    ): Video {
+        // Per-stream headers are what the site's player sends: Castle needs its browser-like
+        // set, Jay's hosts need the cinejoy.pk Referer, and so on. A pre-set Range would pin
+        // every request to the first byte, so it is left to the player.
+        val streamHeaders = headers.newBuilder().apply {
+            stream.headers.orEmpty().forEach { (name, value) ->
+                if (!name.equals("Range", true) && !name.equals("Accept-Encoding", true) && value.isNotBlank()) {
+                    set(name, value)
+                }
+            }
+        }.build()
+
+        val lower = url.lowercase().substringBefore('?')
+        val type = stream.type?.lowercase()
+        val isHls = type == "hls" || lower.endsWith(".m3u8") ||
+            (type == "auto" && !lower.endsWith(".mp4") && !lower.endsWith(".mkv"))
+        val isDash = type == "dash" || lower.endsWith(".mpd")
+        val container = when {
+            isDash -> "DASH"
+            isHls -> "HLS"
+            lower.endsWith(".mkv") || type == "mkv" -> "MKV"
+            else -> "MP4"
+        }
+        val playable = if (isHls) hlsHintedUrl(url) ?: url else url
+
+        val detail = stream.subServer?.takeIf { it.isNotBlank() && !it.equals(server.label, true) }
+        val resolution = qualityRegex.find(stream.quality.orEmpty())?.groupValues?.get(1)?.let { "${it}p" }
+        val label = listOfNotNull(
+            "$SCREENSCAPE_NAME/${server.label}",
+            detail,
+            resolution ?: stream.quality?.takeIf { it.isNotBlank() && !it.equals("auto", true) } ?: "Auto",
+            language,
+            container,
+            stream.size?.takeIf { it.isNotBlank() && it != "-" },
+        ).joinToString(" · ")
+
+        return Video(
+            url = playable,
+            quality = label,
+            videoUrl = playable,
+            headers = streamHeaders,
+        )
+    }
+
+    /**
+     * The audio language, mirroring the site's own inference: the declared field unless it is
+     * missing or "Original", otherwise the first language named in the stream's title.
+     */
+    private fun screenscapeLanguage(stream: ScreenscapeStreamDto): String {
+        stream.language?.trim()?.takeIf { it.isNotEmpty() && !it.equals("Original", true) }?.let { return it }
+        val text = "${stream.name.orEmpty()} ${stream.quality.orEmpty()} ${stream.subServer.orEmpty()}".lowercase()
+        SCREENSCAPE_NAMED_LANGUAGES.firstOrNull { it.lowercase() in text }?.let { return it }
+        return "Original"
     }
 
     // ======================== VidLove (Yoru) backend ========================
@@ -2364,6 +2570,71 @@ class RentaroExtractor(
 
         fun vidLoveProviderValues(): List<String> = VIDLOVE_SOURCES.map { it.key }
 
+        // Screenscape (screenscape.me) aggregates about twenty upstream servers behind one
+        // encrypted API; see [ScreenscapeCipher].
+        private const val SCREENSCAPE_NAME = "Sun"
+        private const val SCREENSCAPE_ORIGIN = "https://screenscape.me"
+        private const val SCREENSCAPE_AUTH_TTL_MS = 240_000L
+
+        private class ScreenscapeServer(val key: String, val label: String)
+
+        /**
+         * Servers queried, named as the site's own picker names them.
+         *
+         * Chosen from a 26 September 2026 check of all 22 across six movies and episodes,
+         * following each stream through to media bytes. Left out: MBox (403 on every DASH
+         * manifest), CAT, Nitro, Sealx, HINDI, Venom and Tamil (404/403/502 throughout),
+         * Vortex and ALS (429 rate-limited), and FOGS, 4K and HDHub (no or download-only
+         * sources). 4KELITE is omitted too: it is CineJoy, which Jay already covers.
+         */
+        private val SCREENSCAPE_SERVERS = listOf(
+            ScreenscapeServer("castel", "MONGO"), // Castle, English/Tamil/Telugu/Hindi, 4/4
+            ScreenscapeServer("drive", "Elite"), // HubCloud MKV, 4/4
+            ScreenscapeServer("viduki", "Viduki"), // English MP4 and HLS, 3/4
+            ScreenscapeServer("hindibox", "HBOX"),
+            ScreenscapeServer("vidnestfun", "Mune"),
+            ScreenscapeServer("engstream", "Scape"),
+            ScreenscapeServer("korso", "1xC"),
+            ScreenscapeServer("Elite", "Freak"),
+            ScreenscapeServer("awsind", "ALICE"),
+        )
+
+        /** Languages the site names in stream titles when the language field is unset. */
+        private val SCREENSCAPE_NAMED_LANGUAGES = listOf(
+            "Hindi", "English", "Tamil", "Telugu", "Bengali", "Malayalam", "Kannada",
+            "French", "Italian", "Spanish", "Portuguese", "Latin", "Korean", "Japanese",
+        )
+
+        /** Language groups offered in the Sun picker, in display order. */
+        val SCREENSCAPE_LANGUAGES: List<String> = listOf(
+            "English",
+            "Original",
+            "Hindi",
+            "Tamil",
+            "Telugu",
+            "Other",
+        )
+
+        /** Everything except Hindi, which most of these servers lead with. */
+        val SCREENSCAPE_LANGUAGE_DEFAULT: Set<String> = SCREENSCAPE_LANGUAGES.toSet() - "Hindi"
+
+        /**
+         * Buckets a stream's language for filtering. Anything mentioning English counts as
+         * English, so a "Hindi + English" dual-audio release survives with Hindi switched off;
+         * "Hindi dub" and "Hindi Subbed" are Hindi.
+         */
+        internal fun screenscapeLanguageGroup(language: String): String {
+            val lower = language.lowercase()
+            return when {
+                "english" in lower -> "English"
+                "hindi" in lower -> "Hindi"
+                "tamil" in lower -> "Tamil"
+                "telugu" in lower -> "Telugu"
+                lower == "original" || lower == "original audio" || lower == "multi" -> "Original"
+                else -> "Other"
+            }
+        }
+
         // VidFast is the only backend that is not fully independent.
         //
         // Its two payloads are encrypted by a bytecode VM embedded in the player
@@ -2759,7 +3030,7 @@ class RentaroExtractor(
         private val VIDLOVE_HLS_ATTRIBUTE_REGEX =
             Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
 
-        /** The six independent backend families offered in settings. */
+        /** The independent backend families offered in settings. */
         val SERVER_DISPLAY_NAMES: List<String> = listOf(
             VIDLINK_NAME,
             NEXUS_NAME,
@@ -2767,6 +3038,7 @@ class RentaroExtractor(
             CINEFLIX_NAME,
             VIDFAST_NAME,
             VIDLOVE_NAME,
+            SCREENSCAPE_NAME,
         )
 
         /**
@@ -2791,6 +3063,7 @@ class RentaroExtractor(
             CINEFLIX_NAME -> "Original"
             VIDFAST_NAME -> "Multi-Lang"
             VIDLOVE_NAME -> "Original"
+            SCREENSCAPE_NAME -> "Multi-Lang"
             else -> "Unknown"
         }
     }
