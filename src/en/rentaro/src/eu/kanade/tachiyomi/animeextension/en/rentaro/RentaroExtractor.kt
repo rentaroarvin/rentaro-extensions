@@ -37,6 +37,7 @@ import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 /**
  * Resolves Rentaro playback through the independent VidLink, Nexus, CineJoy,
@@ -1663,6 +1664,17 @@ class RentaroExtractor(
         // A provider with no match reports it here rather than by status code.
         if (!sourcesDto.error.isNullOrBlank()) return emptyList()
 
+        // 4k-bk (hdhub4u) advertises VidHide player pages as `mp4`. They are HTML, so each is
+        // resolved to the HLS stream its player loads; one that cannot be resolved is dropped.
+        val vidHideStreams = coroutineScope {
+            sourcesDto.sources
+                .mapNotNull { it.url?.trim()?.takeIf(::isVidHidePage) }
+                .distinct()
+                .map { page -> async { page to runCatching { resolveVidHide(page) }.getOrNull() } }
+                .map { it.await() }
+                .toMap()
+        }
+
         val playable = sourcesDto.sources.mapNotNull { source ->
             val rawUrl = source.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             // Embeds are player pages, not streams.
@@ -1671,11 +1683,22 @@ class RentaroExtractor(
             // pages rather than media, so they would only fail in the player.
             if (isNexusLandingPage(rawUrl)) return@mapNotNull null
 
-            val url = sanitiseNexusUrl(rawUrl)
-
             val quality = source.quality?.takeIf { it.isNotBlank() }
                 ?: source.label?.takeIf { it.isNotBlank() }
                 ?: "Auto"
+
+            if (isVidHidePage(rawUrl.trim())) {
+                val stream = vidHideStreams[rawUrl.trim()] ?: return@mapNotNull null
+                return@mapNotNull NexusCandidate(
+                    url = stream.url,
+                    label = nexusLabel(serverName, quality, stream.url, "hls"),
+                    videoHeaders = stream.headers,
+                    type = "hls",
+                    subtitles = stream.subtitles,
+                )
+            }
+
+            val url = sanitiseNexusUrl(rawUrl)
 
             // These CDNs disagree about the Referer, so it is applied per host
             // rather than globally.
@@ -1727,6 +1750,7 @@ class RentaroExtractor(
                     quality = label,
                     videoUrl = candidate.url,
                     headers = candidate.videoHeaders,
+                    subtitleTracks = candidate.subtitles,
                 ),
             )
 
@@ -1751,6 +1775,7 @@ class RentaroExtractor(
                     videoNameGen = { variant ->
                         if (variant.equals("Video", ignoreCase = true)) label else "$label · $variant"
                     },
+                    subtitleList = candidate.subtitles,
                     masterHeaders = candidate.videoHeaders,
                     videoHeaders = candidate.videoHeaders,
                 )
@@ -1805,7 +1830,120 @@ class RentaroExtractor(
         val label: String,
         val videoHeaders: Headers,
         val type: String?,
+        val subtitles: List<Track> = emptyList(),
     )
+
+    /** The HLS stream a VidHide player page loads, with the headers its CDN needs. */
+    private class VidHideStream(val url: String, val headers: Headers, val subtitles: List<Track>)
+
+    /** Whether a Nexus source URL is a VidHide player page (hdstream4u) rather than a file. */
+    private fun isVidHidePage(url: String): Boolean {
+        val host = url.toHttpUrlOrNull()?.host ?: return false
+        return VIDHIDE_HOSTS.any { host == it || host.endsWith(".$it") }
+    }
+
+    /**
+     * Resolves a VidHide `/file/<code>` page to the HLS stream its player loads.
+     *
+     * The player setup is P.A.C.K.E.R.-packed and declares
+     * `var links={"hls2":…,"hls3":…,"hls4":…}`; not every page carries all three. Checked
+     * against three titles and the site's own player on 26 September 2026:
+     *
+     *     hls3  CDN master; 404s without the page Referer. What the player actually plays.
+     *     hls2  CDN master on a second host; the fallback when hls3 is absent.
+     *     hls4  same-origin proxy that pads the variant with ad images and often hangs. Unused.
+     *
+     * The browser fetches both CDNs cross-site with `Origin` and `Referer` set to the page
+     * origin, so those go on the master, variants and segments alike. Some titles still 404
+     * on odd segments for the site's own player too, which is a CDN gap, not a header issue.
+     */
+    private suspend fun resolveVidHide(pageUrl: String): VidHideStream? {
+        val page = pageUrl.toHttpUrlOrNull() ?: return null
+        val pageHeaders = headers.newBuilder().removeAll("Referer").removeAll("Origin").build()
+        val html = client.newCall(GET(pageUrl, pageHeaders)).awaitSuccess().bodyString()
+
+        val script = VIDHIDE_PACKED_REGEX.findAll(html)
+            .mapNotNull { unpackPacker(it.value) }
+            .firstOrNull { "links" in it && "jwplayer" in it }
+            ?: return null
+
+        val links = VIDHIDE_LINKS_REGEX.find(script)?.groupValues?.get(1)
+            ?.let { runCatching { nexusJson.decodeFromString<Map<String, String>>(it) }.getOrNull() }
+            ?: return null
+
+        val origin = "${page.scheme}://${page.host}"
+        val streamHeaders = pageHeaders.newBuilder()
+            .set("Referer", "$origin/")
+            .set("Origin", origin)
+            .build()
+
+        // The page is regenerated per load with a different link set, and either CDN may
+        // answer 404 or stall on a given load, so the first master that actually answers wins.
+        val streamUrl = listOfNotNull(links["hls3"], links["hls2"])
+            .mapNotNull { page.resolve(it)?.toString() }
+            .firstOrNull { isLiveHlsMaster(it, streamHeaders) }
+            ?: return null
+
+        // Captions sit in the player's `tracks` alongside a thumbnail sprite, which is skipped.
+        val subtitles = VIDHIDE_TRACK_REGEX.findAll(script)
+            .filter { it.groupValues[3] == "captions" || it.groupValues[3] == "subtitles" }
+            .mapNotNull { match ->
+                val url = page.resolve(match.groupValues[1])?.toString() ?: return@mapNotNull null
+                Track(url, match.groupValues[2])
+            }
+            .toList()
+
+        return VidHideStream(streamUrl, streamHeaders, subtitles)
+    }
+
+    /** Short-timeout client for probing VidHide masters, whose CDNs can stall indefinitely. */
+    private val vidHideProbeClient: OkHttpClient by lazy {
+        client.newBuilder().callTimeout(VIDHIDE_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
+    }
+
+    /** Whether `url` answers with an HLS playlist right now. */
+    private suspend fun isLiveHlsMaster(url: String, headers: Headers): Boolean = runCatching {
+        vidHideProbeClient.newCall(GET(url, headers)).awaitSuccess().use { response ->
+            response.peekBody(HLS_PROBE_BYTES).string().trimStart().startsWith("#EXTM3U")
+        }
+    }.getOrDefault(false)
+
+    /**
+     * Unpacks Dean Edwards' P.A.C.K.E.R. (`eval(function(p,a,c,k,e,d){…}('…',a,c,'…'.split('|')))`).
+     *
+     * Every word token in the payload is a base-`a` index into the keyword list and is swapped
+     * for that keyword, unless the entry is empty, in which case the token stands for itself.
+     */
+    private fun unpackPacker(packed: String): String? {
+        val match = PACKER_ARGS_REGEX.find(packed) ?: return null
+        val payload = match.groupValues[1].replace("\\'", "'").replace("\\\\", "\\")
+        val radix = match.groupValues[2].toIntOrNull() ?: return null
+        val keywords = match.groupValues[4].split('|')
+        if (radix !in 2..62) return null
+
+        return PACKER_WORD_REGEX.replace(payload) { word ->
+            val index = decodeBase(word.value, radix)
+            keywords.getOrNull(index)?.takeIf { it.isNotEmpty() } ?: word.value
+        }
+    }
+
+    /** Parses a token written in P.A.C.K.E.R.'s base-62 digits: 0-9, a-z, then A-Z. */
+    private fun decodeBase(token: String, radix: Int): Int {
+        var value = 0L
+        for (c in token) {
+            val digit = when (c) {
+                in '0'..'9' -> c - '0'
+                in 'a'..'z' -> c - 'a' + 10
+                in 'A'..'Z' -> c - 'A' + 36
+                else -> return -1
+            }
+            if (digit >= radix) return -1
+            value = value * radix + digit
+            // Past this it cannot index the keyword list, and would overflow.
+            if (value > Int.MAX_VALUE) return -1
+        }
+        return value.toInt()
+    }
 
     /**
      * Percent-encodes whitespace in a Nexus source URL.
@@ -2165,6 +2303,28 @@ class RentaroExtractor(
          * hand-off that redirects out to telegram.me.
          */
         private val NEXUS_LANDING_PATH_SEGMENTS = setOf("drive", "tg")
+
+        /** VidHide mirrors 4k-bk links as player pages rather than files. */
+        private val VIDHIDE_HOSTS = listOf("hdstream4u.com")
+
+        /** A whole P.A.C.K.E.R. block, from `eval(function(p,a,c,k,e,d)` to its `.split('|')))`. */
+        private val VIDHIDE_PACKED_REGEX =
+            Regex("""eval\(function\(p,a,c,k,e,d\).*?\.split\('\|'\)\)\)""", RegexOption.DOT_MATCHES_ALL)
+
+        /** The packer's arguments: payload, radix, count and the `|`-joined keyword list. */
+        private val PACKER_ARGS_REGEX =
+            Regex("""\}\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
+
+        private val PACKER_WORD_REGEX = Regex("""\b\w+\b""")
+
+        private val VIDHIDE_LINKS_REGEX = Regex("""var\s+links\s*=\s*(\{[^}]*\})""")
+
+        private val VIDHIDE_TRACK_REGEX = Regex("""\{file:"([^"]+)",label:"([^"]*)",kind:"(\w+)"""")
+
+        /** A live master answers in 1-3 s; a stalled CDN never does. */
+        private const val VIDHIDE_PROBE_TIMEOUT_SECONDS = 12L
+
+        private const val HLS_PROBE_BYTES = 64L
 
         /** Keeps a verbose Nexus quality string from overflowing the picker. */
         private const val NEXUS_LABEL_LIMIT = 40
