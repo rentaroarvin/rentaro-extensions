@@ -2157,14 +2157,20 @@ class RentaroExtractor(
      * a working source.
      */
     private suspend fun isPlayableMediaFile(url: String, videoHeaders: Headers): Boolean {
-        val probeHeaders = videoHeaders.newBuilder().set("Range", "bytes=0-15").build()
+        // An open-ended range, as the player sends. Some Google-backed workers (vip.hotstar)
+        // serve `bytes=0-15` but answer the player's `bytes=0-` with 403 "quota exceeded", so a
+        // bounded probe passed files that could never play. Only 16 bytes are read either way.
+        val probeHeaders = videoHeaders.newBuilder().set("Range", "bytes=0-").build()
         val response = runCatching {
             mediaProbeClient.newCall(GET(url, probeHeaders)).await()
         }.getOrElse { return true }
         return response.use {
             if (!it.isSuccessful) return@use false
-            val head = runCatching { it.body.source().readByteArray(16L.coerceAtMost(it.body.contentLength().takeIf { n -> n > 0 } ?: 16L)) }
-                .getOrElse { ByteArray(0) }
+            val head = runCatching {
+                val source = it.body.source()
+                source.request(16)
+                source.buffer.readByteArray(minOf(16L, source.buffer.size))
+            }.getOrElse { ByteArray(0) }
             isMediaSignature(head)
         }
     }
