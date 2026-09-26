@@ -800,6 +800,32 @@ class Rentaro :
             }.apply()
         }
 
+        // Providers found not playing on 26 September 2026 leave the defaults, and are removed
+        // once from existing selections too. Only the withdrawn names are subtracted, so any
+        // other hand-picked choice survives; a user can still re-enable them from the picker.
+        if (!getBoolean(PREF_NON_PLAYING_PRUNED_KEY, false)) {
+            edit().apply {
+                getStringSet(PREF_NEXUS_PROVIDERS_KEY, null)?.let { stored ->
+                    putStringSet(PREF_NEXUS_PROVIDERS_KEY, stored - RentaroExtractor.NEXUS_RARELY_PLAYS)
+                }
+                getStringSet(PREF_CINEJOY_SERVERS_KEY, null)?.let { stored ->
+                    val pruned = stored - RentaroExtractor.CINEJOY_OFFLINE_SERVERS
+                    putStringSet(
+                        PREF_CINEJOY_SERVERS_KEY,
+                        pruned.ifEmpty { RentaroExtractor.CINEJOY_SERVER_DEFAULT },
+                    )
+                }
+                getStringSet(PREF_VIDLOVE_PROVIDERS_KEY, null)?.let { stored ->
+                    val pruned = stored - RentaroExtractor.VIDLOVE_NO_SOURCE_PROVIDERS
+                    putStringSet(
+                        PREF_VIDLOVE_PROVIDERS_KEY,
+                        pruned.ifEmpty { RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT },
+                    )
+                }
+                putBoolean(PREF_NON_PLAYING_PRUNED_KEY, true)
+            }.apply()
+        }
+
         return this
     }
 
@@ -905,8 +931,8 @@ class Rentaro :
             entries = RentaroExtractor.vidLoveProviderEntries(),
             entryValues = RentaroExtractor.vidLoveProviderValues(),
             default = RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT,
-            summary = "Which VidLove providers Yoru queries. Enabling every provider improves " +
-                "coverage but sends more requests. Only applies when Yoru is enabled above.",
+            summary = "Which VidLove providers Yoru queries. Providers marked \"no video when " +
+                "tested\" are off by default. Only applies when Yoru is enabled above.",
         )
     }
 
@@ -1065,6 +1091,9 @@ class Rentaro :
 
         /** One-shot addition of the hub-resolved 4k-bkl and 4k-Hublink to stored selections. */
         private const val PREF_NEXUS_HUB_DIRECT_ADDED_KEY = "pref_nexus_hub_direct_added_v1"
+
+        /** One-shot removal of the providers found not playing in the 26 September 2026 retest. */
+        private const val PREF_NON_PLAYING_PRUNED_KEY = "pref_non_playing_pruned_20260926"
 
         /** Legacy Wave migration marker, cleared with the removed nested setting. */
         private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"

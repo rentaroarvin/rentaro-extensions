@@ -2345,15 +2345,22 @@ class RentaroExtractor(
         /**
          * Providers that returned no source for all six regional/type probes on 20 September
          * 2026. Kept selectable for future recovery, but not enabled by default.
+         *
+         * Mega Knight and Barbarian King 2.0 joined on 26 September 2026: `source` was null for
+         * all ten movies and episodes tested, with and without HEVC, and vidlove.cc's own player
+         * skipped them too. Only Archer Queen (vidapi) played, 10 of 10.
          */
         val VIDLOVE_NO_SOURCE_PROVIDERS: Set<String> =
-            setOf("warden", "cinefreak", "ipcloud", "tcloud")
+            setOf("megaknight", "warden", "cinefreak", "moviebox2", "ipcloud", "tcloud")
+
+        /** Picker note for a provider that is off because it returned nothing when tested. */
+        private fun vidLoveNote(key: String): String = if (key in VIDLOVE_NO_SOURCE_PROVIDERS) " - no video when tested" else ""
 
         /** Providers that returned at least one playable movie or episode in that matrix. */
         val VIDLOVE_PROVIDER_DEFAULT: Set<String> =
             VIDLOVE_SOURCES.map { it.key }.toSet() - VIDLOVE_NO_SOURCE_PROVIDERS
 
-        fun vidLoveProviderEntries(): List<String> = VIDLOVE_SOURCES.map { it.label }
+        fun vidLoveProviderEntries(): List<String> = VIDLOVE_SOURCES.map { "${it.label}${vidLoveNote(it.key)}" }
 
         fun vidLoveProviderValues(): List<String> = VIDLOVE_SOURCES.map { it.key }
 
@@ -2420,11 +2427,19 @@ class RentaroExtractor(
             "Athens",
         )
 
-        val CINEJOY_SERVER_DEFAULT: Set<String> = CINEJOY_SERVERS.toSet()
+        /**
+         * Servers still listed but not playing on 26 September 2026: Lisbon's variant playlists
+         * answer "502 origin unavailable" and Athens returns an empty mirror list. They stay
+         * selectable in case they recover, but are not enabled by default.
+         */
+        val CINEJOY_OFFLINE_SERVERS: Set<String> = setOf("Lisbon", "Athens")
+
+        val CINEJOY_SERVER_DEFAULT: Set<String> = CINEJOY_SERVERS.toSet() - CINEJOY_OFFLINE_SERVERS
 
         /** Entry labels for the CineJoy server preference, ordered as the list is. */
         fun cineJoyServerEntries(): List<String> = CINEJOY_SERVERS.map { server ->
-            if (server == "Lisbon") "$server (US, 4K)" else "$server (US)"
+            val label = if (server == "Lisbon") "$server (US, 4K)" else "$server (US)"
+            if (server in CINEJOY_OFFLINE_SERVERS) "$label - no video when tested" else label
         }
 
         /**
@@ -2642,10 +2657,9 @@ class RentaroExtractor(
             "bdxs",
             "mhbox", // MhPly   - DASH, 3/3, what the site's own player uses
             "k4khdhub", // 4k-Hub  - MKV, 5/14, the only 2160p source
-            "vidapi", // VidPi   - HLS, 4/6, rejects a Referer
-            "stvv", // Stvvid  - MP4, 4/6
+            "vidapi", // VidPi   - HLS, 4/10 on 26 September 2026, rejects a Referer
             "hdhub4u", // 4k-bk   - MKV, 2/3
-            "ophim", // Ophm    - kept by request; 0/3 when tested
+            "ophim", // Ophm    - 9/10 titles playable on 26 September 2026
             // Citadel - HLS, 10/11 titles. Was written off against Western
             // probes; it is an Indian-catalogue provider and answers for
             // Bollywood and South Indian cinema with up to 12 per-language
@@ -2707,12 +2721,19 @@ class RentaroExtractor(
         // with or without the site Referer, the only one on itsnitrox.tech still refused.
         private val NEXUS_UPSTREAM_BLOCKED = setOf("nitro", "mbox", "rive-flowcast", "vidking")
 
+        /**
+         * Scrapers withdrawn from the default because they almost never play: Stvvid (stvv)
+         * produced playable media for 1 of 10 titles on 26 September 2026, down from 4 of 6.
+         */
+        val NEXUS_RARELY_PLAYS: Set<String> = setOf("stvv")
+
         /** Entry labels for the provider preference, ordered as the list is. */
         fun nexusProviderEntries(): List<String> = NEXUS_PROVIDERS.map { provider ->
             val note = when {
                 provider.scraper in NEXUS_PROVIDER_DEFAULT -> ""
                 provider.scraper in NEXUS_UPSTREAM_BLOCKED -> " - host refuses playback"
                 provider.scraper in NEXUS_KNOWN_DEAD -> " - no video when tested"
+                provider.scraper in NEXUS_RARELY_PLAYS -> " - rarely plays when tested"
                 else -> ""
             }
             "${provider.label}$note"
