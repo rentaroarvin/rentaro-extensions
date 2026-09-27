@@ -640,6 +640,7 @@ class Rentaro :
             enabledCineJoyServers = preferences.enabledCineJoyServers,
             enabledVidLoveProviders = preferences.enabledVidLoveProviders,
             enabledScreenscapeLanguages = preferences.enabledScreenscapeLanguages,
+            enabledScreenscapeServers = preferences.enabledScreenscapeServers,
         )
     }
 
@@ -688,6 +689,10 @@ class Rentaro :
     private val SharedPreferences.enabledVidLoveProviders: Set<String> by preferences.delegate(
         PREF_VIDLOVE_PROVIDERS_KEY,
         RentaroExtractor.VIDLOVE_PROVIDER_DEFAULT,
+    )
+    private val SharedPreferences.enabledScreenscapeServers: Set<String> by preferences.delegate(
+        PREF_SCREENSCAPE_SERVERS_KEY,
+        RentaroExtractor.SCREENSCAPE_SERVER_DEFAULT,
     )
     private val SharedPreferences.enabledScreenscapeLanguages: Set<String> by preferences.delegate(
         PREF_SCREENSCAPE_LANGUAGES_KEY,
@@ -940,6 +945,18 @@ class Rentaro :
                 "tested\" are off by default. Only applies when Yoru is enabled above.",
         )
 
+        // Sun fans out to Screenscape's own servers, one request each, so they are selectable
+        // like Art's providers rather than all-or-nothing.
+        screen.addSetPreference(
+            key = PREF_SCREENSCAPE_SERVERS_KEY,
+            title = "Sun Providers",
+            entries = RentaroExtractor.screenscapeServerEntries(),
+            entryValues = RentaroExtractor.screenscapeServerValues(),
+            default = RentaroExtractor.SCREENSCAPE_SERVER_DEFAULT,
+            summary = "Which Screenscape servers Sun queries. Each is a separate request, so " +
+                "enabling every one slows the video list. Only applies when Sun is enabled above.",
+        )
+
         // Sun's servers lead with Hindi dubs, so the audio language is filtered rather than the
         // server. Hindi is off by default; dual "Hindi + English" releases count as English.
         screen.addSetPreference(
@@ -1091,6 +1108,8 @@ class Rentaro :
         private const val PREF_VIDLOVE_PROVIDERS_KEY = "pref_vidlove_providers"
 
         private const val PREF_SCREENSCAPE_LANGUAGES_KEY = "pref_screenscape_languages"
+
+        private const val PREF_SCREENSCAPE_SERVERS_KEY = "pref_screenscape_servers"
 
         /**
          * One-shot marker for resetting the Art provider selection to the

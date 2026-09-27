@@ -83,6 +83,7 @@ class RentaroExtractor(
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
         enabledVidLoveProviders: Set<String> = VIDLOVE_PROVIDER_DEFAULT,
         enabledScreenscapeLanguages: Set<String> = SCREENSCAPE_LANGUAGE_DEFAULT,
+        enabledScreenscapeServers: Set<String> = SCREENSCAPE_SERVER_DEFAULT,
     ): List<Video> = videosFlowFromUrl(
         path,
         title,
@@ -95,6 +96,7 @@ class RentaroExtractor(
         enabledCineJoyServers,
         enabledVidLoveProviders,
         enabledScreenscapeLanguages,
+        enabledScreenscapeServers,
     ).last()
 
     /**
@@ -126,6 +128,7 @@ class RentaroExtractor(
         enabledCineJoyServers: Set<String> = CINEJOY_SERVER_DEFAULT,
         enabledVidLoveProviders: Set<String> = VIDLOVE_PROVIDER_DEFAULT,
         enabledScreenscapeLanguages: Set<String> = SCREENSCAPE_LANGUAGE_DEFAULT,
+        enabledScreenscapeServers: Set<String> = SCREENSCAPE_SERVER_DEFAULT,
     ): Flow<List<Video>> = channelFlow {
         val pathParts = path.split("/")
         val isMovie = pathParts.first() == "movie"
@@ -285,6 +288,7 @@ class RentaroExtractor(
                             episodeId,
                             isMovie,
                             enabledScreenscapeLanguages,
+                            enabledScreenscapeServers,
                         )
                     } catch (_: IOException) {
                         emptyList()
@@ -1073,14 +1077,15 @@ class RentaroExtractor(
         episodeId: String,
         isMovie: Boolean,
         enabledLanguages: Set<String>,
+        enabledServers: Set<String>,
     ): List<Video> {
-        if (tmdbId.isBlank() || enabledLanguages.isEmpty()) return emptyList()
+        if (tmdbId.isBlank() || enabledLanguages.isEmpty() || enabledServers.isEmpty()) return emptyList()
         if (screenscapeAuth() == null) return emptyList()
 
         val season = if (isMovie) null else seasonId.toIntOrNull()
         val episode = if (isMovie) null else episodeId.toIntOrNull()
 
-        val streams = SCREENSCAPE_SERVERS.parallelCatchingFlatMap { server ->
+        val streams = SCREENSCAPE_SERVERS.filter { it.key in enabledServers }.parallelCatchingFlatMap { server ->
             screenscapeServer(server, tmdbId, season, episode).map { server to it }
         }
 
@@ -2728,16 +2733,18 @@ class RentaroExtractor(
         private const val SCREENSCAPE_ORIGIN = "https://screenscape.me"
         private const val SCREENSCAPE_AUTH_TTL_MS = 240_000L
 
-        private class ScreenscapeServer(val key: String, val label: String)
+        private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
 
         /**
-         * Servers queried, named as the site's own picker names them.
+         * Every server the site offers, named as its own picker names them, in its order of
+         * reliability for us. All are selectable in "Sun Providers".
          *
-         * Chosen from a 26 September 2026 check of all 22 across six movies and episodes,
-         * following each stream through to media bytes. Left out: MBox (403 on every DASH
-         * manifest), CAT, Nitro, Sealx, HINDI, Venom and Tamil (404/403/502 throughout),
-         * Vortex and ALS (429 rate-limited), and FOGS, 4K and HDHub (no or download-only
-         * sources). 4KELITE is omitted too: it is CineJoy, which Jay already covers.
+         * The default is the nine that played in a 26 September 2026 check of all 22 across
+         * six movies and episodes, following each stream through to media bytes. The rest are
+         * off by default with the reason in their label: MBox (403 on every DASH manifest),
+         * CAT, Nitro, Sealx, HINDI, Venom and Tamil (404/403/502 throughout), Vortex and ALS
+         * (429 rate-limited), FOGS, 4K and HDHub (no or download-only sources), and 4KELITE,
+         * which is CineJoy and duplicates Jay.
          */
         private val SCREENSCAPE_SERVERS = listOf(
             ScreenscapeServer("castel", "MONGO"), // Castle, English/Tamil/Telugu/Hindi, 4/4
@@ -2749,7 +2756,30 @@ class RentaroExtractor(
             ScreenscapeServer("korso", "1xC"),
             ScreenscapeServer("Elite", "Freak"),
             ScreenscapeServer("awsind", "ALICE"),
+            ScreenscapeServer("cinejoy", "4KELITE", " - same as Jay"),
+            ScreenscapeServer("moviebox2", "MBox", " - host refuses playback"),
+            ScreenscapeServer("nitro", "Nitro", " - host refuses playback"),
+            ScreenscapeServer("vaplayer", "Vortex", " - rate-limited when tested"),
+            ScreenscapeServer("als", "ALS", " - rate-limited when tested"),
+            ScreenscapeServer("showbox", "4K", " - rarely has sources"),
+            ScreenscapeServer("scapeplus", "CAT", " - no video when tested"),
+            ScreenscapeServer("goated", "HINDI", " - no video when tested"),
+            ScreenscapeServer("streamflix", "Sealx", " - no video when tested"),
+            ScreenscapeServer("helios", "Venom", " - no video when tested"),
+            ScreenscapeServer("blast", "Tamil", " - no video when tested"),
+            ScreenscapeServer("filmyfly", "FOGS", " - download only"),
+            ScreenscapeServer("hdhub", "HDHub", " - no video when tested"),
         )
+
+        /** The servers that played when tested; see [SCREENSCAPE_SERVERS]. */
+        val SCREENSCAPE_SERVER_DEFAULT: Set<String> = SCREENSCAPE_SERVERS
+            .filter { it.note.isEmpty() }
+            .map { it.key }
+            .toSet()
+
+        fun screenscapeServerEntries(): List<String> = SCREENSCAPE_SERVERS.map { "${it.label}${it.note}" }
+
+        fun screenscapeServerValues(): List<String> = SCREENSCAPE_SERVERS.map { it.key }
 
         private val SCREENSCAPE_HEVC_REGEX = Regex("""(?i)\b(h\.?265|x265|hevc)\b|/h265/""")
 
