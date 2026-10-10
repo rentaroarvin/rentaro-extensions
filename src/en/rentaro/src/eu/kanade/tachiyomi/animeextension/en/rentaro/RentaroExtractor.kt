@@ -8,12 +8,14 @@ import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parallelCatchingMapNotNull
+import keiyoushi.utils.parallelMapNotNull
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -24,6 +26,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -318,9 +321,82 @@ class RentaroExtractor(
         // Awaiting Orion first created head-of-line blocking: a finished Dave or Jay result sat
         // hidden until every earlier entry had been collected, after which several batches were
         // emitted back-to-back and appeared to arrive together.
+        //
+        // Each resolver absorbs IOException itself, but an error status (HttpException) or a
+        // reply that is not the JSON expected (SerializationException) is neither, so it escaped
+        // and cancelled every other backend with it: on 11 October 2026 one 403 left Fight Club
+        // with no videos at all. Both are the server's answer rather than a fault here, so they
+        // now cost only their own backend.
         resolvers
-            .map { resolver -> launch { publish(resolver()) } }
+            .map { resolver ->
+                launch {
+                    val batch = try {
+                        resolver()
+                    } catch (_: HttpException) {
+                        emptyList()
+                    } catch (_: SerializationException) {
+                        emptyList()
+                    }
+                    publish(withResolutions(batch))
+                }
+            }
             .joinAll()
+    }
+
+    /**
+     * Gives each row whose label names no height the one its stream has, and drops the rows
+     * whose stream is gone. Done before publishing because an emitted row is never withdrawn.
+     *
+     * A source with a single rendition - every KissKH episode, StremFx's one MKV, XDrop's MP4 -
+     * has no other quality to offer, so "Auto" is replaced rather than expanded: "Kiss · Auto"
+     * becomes "Kiss · 720p". A row is dropped only on proof (an error status or a host that no
+     * longer resolves); a slow or unreadable stream keeps its row as it was. See [StreamProbe].
+     */
+    private suspend fun withResolutions(videos: List<Video>): List<Video> = videos.parallelMapNotNull { video ->
+        if (labelHasHeight(video.quality)) return@parallelMapNotNull video
+        val url = video.videoUrl ?: video.url
+        val lower = "${url.lowercase()} ${video.quality.lowercase()}"
+        val adaptive = ".m3u8" in lower || ".mpd" in lower || " hls" in lower || " dash" in lower
+        when (val result = StreamProbe.probe(streamProbeClient, url, video.headers ?: headers, range = !adaptive)) {
+            is StreamProbe.Resolution -> {
+                val height = StreamProbe.heightClass(result.width, result.height)
+                Video(
+                    url = video.url,
+                    quality = labelWithHeight(video.quality, if (height >= 2160) "4K" else "${height}p"),
+                    videoUrl = video.videoUrl,
+                    headers = video.headers,
+                    subtitleTracks = video.subtitleTracks,
+                    audioTracks = video.audioTracks,
+                )
+            }
+            StreamProbe.Gone -> null
+            StreamProbe.Unknown -> video
+        }
+    }
+
+    private val streamProbeClient: OkHttpClient by lazy {
+        client.newBuilder().callTimeout(STREAM_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
+    }
+
+    /**
+     * Whether any segment after the server names a height. The server segment is skipped
+     * because names such as "Art/4k-bk" read as one.
+     */
+    private fun labelHasHeight(label: String): Boolean = label.split(" · ").drop(1).any { part ->
+        LABEL_HEIGHT_REGEX.containsMatchIn(part) || part.equals("4K", ignoreCase = true)
+    }
+
+    /** [label] without the height segments after its server name. */
+    private fun labelWithoutHeight(label: String): String = label.split(" · ")
+        .filterIndexed { index, part -> index == 0 || !(LABEL_HEIGHT_REGEX.matches(part) || part.equals("4K", ignoreCase = true)) }
+        .joinToString(" · ")
+
+    /** Replaces an "Auto" segment with [height], or puts it straight after the server name. */
+    private fun labelWithHeight(label: String, height: String): String {
+        val parts = label.split(" · ").toMutableList()
+        val auto = parts.indexOfFirst { it.equals("Auto", ignoreCase = true) }
+        if (auto > 0) parts[auto] = height else parts.add(minOf(1, parts.size), height)
+        return parts.joinToString(" · ")
     }
 
     /**
@@ -1253,8 +1329,13 @@ class RentaroExtractor(
      * The episode's stream and subtitles are then fetched in parallel with keys from
      * [KissCipher].
      *
-     * The episode reply also names a third-party embed (StreamWish and similar). Those are
-     * player pages rather than streams, so only the site's own stream is used.
+     * Where the episode has one, the stream behind the site player's "Data saver" button is
+     * listed as a second source, "Kiss/Data saver" (none of 61 sampled episodes did on
+     * 11 October 2026, so it is usually absent).
+     *
+     * The episode reply also names a third-party embed. Those are not used: on 11 October 2026
+     * sbplay2 had an expired certificate, dwish reset every connection and awish and streamsss
+     * redirected to parked-domain pages.
      */
     private suspend fun kissVideos(
         title: String,
@@ -1283,11 +1364,14 @@ class RentaroExtractor(
             ).awaitSuccess().parseAs<KissVideoDto>()
 
             val url = stream.video?.takeIf { it.startsWith("http") }
-            if (url == null) {
+            val dataSaver = stream.dataSaver?.takeIf { it.startsWith("http") && it != url }
+            if (url == null && dataSaver == null) {
                 subtitles.cancel()
                 emptyList()
             } else {
-                kissStreams(url, stream.type, subtitles.await())
+                val tracks = subtitles.await()
+                url?.let { kissStreams(it, stream.type, tracks, KISS_NAME) }.orEmpty() +
+                    dataSaver?.let { kissStreams(it, 1, tracks, "$KISS_NAME/$KISS_DATA_SAVER") }.orEmpty()
             }
         }
     }
@@ -1396,7 +1480,7 @@ class RentaroExtractor(
      * a host that no longer resolves (one on vipdracdn.net did), and listing it would only fail
      * in the player.
      */
-    private suspend fun kissStreams(url: String, type: Int?, subtitles: List<Track>): List<Video> {
+    private suspend fun kissStreams(url: String, type: Int?, subtitles: List<Track>, server: String): List<Video> {
         val streamHeaders = headers.newBuilder()
             .set("Referer", "$KISS_ORIGIN/")
             .set("Origin", KISS_ORIGIN)
@@ -1407,7 +1491,7 @@ class RentaroExtractor(
             return listOf(
                 Video(
                     url = url,
-                    quality = kissLabel("Auto", "MP4", subtitles.size),
+                    quality = kissLabel(server, "Auto", "MP4", subtitles.size),
                     videoUrl = url,
                     headers = streamHeaders,
                     subtitleTracks = subtitles,
@@ -1420,7 +1504,7 @@ class RentaroExtractor(
                 playlistUrl = url,
                 // A media playlist has no variants and is named "Video"; it carries no height.
                 videoNameGen = { variant ->
-                    kissLabel(if (variant.equals("Video", ignoreCase = true)) "Auto" else variant, "HLS", subtitles.size)
+                    kissLabel(server, if (variant.equals("Video", ignoreCase = true)) "Auto" else variant, "HLS", subtitles.size)
                 },
                 subtitleList = subtitles,
                 masterHeaders = streamHeaders,
@@ -1492,8 +1576,8 @@ class RentaroExtractor(
         return File(dir, "$KISS_SUBTITLE_PREFIX${url.hashCode().toUInt()}.srt").apply { writeText(content) }
     }
 
-    private fun kissLabel(quality: String, container: String, subCount: Int): String = listOfNotNull(
-        KISS_NAME,
+    private fun kissLabel(server: String, quality: String, container: String, subCount: Int): String = listOfNotNull(
+        server,
         quality,
         container,
         "$subCount subs".takeIf { subCount > 0 },
@@ -1826,12 +1910,13 @@ class RentaroExtractor(
 
     /**
      * VidFast is the only backend that still needs
-     * enc-dec.app. Four calls per resolve:
+     * enc-dec.app. Six calls per resolve:
      *
      *  1. `GET /movie/{tmdb}` (or `/tv/{tmdb}/{s}/{e}`)  the embed page, whose
      *     HTML carries a short-lived token.
-     *  2. `enc-vidfast?text=…`  that token is handed to enc-dec.app, which
-     *     returns the two request URLs plus the CSRF token.
+     *  2. `enc-vidfast?text=…&stage=1`, then a POST to the URL it returns, then
+     *     `enc-vidfast?text=<that reply>&stage=2`  enc-dec.app turns the token into
+     *     the two request URLs plus the CSRF token.
      *  3. `POST {servers}`  answers the encrypted server list.
      *  4. `POST {stream}/{data}`  answers one server's encrypted stream.
      *
@@ -1867,7 +1952,23 @@ class RentaroExtractor(
         val token = VIDFAST_TOKEN_REGEX.find(page)?.groupValues?.get(1)
             ?: return emptyList()
 
-        val encUrl = "$VIDFAST_ENC_URL?text=${URLEncoder.encode(token, "UTF-8")}"
+        // enc-dec.app split the hand-off in two by 11 October 2026, and answers 400 to the old
+        // single call: stage 1 turns the page token into a URL that is POSTed with its own CSRF
+        // token, and stage 2 turns that reply into the server and stream URLs.
+        val stage1 = client.newCall(GET("$VIDFAST_ENC_URL?text=${URLEncoder.encode(token, "UTF-8")}&stage=1", headers))
+            .awaitSuccess()
+            .parseAs<VidFastStage1Dto>()
+        val handOff = stage1.result?.takeIf { stage1.status == HTTP_OK } ?: return emptyList()
+        val stage1Url = handOff.stage1?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val stage1Csrf = handOff.token?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val stage1Reply = client.newCall(POST(stage1Url, vidFastApiHeaders(stage1Csrf), VIDFAST_EMPTY_BODY))
+            .awaitSuccess()
+            .bodyString()
+            .trim()
+            .takeIf { it.isNotEmpty() }
+            ?: return emptyList()
+
+        val encUrl = "$VIDFAST_ENC_URL?text=${URLEncoder.encode(stage1Reply, "UTF-8")}&stage=2"
         val enc = client.newCall(GET(encUrl, headers))
             .awaitSuccess()
             .parseAs<VidFastEncDto>()
@@ -1891,7 +1992,7 @@ class RentaroExtractor(
         // Filtered against the user's selection before any request is made, so a
         // disabled server costs nothing.
         return serverList
-            .filter { server -> server.name == VIDFAST_SERVER }
+            .filter { server -> server.name in VIDFAST_SERVERS }
             .parallelCatchingFlatMap { server ->
                 val data = server.data?.takeIf { it.isNotBlank() }
                     ?: return@parallelCatchingFlatMap emptyList()
@@ -2353,8 +2454,12 @@ class RentaroExtractor(
                     // which adds nothing to a label that already carries the
                     // height. Citadel and CastVid return media playlists rather
                     // than masters, so that was every one of their rows.
+                    //
+                    // A real variant's height replaces the one the provider
+                    // claimed: PureWave says "1080p" for a master whose only
+                    // variant is 720p, which read "1080p · … · 720p".
                     videoNameGen = { variant ->
-                        if (variant.equals("Video", ignoreCase = true)) label else "$label · $variant"
+                        if (variant.equals("Video", ignoreCase = true)) label else "${labelWithoutHeight(label)} · $variant"
                     },
                     subtitleList = candidate.subtitles,
                     masterHeaders = candidate.videoHeaders,
@@ -3044,6 +3149,9 @@ class RentaroExtractor(
         private const val KISS_ORIGIN = "https://kisskh.do"
         private const val KISS_API_BASE = "$KISS_ORIGIN/api"
 
+        /** Label of the lower-bitrate stream behind the site player's "Data saver" button. */
+        private const val KISS_DATA_SAVER = "Data saver"
+
         /** "(2026)" in a KissKH title. */
         private val KISS_YEAR_REGEX = Regex("""\((\d{4})\)""")
 
@@ -3185,13 +3293,14 @@ class RentaroExtractor(
         private val VIDFAST_TOKEN_REGEX = """\\"(?:en|token)\\":\\"(.*?)\\"""".toRegex()
 
         /**
-         * The only VidFast server still offered, so no nested setting is needed.
+         * The VidFast servers queried, so no nested setting is needed.
          *
-         * A live eight-title check on 20 September 2026 found Bravo playable for all four TV
-         * episodes tested. Every other configured VidFast server was either consistently 403 or
-         * returned no stream, so keeping them in the picker only offered known failures.
+         * Bravo was the only one playing on 20 September 2026; by 11 October 2026 it returned no
+         * stream for Fight Club and a dead (404) playlist for Breaking Bad, while vRapid and vBlaze
+         * played both with 4K, 1080p, 720p and 480p variants. Cobra's playlist answered 502 and
+         * Cine and Horizon returned nothing, so they are left out.
          */
-        private const val VIDFAST_SERVER = "Bravo"
+        private val VIDFAST_SERVERS = setOf("vRapid", "vBlaze")
 
         /** Status field both enc-dec.app endpoints report success with. */
         private const val HTTP_OK = 200
@@ -3263,6 +3372,12 @@ class RentaroExtractor(
         private val NEXUS_LANDING_PATH_SEGMENTS = setOf("drive", "tg")
 
         private const val MEDIA_PROBE_TIMEOUT_SECONDS = 8L
+
+        /** Bounds the resolution probe, which reads up to two small ranges per stream. */
+        private const val STREAM_PROBE_TIMEOUT_SECONDS = 10L
+
+        /** A height such as "720p" or "1080P" in one label segment. */
+        private val LABEL_HEIGHT_REGEX = Regex("""(?<!\d)\d{3,4}p\b""", RegexOption.IGNORE_CASE)
 
         private val SIGNED_EXPIRY_REGEX = Regex("""[?&]expires?=(\d{10,13})(?:&|$)""", RegexOption.IGNORE_CASE)
 

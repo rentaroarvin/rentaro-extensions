@@ -428,7 +428,20 @@ data class VidLoveSubtitleDto(
 // delegated. See the VIDFAST_* declarations in [RentaroExtractor] for the
 // endpoints and protocol notes.
 
-/** `enc-vidfast` response: the two request URLs plus the CSRF token. */
+/** `enc-vidfast?stage=1`: where to POST the page token's hand-off, and the CSRF token for it. */
+@Serializable
+data class VidFastStage1Dto(
+    val status: Int? = null,
+    val result: VidFastStage1ResultDto? = null,
+)
+
+@Serializable
+data class VidFastStage1ResultDto(
+    val stage1: String? = null,
+    val token: String? = null,
+)
+
+/** `enc-vidfast?stage=2` response: the two request URLs plus the CSRF token. */
 @Serializable
 data class VidFastEncDto(
     val status: Int? = null,
@@ -577,9 +590,11 @@ data class KissEpisodeDto(
 data class KissVideoDto(
     @SerialName("Video")
     val video: String? = null,
-    // 1 is an HLS media playlist, 0 a progressive MP4.
+    // 1 is an HLS media playlist, 0 a progressive MP4, 2 a countdown for an unaired episode.
     @SerialName("Type")
     val type: Int? = null,
+    // The HLS stream behind the player's "Data saver" button, when the episode has one.
+    val dataSaver: String? = null,
 )
 
 @Serializable
