@@ -548,3 +548,43 @@ data class ScreenscapeStreamDto(
     // Pixeldrain and similar pages the site offers only as downloads.
     val downloadOnly: Boolean = false,
 )
+
+// ============================== KissKH DTOs ==============================
+
+/** One `/DramaList/Search` hit. Only the title says which season a hit is. */
+@Serializable
+data class KissSearchItemDto(
+    val id: Int? = null,
+    val title: String? = null,
+    val episodesCount: Int? = null,
+)
+
+@Serializable
+data class KissDramaDto(
+    // "TVSeries", "Movie", "Anime" or "Hollywood"; the last covers films and series alike.
+    val type: String? = null,
+    val episodes: List<KissEpisodeDto> = emptyList(),
+)
+
+@Serializable
+data class KissEpisodeDto(
+    val id: Int? = null,
+    // Sent as 1.0, 2.0, …
+    val number: Double? = null,
+)
+
+@Serializable
+data class KissVideoDto(
+    @SerialName("Video")
+    val video: String? = null,
+    // 1 is an HLS media playlist, 0 a progressive MP4.
+    @SerialName("Type")
+    val type: Int? = null,
+)
+
+@Serializable
+data class KissSubtitleDto(
+    val src: String? = null,
+    val label: String? = null,
+    val default: Boolean = false,
+)

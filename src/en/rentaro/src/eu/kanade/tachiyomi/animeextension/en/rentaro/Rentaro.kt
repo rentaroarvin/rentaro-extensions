@@ -1113,7 +1113,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -1190,6 +1190,8 @@ class Rentaro :
             "pref_optin_yoru" to setOf("Yoru"),
             // Screenscape shipped as "Sun" in v49, on the same one-shot basis.
             "pref_optin_sun" to setOf("Sun"),
+            // KissKH shipped as "Kiss" in v57, on the same one-shot basis.
+            "pref_optin_kiss" to setOf("Kiss"),
         )
 
         /**

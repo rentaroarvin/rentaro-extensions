@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.rentaro
 
 import android.media.MediaCodecList
+import android.net.Uri
 import android.os.Build
 import androidx.annotation.RequiresApi
 import aniyomi.lib.playlistutils.PlaylistUtils
@@ -12,6 +13,7 @@ import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.parallelCatchingFlatMap
+import keiyoushi.utils.parallelCatchingMapNotNull
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -36,10 +38,12 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
 import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 /**
  * Resolves Rentaro playback through the independent VidLink, Nexus, CineJoy,
@@ -143,11 +147,12 @@ class RentaroExtractor(
         val vidFastEnabled = VIDFAST_NAME in enabledServers
         val vidLoveEnabled = VIDLOVE_NAME in enabledServers
         val screenscapeEnabled = SCREENSCAPE_NAME in enabledServers
+        val kissEnabled = KISS_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
-            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled
+            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -290,6 +295,18 @@ class RentaroExtractor(
                             enabledScreenscapeLanguages,
                             enabledScreenscapeServers,
                         )
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // KissKH has no TMDB ids, so it is matched by title and season before anything plays.
+            {
+                if (!kissEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        kissVideos(title, year, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -1221,6 +1238,266 @@ class RentaroExtractor(
         SCREENSCAPE_NAMED_LANGUAGES.firstOrNull { it.lowercase() in text }?.let { return it }
         return "Original"
     }
+
+    // ========================= KissKH (Kiss) backend ==========================
+
+    private val kissApiHeaders: Headers
+        get() = headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Referer", "$KISS_ORIGIN/")
+            .build()
+
+    /**
+     * KissKH carries Asian dramas, films and anime, plus a share of Western titles, under its
+     * own ids, so the TMDB title is searched and matched to the right season by [kissDrama].
+     * The episode's stream and subtitles are then fetched in parallel with keys from
+     * [KissCipher].
+     *
+     * The episode reply also names a third-party embed (StreamWish and similar). Those are
+     * player pages rather than streams, so only the site's own stream is used.
+     */
+    private suspend fun kissVideos(
+        title: String,
+        year: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val drama = kissDrama(title, year, isMovie, seasonId.toIntOrNull() ?: 1) ?: return emptyList()
+        val episode = if (isMovie) {
+            drama.episodes.firstOrNull { it.number == 1.0 } ?: drama.episodes.singleOrNull()
+        } else {
+            val wanted = episodeId.toDoubleOrNull() ?: return emptyList()
+            drama.episodes.firstOrNull { it.number == wanted }
+        }
+        val id = episode?.id ?: return emptyList()
+
+        return coroutineScope {
+            val subtitles = async { runCatching { kissSubtitles(id, subLimit) }.getOrDefault(emptyList()) }
+            val stream = client.newCall(
+                GET(
+                    "$KISS_API_BASE/DramaList/Episode/$id.png?err=false&ts=&time=&kkey=${KissCipher.videoKey(id)}",
+                    kissApiHeaders,
+                ),
+            ).awaitSuccess().parseAs<KissVideoDto>()
+
+            val url = stream.video?.takeIf { it.startsWith("http") }
+            if (url == null) {
+                subtitles.cancel()
+                emptyList()
+            } else {
+                kissStreams(url, stream.type, subtitles.await())
+            }
+        }
+    }
+
+    /**
+     * Finds the KissKH drama for a TMDB title and season, or null when it carries none.
+     *
+     * Search is fuzzy ("Shadow Punisher" also returns "Shadow Love"), so a hit must have the
+     * title exactly, after [kissCandidate] strips its season and year. KissKH lists each season
+     * as its own drama ("Squid Game Season 2", "Game Of Thrones - Season 1") and an unmarked
+     * one is the first. A year in the title must be within one of TMDB's for a film or a first
+     * season; a later season airs years after the show's first air date, so it is not checked.
+     * The drama's type then has to agree, since a film and a series can share a title.
+     *
+     * Checked on 10 October 2026 against 19 titles (Korean, Chinese and Western series and
+     * films, anime, later seasons): every one KissKH carries was matched, and Fight Club and
+     * MASHLE, which it does not, matched nothing rather than a near miss.
+     */
+    private suspend fun kissDrama(title: String, year: String, isMovie: Boolean, season: Int): KissDramaDto? {
+        val url = "$KISS_API_BASE/DramaList/Search".toHttpUrl().newBuilder()
+            .addQueryParameter("q", title)
+            .addQueryParameter("type", "0")
+            .build()
+        val wanted = kissNormalise(title)
+        val wantedYear = year.take(4).toIntOrNull()
+
+        val matches = client.newCall(GET(url.toString(), kissApiHeaders))
+            .awaitSuccess()
+            .parseAs<List<KissSearchItemDto>>()
+            .mapNotNull(::kissCandidate)
+            .filter { wanted in it.names }
+            .filter { isMovie || it.season == season }
+            .filter { candidate ->
+                val year = candidate.year
+                year == null || wantedYear == null || !(isMovie || season == 1) || abs(year - wantedYear) <= 1
+            }
+            .sortedByDescending { it.year == wantedYear }
+
+        for (candidate in matches) {
+            val drama = client.newCall(GET("$KISS_API_BASE/DramaList/Drama/${candidate.id}?isq=false", kissApiHeaders))
+                .awaitSuccess()
+                .parseAs<KissDramaDto>()
+            // "Hollywood" and "Anime" hold films and series alike; a film is their one-episode entry.
+            val isFilm = drama.type == "Movie" || (candidate.episodesCount == 1 && drama.type != "TVSeries")
+            if (isFilm == isMovie) return drama
+        }
+        return null
+    }
+
+    /** A search hit reduced to the names, season and year its title carries. */
+    private class KissCandidate(
+        val id: Int,
+        val episodesCount: Int?,
+        val names: List<String>,
+        val season: Int,
+        val year: Int?,
+    )
+
+    /**
+     * Splits a KissKH title into its names and season. Alternate names are joined with " - "
+     * ("Goblin - Guardian: The Lonely and Great God"); a season is "Season N" or a trailing
+     * "S2"; a year is "(2026)". Combined anime entries ("Solo Leveling S1+S2") number their
+     * episodes straight through, as TMDB does for those shows, so they count as the first.
+     */
+    private fun kissCandidate(item: KissSearchItemDto): KissCandidate? {
+        val id = item.id ?: return null
+        val title = item.title?.takeIf { it.isNotBlank() } ?: return null
+        var season = KISS_SEASON_REGEX.find(title)?.groupValues?.get(1)?.toIntOrNull()
+
+        val names = title.split(KISS_NAME_SEPARATOR_REGEX).mapNotNull { name ->
+            var base = name.replace(KISS_YEAR_REGEX, " ")
+                .replace(KISS_SEASON_TAIL_REGEX, " ")
+                .replace(KISS_COMBINED_SEASONS_REGEX, " ")
+            KISS_TRAILING_SEASON_REGEX.find(base)?.let { match ->
+                if (season == null) season = match.groupValues[1].toIntOrNull()
+                base = base.substring(0, match.range.first)
+            }
+            kissNormalise(base).takeIf { it.isNotEmpty() }
+        }
+
+        return KissCandidate(
+            id = id,
+            episodesCount = item.episodesCount,
+            names = names,
+            season = season ?: 1,
+            year = KISS_YEAR_REGEX.find(title)?.groupValues?.get(1)?.toIntOrNull(),
+        )
+    }
+
+    /**
+     * Lowercases, drops punctuation and collapses spaces. Unlike [normaliseTitle] the spaces
+     * are collapsed, because TMDB's "Maxton Hall – The World Between Us" and KissKH's
+     * "Maxton Hall: The World Between Us" differ only in punctuation and its spacing.
+     */
+    private fun kissNormalise(value: String): String = value.lowercase()
+        .replace("&", " and ")
+        .filter { it.isLetterOrDigit() || it.isWhitespace() }
+        .replace(KISS_WHITESPACE_REGEX, " ")
+        .trim()
+
+    /**
+     * Type 1 is an HLS media playlist and type 0 a seekable MP4; both play without the site's
+     * headers, but they are sent as the browser sends them.
+     *
+     * The playlist is fetched here, which doubles as a liveness check: an episode can point at
+     * a host that no longer resolves (one on vipdracdn.net did), and listing it would only fail
+     * in the player.
+     */
+    private suspend fun kissStreams(url: String, type: Int?, subtitles: List<Track>): List<Video> {
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$KISS_ORIGIN/")
+            .set("Origin", KISS_ORIGIN)
+            .build()
+
+        val isHls = type == 1 || ".m3u8" in url.lowercase().substringBefore('?')
+        if (!isHls) {
+            return listOf(
+                Video(
+                    url = url,
+                    quality = kissLabel("Auto", "MP4", subtitles.size),
+                    videoUrl = url,
+                    headers = streamHeaders,
+                    subtitleTracks = subtitles,
+                ),
+            )
+        }
+
+        return runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = url,
+                // A media playlist has no variants and is named "Video"; it carries no height.
+                videoNameGen = { variant ->
+                    kissLabel(if (variant.equals("Video", ignoreCase = true)) "Auto" else variant, "HLS", subtitles.size)
+                },
+                subtitleList = subtitles,
+                masterHeaders = streamHeaders,
+                videoHeaders = streamHeaders,
+            )
+        }.getOrDefault(emptyList())
+    }
+
+    /**
+     * The episode's subtitles, the site's default (English) first. Plain SRT is handed to the
+     * player by URL. Encrypted files (`.txt1` for about one in nine on 10 October 2026) are
+     * decrypted by [kissDecryptedSubtitle]; one that cannot be read is dropped.
+     */
+    private suspend fun kissSubtitles(episodeId: Int, subLimit: Int): List<Track> {
+        if (subLimit <= 0) return emptyList()
+        return client.newCall(
+            GET("$KISS_API_BASE/Sub/$episodeId?kkey=${KissCipher.subtitleKey(episodeId)}", kissApiHeaders),
+        ).awaitSuccess()
+            .parseAs<List<KissSubtitleDto>>()
+            .filter { !it.src.isNullOrBlank() }
+            .sortedByDescending { it.default }
+            .take(subLimit)
+            .parallelCatchingMapNotNull { subtitle ->
+                val src = subtitle.src!!
+                val label = subtitle.label?.takeIf { it.isNotBlank() } ?: "Unknown"
+                if (KissCipher.isEncryptedSubtitle(src)) kissDecryptedSubtitle(src, label) else Track(src, label)
+            }
+    }
+
+    /**
+     * Decrypts an encrypted KissKH subtitle into a local SRT file and returns it as a track.
+     *
+     * The player loads subtitles by URL and cannot decrypt them, so the readable copy has to
+     * exist somewhere it can open; a `file://` URI in the app's cache is what other Aniyomi
+     * KissKH sources use. Each cue's text is one base64 line, decrypted on its own as the site
+     * does (1,548 cues across six files, none spanning lines).
+     */
+    private suspend fun kissDecryptedSubtitle(url: String, label: String): Track? {
+        val extension = KissCipher.subtitleExtension(url)
+        val body = client.newCall(GET(url, headers)).awaitSuccess().bodyString()
+
+        val cues = body.replace("\r\n", "\n").split(KISS_CUE_BREAK_REGEX).mapNotNull { block ->
+            val lines = block.lines()
+            val timing = lines.indexOfFirst { "-->" in it }.takeIf { it >= 0 } ?: return@mapNotNull null
+            val text = lines.drop(timing + 1)
+                .filter { it.isNotBlank() }
+                .joinToString("\n") { KissCipher.decryptCueLine(it, extension) }
+                // A blank line would end the cue early, and decrypted text can contain one.
+                .lines()
+                .filter { it.isNotBlank() }
+                .joinToString("\n")
+            "${lines[timing].trim()}\n$text"
+        }
+        if (cues.isEmpty()) return null
+
+        val srt = cues.withIndex().joinToString("\n\n") { (index, cue) -> "${index + 1}\n$cue" }
+        return Track(Uri.fromFile(kissSubtitleFile(url, srt)).toString(), label)
+    }
+
+    /**
+     * Writes a decrypted subtitle to the app's cache, one file per source URL so a rewatch reuses
+     * it. Copies older than a day are removed on each write, so the directory stays bounded.
+     */
+    private fun kissSubtitleFile(url: String, content: String): File {
+        val dir = File(System.getProperty("java.io.tmpdir") ?: ".")
+        val cutoff = System.currentTimeMillis() - KISS_SUBTITLE_TTL_MS
+        dir.listFiles { file -> file.name.startsWith(KISS_SUBTITLE_PREFIX) && file.lastModified() < cutoff }
+            ?.forEach { it.delete() }
+        return File(dir, "$KISS_SUBTITLE_PREFIX${url.hashCode().toUInt()}.srt").apply { writeText(content) }
+    }
+
+    private fun kissLabel(quality: String, container: String, subCount: Int): String = listOfNotNull(
+        KISS_NAME,
+        quality,
+        container,
+        "$subCount subs".takeIf { subCount > 0 },
+    ).joinToString(" · ")
 
     // ======================== VidLove (Yoru) backend ========================
 
@@ -2761,6 +3038,38 @@ class RentaroExtractor(
         private const val SCREENSCAPE_ORIGIN = "https://screenscape.me"
         private const val SCREENSCAPE_AUTH_TTL_MS = 240_000L
 
+        // KissKH (kisskh.do) is an independent catalogue of Asian dramas, films and anime with
+        // its own ids; its stream and subtitle routes are keyed by [KissCipher].
+        private const val KISS_NAME = "Kiss"
+        private const val KISS_ORIGIN = "https://kisskh.do"
+        private const val KISS_API_BASE = "$KISS_ORIGIN/api"
+
+        /** "(2026)" in a KissKH title. */
+        private val KISS_YEAR_REGEX = Regex("""\((\d{4})\)""")
+
+        /** "Season 2" anywhere in a KissKH title. */
+        private val KISS_SEASON_REGEX = Regex("""\bSeason\s*(\d+)""", RegexOption.IGNORE_CASE)
+
+        /** "Season 2" and what follows it ("Season 2: Light and Shadow"), cut from a name. */
+        private val KISS_SEASON_TAIL_REGEX = Regex("""\bSeason\s*\d+.*$""", RegexOption.IGNORE_CASE)
+
+        /** A combined entry's "S1+S2" or "S2 + S1". */
+        private val KISS_COMBINED_SEASONS_REGEX = Regex("""\bS\d+(?:\s*\+\s*S\d+)+\b""", RegexOption.IGNORE_CASE)
+
+        /** A lone trailing "S2". */
+        private val KISS_TRAILING_SEASON_REGEX = Regex("""\bS(\d{1,2})\s*$""", RegexOption.IGNORE_CASE)
+
+        /** The " - " joining a KissKH title's alternate names. */
+        private val KISS_NAME_SEPARATOR_REGEX = Regex("""\s+-\s+""")
+
+        private val KISS_WHITESPACE_REGEX = Regex("""\s+""")
+
+        /** The blank line between SRT cues. */
+        private val KISS_CUE_BREAK_REGEX = Regex("""\n\s*\n""")
+
+        private const val KISS_SUBTITLE_PREFIX = "rentaro-kiss-"
+        private const val KISS_SUBTITLE_TTL_MS = 24 * 60 * 60 * 1000L
+
         private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
 
         /**
@@ -3297,6 +3606,7 @@ class RentaroExtractor(
             VIDFAST_NAME,
             VIDLOVE_NAME,
             SCREENSCAPE_NAME,
+            KISS_NAME,
         )
 
         /**
@@ -3322,6 +3632,7 @@ class RentaroExtractor(
             VIDFAST_NAME -> "Multi-Lang"
             VIDLOVE_NAME -> "Original"
             SCREENSCAPE_NAME -> "Multi-Lang"
+            KISS_NAME -> "Original"
             else -> "Unknown"
         }
     }
