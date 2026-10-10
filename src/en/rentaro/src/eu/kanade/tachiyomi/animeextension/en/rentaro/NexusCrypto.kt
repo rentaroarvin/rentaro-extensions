@@ -25,15 +25,15 @@ import javax.crypto.spec.SecretKeySpec
 internal object NexusCrypto {
 
     /**
-     * Passphrase used by the site's own client, where it is assembled from
-     * character codes to keep it out of plain sight in the bundle.
+     * Passphrase used by the site's own client, a hex string literal in the
+     * lazily loaded player chunk (the one calling `AES.encrypt`).
+     *
+     * Rotated by 10 October 2026 from the earlier `S8x!Jk4ZP1uG8$my`. The
+     * servers call still answers 200 to a request sealed with a stale key, so
+     * the rotation shows only as every response failing to decrypt, which
+     * left Art returning nothing.
      */
-    private val PASSPHRASE = String(
-        charArrayOf(
-            'S', '8', 'x', '!', 'J', 'k', '4', 'Z',
-            'P', '1', 'u', 'G', '8', '$', 'm', 'y',
-        ),
-    )
+    private const val PASSPHRASE = "f4488ab4da401203d23baa129fc546153898162524635d6776826d0c867ccaa3"
 
     private const val SALT_MAGIC = "Salted__"
     private const val SALT_SIZE = 8
