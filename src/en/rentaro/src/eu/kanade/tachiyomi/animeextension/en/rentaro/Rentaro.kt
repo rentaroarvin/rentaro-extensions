@@ -836,6 +836,23 @@ class Rentaro :
             }.apply()
         }
 
+        // The Art backend's 10 October 2026 catalogue: the new providers that play join
+        // existing selections once, as they do the fresh default, and names the backend no
+        // longer advertises are dropped. The rest of the user's choice is left as it is.
+        if (!getBoolean(PREF_NEXUS_CATALOGUE_20261010_KEY, false)) {
+            val stored = getStringSet(PREF_NEXUS_PROVIDERS_KEY, null)
+            edit().apply {
+                if (stored != null) {
+                    val known = RentaroExtractor.nexusProviderValues().toSet()
+                    putStringSet(
+                        PREF_NEXUS_PROVIDERS_KEY,
+                        stored.intersect(known) + "xdownloader" + "purstream" + "vixolity" + "moviesdrive",
+                    )
+                }
+                putBoolean(PREF_NEXUS_CATALOGUE_20261010_KEY, true)
+            }.apply()
+        }
+
         return this
     }
 
@@ -1132,6 +1149,9 @@ class Rentaro :
 
         /** One-shot removal of the providers found not playing in the 26 September 2026 retest. */
         private const val PREF_NON_PLAYING_PRUNED_KEY = "pref_non_playing_pruned_20260926"
+
+        /** One-shot sync of stored Art selections with the 10 October 2026 backend catalogue. */
+        private const val PREF_NEXUS_CATALOGUE_20261010_KEY = "pref_nexus_catalogue_20261010"
 
         /** Legacy Wave migration marker, cleared with the removed nested setting. */
         private const val PREF_VIDFAST_SERVERS_RESET_KEY = "pref_vidfast_servers_bravo_v1"

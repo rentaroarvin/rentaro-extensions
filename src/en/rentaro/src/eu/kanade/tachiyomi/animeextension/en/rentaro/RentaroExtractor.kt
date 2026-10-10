@@ -2497,26 +2497,35 @@ class RentaroExtractor(
      * MbBlast. The word "audio" is appended because players group these entries
      * by looking for it - a bare language reads as an unclassified detail.
      */
-    private fun nexusLabel(serverName: String, quality: String, url: String, type: String? = null): String {
+    private fun nexusLabel(serverName: String, rawQuality: String, url: String, type: String? = null): String {
         val parts = mutableListOf("$NEXUS_NAME/${shortenNexusServer(serverName)}")
+        val quality = normaliseNexusQuality(rawQuality)
 
         // Codec tags carry a bare number ("x264", "H.265") that reads as a
         // resolution, so they are taken out before the height is looked for.
         // Without this "1.4 GB | … | x264" was labelled 264p.
+        //
+        // A height written with its "p" wins over a bare number: MD-4K's release names open
+        // with the year ("Interstellar (2014) [...] 2160p ..."), which was labelled 2014p.
         val heightSource = NEXUS_CODEC_NOISE_REGEX.replace(quality, " ")
-        val resolution = qualityRegex.find(heightSource)?.groupValues?.get(1)
+        val resolution = (NEXUS_EXPLICIT_HEIGHT_REGEX.find(heightSource) ?: qualityRegex.find(heightSource))
+            ?.groupValues?.get(1)
+        val audio = nexusAudioDescriptor(quality)
         when {
             resolution != null -> parts += "${resolution}p"
             quality.contains("4k", ignoreCase = true) -> parts += "4K"
             // No height anywhere. Falling back to the raw string produced a row
             // titled with the whole tag list, so only the part before the first
-            // separator is used and the rest is left to the tags below.
+            // separator is used and the rest is left to the tags below. A part
+            // that is itself the language list the audio descriptor was built
+            // from is left to it, so XDrop's "English" does not read
+            // "English · English audio".
             else -> quality.substringBefore('|').trim()
-                .takeIf { it.isNotBlank() }
+                .takeIf { it.isNotBlank() && audio != nexusAudioSuffixed(nexusTrimLanguages(it)) }
                 ?.let { parts += it.take(NEXUS_LABEL_LIMIT) }
         }
 
-        nexusAudioDescriptor(quality)?.let { parts += it }
+        audio?.let { parts += it }
 
         // "… | 1080p | Hindi | BluRay | x265 …" style: keep the source and codec
         // tags, which separate a BluRay rip from a WEB-DL of the same height.
@@ -2532,8 +2541,10 @@ class RentaroExtractor(
         }
         // Size is what separates the 66 GB, 41 GB and 20 GB releases. Skipped
         // when the height was missing and the size already became the title, so
-        // "1.4 GB | Hindi | …" is not labelled with its size twice.
-        tags.firstOrNull { NEXUS_SIZE_REGEX.matches(it) }
+        // "1.4 GB | Hindi | …" is not labelled with its size twice. Release names
+        // with no tag separators (MD-4K's "… x265 HEVC 10bit [10.8GB] …") carry
+        // it inline, so the first size anywhere is the fallback.
+        (tags.firstOrNull { NEXUS_SIZE_REGEX.matches(it) } ?: NEXUS_SIZE_REGEX.find(quality)?.value)
             ?.takeIf { size -> parts.none { it == size } }
             ?.let { parts += it }
 
@@ -2552,6 +2563,23 @@ class RentaroExtractor(
         if (container != null) parts += container
         return parts.joinToString(" · ")
     }
+
+    /**
+     * Rewrites the " · "-joined quality strings of the scrapers added by 10 October 2026 into
+     * the pipe-tagged shape [nexusLabel] reads, e.g.
+     *
+     *     "Purstream · pulse · 1080p · MULTI"             -> "1080p | MULTI"
+     *     "XDownloader · English, Deutsch, Español S1E1"  -> "English, Deutsch, Español"
+     *     "Vixolity"                                      -> ""
+     *
+     * They lead with their own upstream name, which was otherwise read as a title and then
+     * again as a language ("Vixolity · Vixolity audio"). The episode tag repeats what is
+     * already being played. Strings without the separator pass through unchanged.
+     */
+    private fun normaliseNexusQuality(quality: String): String = quality.split('·')
+        .map { NEXUS_EPISODE_TAG_REGEX.replace(it, "").trim() }
+        .filter { it.isNotEmpty() && it.lowercase() !in NEXUS_UPSTREAM_NAMES }
+        .joinToString(" | ")
 
     /**
      * Extracts the audio descriptor from a Nexus quality string.
@@ -2986,6 +3014,15 @@ class RentaroExtractor(
         /** Matches a size tag such as "20.26 GB" or "643.3 MB". */
         private val NEXUS_SIZE_REGEX = Regex("""\d+(\.\d+)?\s*[MG]B""", RegexOption.IGNORE_CASE)
 
+        /** A height written with its unit, "2160p" or "720P", as opposed to a bare number. */
+        private val NEXUS_EXPLICIT_HEIGHT_REGEX = Regex("""(?<!\d)(\d{3,4})[pP]\b""")
+
+        /** An episode tag such as "S1E1" or "S01E10" in a quality string. */
+        private val NEXUS_EPISODE_TAG_REGEX = Regex("""\bS\d{1,2}E\d{1,4}\b""", RegexOption.IGNORE_CASE)
+
+        /** Upstream names the newer scrapers lead their quality strings with. */
+        private val NEXUS_UPSTREAM_NAMES = setOf("xdownloader", "purstream", "pulse", "vixolity")
+
         /**
          * Codec tags whose digits would otherwise be read as a resolution.
          *
@@ -3012,6 +3049,8 @@ class RentaroExtractor(
             "hevc", "avc", "x264", "x265", "h264", "h265", "h.264", "h.265", "av1", "vp9",
             "mkv", "mp4", "ts", "dts", "atmos", "aac", "ac3", "dd", "ddp", "truehd", "org",
             "10bit", "8bit", "hdr", "sdr", "dv", "remux", "esub", "msub",
+            // The placeholder used when a source names no quality at all, not a language.
+            "auto",
             // 4k-Hublink leads its quality string with the file host ("HubDrive | 11.4 GB | …"),
             // which otherwise read as a language: "HubCloud, Hindi, English audio".
             "hubcloud", "hubdrive", "hubcdn", "gdflix", "pixeldrain", "filepress", "gofile",
@@ -3052,7 +3091,6 @@ class RentaroExtractor(
          * carries fewer titles, and works normally for those it has.
          */
         val NEXUS_PROVIDERS = listOf(
-            NexusProvider("holly", "Lolly", 4),
             NexusProvider("castle", "CastVid", 4),
             NexusProvider("ophim", "Ophm", 4),
             NexusProvider("yomovies", "StreamX", 4),
@@ -3073,19 +3111,24 @@ class RentaroExtractor(
             NexusProvider("hdhub4u", "4k-bk", 2),
             NexusProvider("rive-flowcast", "River", 1),
             NexusProvider("rive-hindicast", "HindiSk", 1),
-            NexusProvider("rive-asiacloud", "AsiaLug", 0),
             NexusProvider("levi", "Hevily", 0),
             NexusProvider("toonstream", "TunWatch", 0),
             NexusProvider("tamilblasters", "TamBlast", 0),
             NexusProvider("filmyfly", "FlyVid", 0),
-            NexusProvider("rive-guru", "Gbru", 0),
             NexusProvider("em-8", "VidHindi", 0),
             // Added to the backend by 26 September 2026. Off by default, see the sets below.
-            NexusProvider("vidking", "Vip-4K", 1),
             NexusProvider("hdhub4u-direct", "4k-bkl", 3),
             NexusProvider("k4khdhub-direct", "4k-Hublink", 4),
-            NexusProvider("rive-quasar", "Kutti", 0),
             NexusProvider("filmyfly-direct", "FlyVid Direct", 0),
+            // Added to the backend by 10 October 2026, probed against Fight Club, Interstellar,
+            // Breaking Bad S1E1 and Squid Game S1E1. Lolly (holly), AsiaLug, Gbru, Vip-4K and
+            // Kutti were withdrawn at the same time and are no longer advertised.
+            NexusProvider("xdownloader", "XDrop", 4),
+            NexusProvider("purstream", "PureWave", 4),
+            NexusProvider("vixolity", "Vixo", 3),
+            NexusProvider("moviesdrive", "MD-4K", 2),
+            NexusProvider("movone", "MovOne", 0),
+            NexusProvider("showbox-online", "Xuhd", 0),
         )
 
         /**
@@ -3093,17 +3136,13 @@ class RentaroExtractor(
          * probes on 20 September 2026. They remain available to select manually.
          */
         val NEXUS_NO_SOURCE_PROVIDERS: Set<String> = setOf(
-            "holly",
             "imovr",
             "rive-hindicast",
-            "rive-asiacloud",
             "levi",
             "toonstream",
             "tamilblasters",
             "filmyfly",
-            "rive-guru",
             "em-8",
-            "rive-quasar",
             "filmyfly-direct",
         )
 
@@ -3142,6 +3181,11 @@ class RentaroExtractor(
             // miss: its only page is a deleted hubdrive file); 4k-Hublink is up to 2160p REMUX.
             "hdhub4u-direct",
             "k4khdhub-direct",
+            // Added 10 October 2026, each followed through to media on the four probe titles:
+            "xdownloader", // XDrop    - MP4 with byte ranges, 4/4, per-title audio languages
+            "purstream", // PureWave - HLS, 4/4, multi-audio (French default, English) with subs
+            "vixolity", // Vixo     - HLS up to 1080p, 3/4 (Squid Game's master answered 502)
+            "moviesdrive", // MD-4K  - MKV up to 2160p, 2/4, Google no-seek mirrors only
         )
 
         /**
@@ -3173,9 +3217,7 @@ class RentaroExtractor(
             "toonstream",
             "tamilblasters",
             "filmyfly",
-            "rive-guru",
             "em-8",
-            "rive-quasar",
             "filmyfly-direct",
         )
 
@@ -3187,10 +3229,24 @@ class RentaroExtractor(
          * to 31 sources - and only the fetch fails. nitro additionally serves ad
          * CDN segments when it does answer. Worth revisiting if the block lifts.
          */
-        //
-        // vidking (Vip-4K) masters answer "Access Denied: Blocked by upstream provider nitrox"
-        // with or without the site Referer, the only one on itsnitrox.tech still refused.
-        private val NEXUS_UPSTREAM_BLOCKED = setOf("nitro", "mbox", "rive-flowcast", "vidking")
+        private val NEXUS_UPSTREAM_BLOCKED = setOf("nitro", "mbox", "rive-flowcast")
+
+        /**
+         * Scrapers whose file host sits behind a Cloudflare browser challenge, which a player
+         * cannot solve. Kept apart from [NEXUS_UPSTREAM_BLOCKED] because the cause is the
+         * challenge (`cf-mitigated: challenge`), not a refusal of the request itself.
+         *
+         * movone (MovOne) lists up to 36 files a title, but its a.111477.xyz host answers every
+         * request, Referer or not, with "Just a moment..." (403), checked 10 October 2026.
+         */
+        private val NEXUS_CHALLENGE_REQUIRED = setOf("movone")
+
+        /**
+         * Scrapers that answer `febbox_cookie_required` without the user's own Febbox login,
+         * which the site's player collects in a separate form. The extension has no such login,
+         * so Xuhd (showbox-online) never returns a source.
+         */
+        private val NEXUS_COOKIE_REQUIRED = setOf("showbox-online")
 
         /**
          * Scrapers withdrawn from the default because they almost never play: Stvvid (stvv)
@@ -3203,6 +3259,8 @@ class RentaroExtractor(
             val note = when {
                 provider.scraper in NEXUS_PROVIDER_DEFAULT -> ""
                 provider.scraper in NEXUS_UPSTREAM_BLOCKED -> " - host refuses playback"
+                provider.scraper in NEXUS_CHALLENGE_REQUIRED -> " - challenge required"
+                provider.scraper in NEXUS_COOKIE_REQUIRED -> " - needs a Febbox login"
                 provider.scraper in NEXUS_KNOWN_DEAD -> " - no video when tested"
                 provider.scraper in NEXUS_RARELY_PLAYS -> " - rarely plays when tested"
                 else -> ""
