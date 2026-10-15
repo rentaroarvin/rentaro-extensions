@@ -1081,9 +1081,9 @@ class Rentaro :
          *
          * API keys embedded in an Android client are public by design. This is the same
          * published key used by WatchBox's artwork client, verified against the official API
-         * on 20 September 2026.
+         * on 20 September 2026. The extractor reads it too, for Koto's season counts.
          */
-        private const val TMDB_API_KEY = "d8cd4489c203c5e8c8efb70aa8e33565"
+        internal const val TMDB_API_KEY = "d8cd4489c203c5e8c8efb70aa8e33565"
 
         // Hosts accepted when a URL is pasted into search. Kept in sync with
         // the intent filter in AndroidManifest.xml.
@@ -1113,7 +1113,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss", "Koto")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -1192,6 +1192,8 @@ class Rentaro :
             "pref_optin_sun" to setOf("Sun"),
             // KissKH shipped as "Kiss" in v57, on the same one-shot basis.
             "pref_optin_kiss" to setOf("Kiss"),
+            // Anikoto shipped as "Koto" in v59, on the same one-shot basis.
+            "pref_optin_koto" to setOf("Koto"),
         )
 
         /**

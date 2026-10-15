@@ -36,15 +36,18 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.jsoup.Jsoup
 import java.io.File
 import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.text.Normalizer
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
@@ -151,11 +154,13 @@ class RentaroExtractor(
         val vidLoveEnabled = VIDLOVE_NAME in enabledServers
         val screenscapeEnabled = SCREENSCAPE_NAME in enabledServers
         val kissEnabled = KISS_NAME in enabledServers
+        val kotoEnabled = KOTO_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
-            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled
+            !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled &&
+            !kotoEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -310,6 +315,18 @@ class RentaroExtractor(
                 } else {
                     try {
                         kissVideos(title, year, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // Anikoto is anime only and has its own ids, so it too is matched by title first.
+            {
+                if (!kotoEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        kotoVideos(tmdbId, title, year, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -1582,6 +1599,392 @@ class RentaroExtractor(
         container,
         "$subCount subs".takeIf { subCount > 0 },
     ).joinToString(" · ")
+
+    // ======================== Anikoto (Koto) backend =========================
+
+    private val kotoAjaxHeaders: Headers
+        get() = headers.newBuilder()
+            .set("Accept", "application/json, text/javascript, */*; q=0.01")
+            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Referer", "$KOTO_ORIGIN/")
+            .build()
+
+    /**
+     * Anikoto carries anime only, each season, part and film as its own entry under the site's
+     * own ids, so [kotoEpisodeIds] works out which of its episodes a TMDB episode is. That episode
+     * lists, per audio ("sub" is the Japanese track, "dub" the English), one MegaPlay file on up
+     * to four servers; each distinct stream among them is listed once, as "Koto/Sub" or
+     * "Koto/Dub" with the site's server name.
+     *
+     * Checked on 15 October 2026 across thirteen series and films, old, current and long-running:
+     * Vidstream-2 and Vidstream-1 are the same fetch.nexabloom.top stream in two player skins,
+     * and HD-2 (`?s=bcdn`), offered on about half, is a second CDN. Both serve H.264/AAC MPEG-TS
+     * under image and page names (`seg-f1-00000.jpg`, `.html`, `.js`, `.png`), as Dave's and
+     * Jay's Nebula do, and need MegaPlay's Referer. HD-1 (`?s=tcdn`) is skipped: every one put
+     * its segments on TikTok's ad CDN behind a PNG header, which players reject and ad-blocking
+     * DNS sinkholes, as Art's HubStream did.
+     */
+    private suspend fun kotoVideos(
+        tmdbId: String,
+        title: String,
+        year: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val number = episodeId.toIntOrNull() ?: return emptyList()
+        val ids = kotoEpisodeIds(tmdbId, title, year, isMovie, seasonId.toIntOrNull() ?: 1, number)
+            ?: return emptyList()
+        return kotoServers(ids)
+            .groupBy { it.audio }
+            .toList()
+            .parallelCatchingFlatMap { (audio, servers) -> kotoAudioVideos(audio, servers, subLimit) }
+    }
+
+    /** One server button of an episode, by audio. */
+    private class KotoServer(val audio: String, val name: String, val linkId: String)
+
+    private suspend fun kotoServers(episodeIds: String): List<KotoServer> {
+        // Sent as the site sends it, unencoded: the value is already URL-safe text.
+        val url = "$KOTO_ORIGIN/ajax/server/list".toHttpUrl().newBuilder()
+            .addEncodedQueryParameter("servers", episodeIds)
+            .build()
+        val html = client.newCall(GET(url.toString(), kotoAjaxHeaders)).awaitSuccess()
+            .parseAs<KotoHtmlDto>().result ?: return emptyList()
+        return Jsoup.parseBodyFragment(html).select(".type[data-type]").flatMap { block ->
+            val audio = kotoAudio(block.attr("data-type"))
+            block.select("li[data-link-id]").mapNotNull { item ->
+                val linkId = item.attr("data-link-id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                KotoServer(audio, item.text().trim(), linkId)
+            }
+        }
+    }
+
+    /** The site's audio groups, named as its own buttons name them: SUB and DUB. */
+    private fun kotoAudio(type: String): String = when {
+        type.startsWith("dub", ignoreCase = true) -> "Dub"
+        // "sub", "sub-1", "softsub" and "hsub" are all the Japanese audio.
+        type.contains("sub", ignoreCase = true) -> "Sub"
+        else -> type.replaceFirstChar { it.uppercase() }
+    }
+
+    /**
+     * Every distinct stream of one audio group. The servers of a group play the same MegaPlay
+     * file, so its page is read once per player path, and two servers that resolve to the same
+     * master playlist are listed once, under the first one's name.
+     */
+    private suspend fun kotoAudioVideos(audio: String, servers: List<KotoServer>, subLimit: Int): List<Video> {
+        val embeds = servers.parallelCatchingMapNotNull { server ->
+            val embed = client.newCall(
+                GET("$KOTO_ORIGIN/ajax/server?get=${server.linkId}", kotoAjaxHeaders),
+            ).awaitSuccess().parseAs<KotoServerDto>().result?.url?.toHttpUrlOrNull()
+            embed?.takeIf { it.queryParameter("s") !in KOTO_SKIPPED_CDNS }?.let { server to it }
+        }
+
+        val fileIds = embeds.map { (_, embed) -> megaPlayPage(embed) }.distinct()
+            .parallelCatchingMapNotNull { page -> megaPlayFileId(page)?.let { page to it } }
+            .toMap()
+
+        val streams = embeds.parallelCatchingMapNotNull { (server, embed) ->
+            val fileId = fileIds[megaPlayPage(embed)] ?: return@parallelCatchingMapNotNull null
+            megaPlayStream(embed, fileId)?.let { server to it }
+        }.distinctBy { (_, stream) -> stream.master }
+
+        return streams.parallelCatchingFlatMap { (server, stream) ->
+            val subtitles = if (subLimit <= 0) {
+                emptyList()
+            } else {
+                stream.tracks
+                    .filter { it.kind == null || it.kind == "captions" || it.kind == "subtitles" }
+                    .filter { it.file?.startsWith("http") == true }
+                    .sortedByDescending { it.default }
+                    .take(subLimit)
+                    .map { Track(it.file!!, it.label?.takeIf { label -> label.isNotBlank() } ?: "Unknown") }
+            }
+            // The CDN answers 403 without the player's Referer, and it must be the bare origin:
+            // a Referer naming the embed page is refused too.
+            val origin = "${stream.embed.scheme}://${stream.embed.host}"
+            val streamHeaders = headers.newBuilder()
+                .set("Referer", "$origin/")
+                .set("Origin", origin)
+                .build()
+            playlistUtils.extractFromHls(
+                playlistUrl = stream.master,
+                videoNameGen = { variant ->
+                    val height = LABEL_HEIGHT_REGEX.find(variant)?.value ?: "Auto"
+                    kotoLabel(audio, server.name, height, subtitles.size)
+                },
+                subtitleList = subtitles,
+                masterHeaders = streamHeaders,
+                videoHeaders = streamHeaders,
+            )
+        }
+    }
+
+    /** A MegaPlay player page without its CDN choice; `/videojs/` is only another skin. */
+    private fun megaPlayPage(embed: HttpUrl): String = embed.newBuilder().query(null).build().toString().replace("/videojs/", "/")
+
+    /** The file id the player page asks `/stream/getSources` for, which is not the one in its path. */
+    private suspend fun megaPlayFileId(page: String): String? {
+        val html = client.newCall(GET(page, headers.newBuilder().set("Referer", "$KOTO_ORIGIN/").build()))
+            .awaitSuccess().bodyString()
+        return Jsoup.parse(html).selectFirst("#megaplay-player[data-id]")?.attr("data-id")?.takeIf { it.isNotBlank() }
+    }
+
+    private class MegaPlayStream(val embed: HttpUrl, val master: String, val tracks: List<MegaPlayTrackDto>)
+
+    /** The stream the player would load for [embed]: its `s` picks the CDN, as the page's own rewrite does. */
+    private suspend fun megaPlayStream(embed: HttpUrl, fileId: String): MegaPlayStream? {
+        val url = "${embed.scheme}://${embed.host}/stream/getSources".toHttpUrl().newBuilder()
+            .addQueryParameter("id", fileId)
+            .apply { embed.queryParameter("s")?.let { addQueryParameter("s", it) } }
+            .build()
+        val sources = client.newCall(
+            GET(
+                url.toString(),
+                headers.newBuilder()
+                    .set("Accept", "application/json, text/javascript, */*; q=0.01")
+                    .set("X-Requested-With", "XMLHttpRequest")
+                    .set("Referer", embed.toString())
+                    .build(),
+            ),
+        ).awaitSuccess().parseAs<MegaPlaySourcesDto>()
+        val master = sources.enc?.let(MegaPlayCipher::decrypt)
+            ?.let { runCatching { it.parseAs<MegaPlayFileDto>() }.getOrNull() }
+            ?.file?.takeIf { it.startsWith("http") }
+            ?: return null
+        return MegaPlayStream(embed, master, sources.tracks)
+    }
+
+    private fun kotoLabel(audio: String, server: String, quality: String, subCount: Int): String = listOfNotNull(
+        "$KOTO_NAME/$audio",
+        server.takeIf { it.isNotBlank() },
+        quality,
+        "HLS",
+        "$subCount subs".takeIf { subCount > 0 },
+    ).joinToString(" · ")
+
+    /** One Anikoto `/filter` hit. */
+    private class KotoEntry(
+        val id: String,
+        // The English name first, then the romaji one.
+        val names: List<String>,
+        val type: String,
+        // The site's episode total, which it leaves blank while a season airs.
+        val total: Int?,
+        val released: Int,
+    ) {
+        /** The episodes a walk past this entry skips: its total, or what is out while it airs. */
+        val length: Int get() = total ?: released
+    }
+
+    /** A name cut down to the title it belongs to and the season, part and year it marks. */
+    private class KotoName(val base: String, val season: Int?, val part: Int?, val year: Int?)
+
+    /**
+     * The `data-ids` of the Anikoto episode a TMDB episode is, or null when the site has none.
+     *
+     * A film is the one-episode Movie entry named as TMDB names it, within a year of its release.
+     *
+     * A series is harder, because Anikoto lists every season and cour apart, as MyAnimeList
+     * does, while TMDB groups them as its editors chose: Frieren, Jujutsu Kaisen, Solo Leveling
+     * and Oshi no Ko put every cour in one "Season 1", One Piece and Naruto Shippuden cut one
+     * long Anikoto entry into arcs, and Returner's Magic, Slime and Vinland Saga split as the
+     * site does. So the franchise's TV entries are put in order by the season and part their
+     * names carry ([kotoName]), and the TMDB episode is counted along them:
+     *
+     *  - A later TMDB season starts at the entry marked with that season, if there is one.
+     *  - Otherwise, and when TMDB's earlier seasons already run past that entry (a "Season 1"
+     *    that took in Anikoto's first two seasons), the episode is numbered from the very
+     *    first, after every episode TMDB's earlier seasons hold.
+     *
+     * The count moves only from an entry to its next part or the next season's first, so a
+     * season the site names without a number (Demon Slayer's arcs, Attack on Titan's "Final
+     * Season") ends the walk and nothing is played rather than a later season's episode.
+     *
+     * Checked on 15 October 2026 against 23 TMDB episodes and films, each matched to the episode
+     * the site itself plays for it, from One Piece S23 (episode 1156) to Hunter x Hunter's 2011
+     * remake and Kaguya-sama's "Ultra Romantic"; Demon Slayer S2, Attack on Titan S4, Dr. Stone's
+     * "Stone Wars", the live-action One Piece and Breaking Bad matched nothing.
+     */
+    private suspend fun kotoEpisodeIds(
+        tmdbId: String,
+        title: String,
+        year: String,
+        isMovie: Boolean,
+        season: Int,
+        episode: Int,
+    ): String? = coroutineScope {
+        val earlierEpisodes = if (!isMovie && season > 1) async { tmdbEpisodesBefore(tmdbId, season) } else null
+        val entries = kotoSearch(title)
+        val wanted = kotoNormalise(title)
+        val wantedYear = year.take(4).toIntOrNull()
+
+        if (isMovie) {
+            val filmTitle = kotoFilmTitle(title)
+            val films = entries.filter { entry ->
+                entry.type.equals("Movie", ignoreCase = true) && entry.names.any { kotoFilmTitle(it) == filmTitle }
+            }
+            val film = kotoClosestInYear(films, wantedYear) ?: return@coroutineScope null
+            // A film the site splits into parts would play only its first, so it is left out.
+            return@coroutineScope kotoEpisodeList(film.id).singleOrNull()?.second
+        }
+
+        val shows = entries.filter { it.type.equals("TV", ignoreCase = true) || it.type.equals("ONA", ignoreCase = true) }
+        val parsed = shows.associateWith { entry -> entry.names.map(::kotoName) }
+        fun position(entry: KotoEntry): Pair<Int, Int> {
+            val names = parsed.getValue(entry)
+            return (names.firstNotNullOfOrNull { it.season } ?: 1) to (names.firstNotNullOfOrNull { it.part } ?: 1)
+        }
+
+        val first = kotoClosestInYear(
+            shows.filter { entry -> position(entry) == (1 to 1) && parsed.getValue(entry).any { it.base == wanted } },
+            wantedYear,
+        ) ?: return@coroutineScope null
+
+        // A sequel can be recognisable by its romaji name alone ("Dr. Stone 3rd Season" is
+        // "Dr. Stone: New World" in English), so the first season's names all count as the title.
+        val bases = parsed.getValue(first).map { it.base }.toSet() + wanted
+        val chain = mutableMapOf<Pair<Int, Int>, KotoEntry>(1 to 1 to first)
+        shows.filter { it !== first && parsed.getValue(it).any { name -> name.base in bases } }
+            .forEach { chain.getOrPut(position(it)) { it } }
+
+        fun next(at: Pair<Int, Int>): Pair<Int, Int>? = listOf(at.first to at.second + 1, at.first + 1 to 1).firstOrNull { it in chain }
+
+        /** How many episodes come before [target] along the chain, or null if it cannot be reached. */
+        fun episodesBefore(target: Pair<Int, Int>): Int? {
+            var at = 1 to 1
+            var count = 0
+            while (at != target) {
+                count += chain.getValue(at).length
+                at = next(at) ?: return null
+            }
+            return count
+        }
+
+        val earlier = earlierEpisodes?.await()
+        val direct = (season to 1).takeIf { season > 1 && it in chain }
+        var at: Pair<Int, Int>
+        var index: Int
+        val directStart = direct?.let(::episodesBefore)
+        if (direct != null && (earlier == null || directStart == null || earlier < directStart + chain.getValue(direct).length)) {
+            at = direct
+            index = episode
+        } else {
+            at = 1 to 1
+            index = (if (season > 1) earlier ?: return@coroutineScope null else 0) + episode
+        }
+
+        while (true) {
+            val entry = chain.getValue(at)
+            if (entry.total == null || index <= entry.total) break
+            index -= entry.total
+            at = next(at) ?: return@coroutineScope null
+        }
+
+        kotoEpisodeList(chain.getValue(at).id).firstOrNull { (number, _) -> number == index.toDouble() }?.second
+    }
+
+    /** TMDB's episode count over the seasons before [season], or null when it cannot be read. */
+    private suspend fun tmdbEpisodesBefore(tmdbId: String, season: Int): Int? = runCatching {
+        val url = "$TMDB_API_BASE/tv/$tmdbId".toHttpUrl().newBuilder()
+            .addQueryParameter("api_key", Rentaro.TMDB_API_KEY)
+            .build()
+        client.newCall(GET(url.toString())).awaitSuccess().parseAs<TvDetailDto>()
+            .seasons.filter { it.seasonNumber in 1 until season }
+            .sumOf { it.episodeCount }
+    }.getOrNull()
+
+    /** The site's `/filter` results for [title], in its order. */
+    private suspend fun kotoSearch(title: String): List<KotoEntry> {
+        // Brackets and accents keep the site's search from finding "【OSHI NO KO】" or "Shippūden".
+        val keyword = Normalizer.normalize(title, Normalizer.Form.NFD)
+            .replace(KOTO_LATIN_MARK_REGEX, "")
+            .replace(KOTO_QUERY_NOISE_REGEX, " ")
+            .replace(KISS_WHITESPACE_REGEX, " ")
+            .trim()
+        val url = "$KOTO_ORIGIN/filter".toHttpUrl().newBuilder()
+            .addQueryParameter("keyword", keyword)
+            .build()
+        val html = client.newCall(GET(url.toString(), headers)).awaitSuccess().bodyString()
+        return Jsoup.parse(html).select("#list-items .item").mapNotNull { item ->
+            val id = item.selectFirst("[data-tip]")?.attr("data-tip")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = item.selectFirst(".name.d-title") ?: return@mapNotNull null
+            fun count(selector: String) = item.selectFirst(selector)?.text()?.trim()?.toIntOrNull()
+            KotoEntry(
+                id = id,
+                names = listOf(name.text(), name.attr("data-jp")).filter { it.isNotBlank() }.distinct(),
+                type = item.selectFirst(".meta .right")?.text()?.trim().orEmpty(),
+                total = count(".ep-status.total span"),
+                released = maxOf(count(".ep-status.sub span") ?: 0, count(".ep-status.dub span") ?: 0),
+            )
+        }
+    }
+
+    /**
+     * Of [entries], the one whose year is nearest [year] and within one of it, or null.
+     *
+     * Hunter x Hunter (1999 and 2011) and Fruits Basket (2001 and 2019) share their names, and a
+     * live-action One Piece shares the anime's, so the year decides. It comes from the name when
+     * it carries one, "(2011)", and otherwise from the site's tooltip.
+     */
+    private suspend fun kotoClosestInYear(entries: List<KotoEntry>, year: Int?): KotoEntry? {
+        if (entries.isEmpty()) return null
+        if (year == null) return entries.first()
+        return entries.parallelCatchingMapNotNull { entry ->
+            val released = entry.names.firstNotNullOfOrNull { kotoName(it).year } ?: kotoYear(entry.id)
+            released?.takeIf { abs(it - year) <= 1 }?.let { entry to abs(it - year) }
+        }.minByOrNull { (_, distance) -> distance }?.first
+    }
+
+    private suspend fun kotoYear(id: String): Int? {
+        val html = client.newCall(GET("$KOTO_ORIGIN/ajax/anime/tooltip/$id", kotoAjaxHeaders))
+            .awaitSuccess().bodyString()
+        return KOTO_TOOLTIP_YEAR_REGEX.find(html)?.groupValues?.get(1)?.toIntOrNull()
+    }
+
+    /** An entry's episodes as (number, `data-ids`), in the site's order. */
+    private suspend fun kotoEpisodeList(id: String): List<Pair<Double, String>> {
+        val html = client.newCall(GET("$KOTO_ORIGIN/ajax/episode/list/$id", kotoAjaxHeaders))
+            .awaitSuccess().parseAs<KotoHtmlDto>().result ?: return emptyList()
+        return Jsoup.parseBodyFragment(html).select("a[data-num][data-ids]").mapNotNull { link ->
+            val number = link.attr("data-num").toDoubleOrNull() ?: return@mapNotNull null
+            number to link.attr("data-ids").takeIf { it.isNotBlank() }.orEmpty()
+        }.filter { (_, ids) -> ids.isNotEmpty() }
+    }
+
+    /**
+     * Splits an Anikoto name into its title, season and part: "Season 2", "2nd Season" or a
+     * trailing "II"; "Part 2", ", Part 2" or "(Part 2)"; a "(2011)" year and a "(TV)" tag
+     * are dropped. Whatever follows the first marker is a subtitle ("Solo Leveling Season 2:
+     * Arise from the Shadow") and is not part of the title.
+     */
+    private fun kotoName(name: String): KotoName {
+        val year = KOTO_YEAR_REGEX.find(name)?.groupValues?.get(1)?.toIntOrNull()
+        val text = name.replace(KOTO_YEAR_REGEX, " ").replace(KOTO_TV_TAG_REGEX, " ").trim()
+
+        val seasonMatch = KOTO_SEASON_REGEX.find(text)
+        val romanMatch = if (seasonMatch == null) KOTO_ROMAN_SEASON_REGEX.find(text) else null
+        val partMatch = KOTO_PART_REGEX.find(text)
+        val season = seasonMatch?.groupValues?.drop(1)?.firstNotNullOfOrNull { it.toIntOrNull() }
+            ?: romanMatch?.let { KOTO_ROMAN_NUMERALS[it.groupValues[1]] }
+        val cut = listOfNotNull(seasonMatch, romanMatch, partMatch).minOfOrNull { it.range.first } ?: text.length
+
+        return KotoName(kotoNormalise(text.substring(0, cut)), season, partMatch?.groupValues?.get(1)?.toIntOrNull(), year)
+    }
+
+    /** A film's name without a "(2016)" year or the "Movie" the site often ends one with. */
+    private fun kotoFilmTitle(name: String): String = kotoNormalise(name.replace(KOTO_YEAR_REGEX, " ").trim().replace(KOTO_MOVIE_TAIL_REGEX, ""))
+
+    /**
+     * Lowercase letters and digits only, accents dropped: TMDB's "Dan Da Dan", "SPY x FAMILY"
+     * and "Naruto Shippūden" are the site's "Dandadan", "Spy x Family" and "Naruto: Shippuden".
+     */
+    private fun kotoNormalise(value: String): String = Normalizer.normalize(value, Normalizer.Form.NFD)
+        .lowercase()
+        .replace("&", "and")
+        .filter { it.isLetterOrDigit() }
 
     // ======================== VidLove (Yoru) backend ========================
 
@@ -3178,6 +3581,44 @@ class RentaroExtractor(
         private const val KISS_SUBTITLE_PREFIX = "rentaro-kiss-"
         private const val KISS_SUBTITLE_TTL_MS = 24 * 60 * 60 * 1000L
 
+        // Anikoto (anikototv.to) is an anime-only catalogue with its own ids; every server it
+        // offers plays through MegaPlay, whose sources are sealed by [MegaPlayCipher].
+        private const val KOTO_NAME = "Koto"
+        private const val KOTO_ORIGIN = "https://anikototv.to"
+
+        /** MegaPlay CDN choices not listed: `tcdn` (HD-1) wraps its segments in PNG. */
+        private val KOTO_SKIPPED_CDNS = setOf("tcdn")
+
+        /** "(2011)" in an Anikoto name. */
+        private val KOTO_YEAR_REGEX = Regex("""\((\d{4})\)""")
+
+        /** The "(TV)" that tells "Jujutsu Kaisen (TV)" from its film. */
+        private val KOTO_TV_TAG_REGEX = Regex("""\(TV\)""", RegexOption.IGNORE_CASE)
+
+        /** "Season 2", "Season 03" or "2nd Season". */
+        private val KOTO_SEASON_REGEX =
+            Regex("""\bSeason\s*0*(\d+)\b|\b(\d+)(?:st|nd|rd|th)\s+Season\b""", RegexOption.IGNORE_CASE)
+
+        /** A trailing "II" to "IV", as in "Mob Psycho 100 II". Upper case only, so a word never reads as one. */
+        private val KOTO_ROMAN_SEASON_REGEX = Regex("""\s(II|III|IV)\s*$""")
+        private val KOTO_ROMAN_NUMERALS = mapOf("II" to 2, "III" to 3, "IV" to 4)
+
+        /** "Part 2" or "Cour 2", bare, after a comma or in brackets. */
+        private val KOTO_PART_REGEX = Regex("""\b(?:Part|Cour)\s*(\d+)\b""", RegexOption.IGNORE_CASE)
+
+        /** The "Movie" or "The Movie" ending a film's name: "Jujutsu Kaisen 0 Movie". */
+        private val KOTO_MOVIE_TAIL_REGEX = Regex("""\s*(?:the\s+)?movie\s*$""", RegexOption.IGNORE_CASE)
+
+        private val KOTO_TOOLTIP_YEAR_REGEX = Regex("""Year\s*:\s*</span>\s*<span>\s*(\d{4})""")
+
+        /** An accent left on a Latin letter once the title is decomposed. */
+        private val KOTO_LATIN_MARK_REGEX = Regex("""(?<=\p{IsLatin})\p{Mn}+""")
+
+        /** Characters the site's search does not match on, such as the brackets of "【OSHI NO KO】". */
+        private val KOTO_QUERY_NOISE_REGEX = Regex("""[^\p{L}\p{N}\s':.,!?&-]""")
+
+        private const val TMDB_API_BASE = "https://api.themoviedb.org/3"
+
         private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
 
         /**
@@ -3722,6 +4163,7 @@ class RentaroExtractor(
             VIDLOVE_NAME,
             SCREENSCAPE_NAME,
             KISS_NAME,
+            KOTO_NAME,
         )
 
         /**
@@ -3748,6 +4190,7 @@ class RentaroExtractor(
             VIDLOVE_NAME -> "Original"
             SCREENSCAPE_NAME -> "Multi-Lang"
             KISS_NAME -> "Original"
+            KOTO_NAME -> "Sub/Dub"
             else -> "Unknown"
         }
     }

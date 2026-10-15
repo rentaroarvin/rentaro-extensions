@@ -117,6 +117,8 @@ data class SeasonDto(
     val name: String,
     @SerialName("season_number")
     val seasonNumber: Int,
+    @SerialName("episode_count")
+    val episodeCount: Int = 0,
 )
 
 // =========================== TV Season Detail ===========================
@@ -602,4 +604,47 @@ data class KissSubtitleDto(
     val src: String? = null,
     val label: String? = null,
     val default: Boolean = false,
+)
+
+// ============================== Anikoto DTOs ==============================
+
+/** An Anikoto `ajax/...` reply whose result is an HTML fragment. */
+@Serializable
+data class KotoHtmlDto(
+    val status: Int? = null,
+    val result: String? = null,
+)
+
+/** `ajax/server?get=`: the embed a server plays from. */
+@Serializable
+data class KotoServerDto(
+    val status: Int? = null,
+    val result: KotoServerResultDto? = null,
+)
+
+@Serializable
+data class KotoServerResultDto(
+    val url: String? = null,
+)
+
+/** MegaPlay's `/stream/getSources`. The stream is sealed in `enc`; see [MegaPlayCipher]. */
+@Serializable
+data class MegaPlaySourcesDto(
+    val enc: String? = null,
+    val tracks: List<MegaPlayTrackDto> = emptyList(),
+)
+
+@Serializable
+data class MegaPlayTrackDto(
+    val file: String? = null,
+    val label: String? = null,
+    // "captions" for subtitles; a thumbnail sprite track would be "thumbnails".
+    val kind: String? = null,
+    val default: Boolean = false,
+)
+
+/** What [MegaPlayCipher] opens `enc` into. */
+@Serializable
+data class MegaPlayFileDto(
+    val file: String? = null,
 )
