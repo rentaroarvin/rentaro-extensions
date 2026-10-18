@@ -648,3 +648,32 @@ data class MegaPlayTrackDto(
 data class MegaPlayFileDto(
     val file: String? = null,
 )
+
+// ============================= VidSrc.pm DTOs =============================
+
+/** `vidsrc.pm/api/vidora/v1/...`: what one of its upstream sources answers. */
+@Serializable
+data class PulseResponseDto(
+    val result: Boolean = false,
+    val sources: List<PulseSourceDto>? = null,
+)
+
+@Serializable
+data class PulseSourceDto(
+    val url: String? = null,
+    val tracks: List<PulseTrackDto>? = null,
+    // Progressive files only: the heights the one URL above is also offered in.
+    val qualities: List<PulseQualityDto>? = null,
+)
+
+@Serializable
+data class PulseTrackDto(
+    val label: String? = null,
+    val file: String? = null,
+)
+
+@Serializable
+data class PulseQualityDto(
+    val height: Int? = null,
+    val url: String? = null,
+)

@@ -155,12 +155,13 @@ class RentaroExtractor(
         val screenscapeEnabled = SCREENSCAPE_NAME in enabledServers
         val kissEnabled = KISS_NAME in enabledServers
         val kotoEnabled = KOTO_NAME in enabledServers
+        val pulseEnabled = PULSE_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
             !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled &&
-            !kotoEnabled
+            !kotoEnabled && !pulseEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -327,6 +328,19 @@ class RentaroExtractor(
                 } else {
                     try {
                         kotoVideos(tmdbId, title, year, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // VidSrc.pm answers in plain JSON behind one fixed key; each upstream source is asked
+            // for separately, so one that is down cannot hide the rest.
+            {
+                if (!pulseEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        pulseVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -1986,6 +2000,173 @@ class RentaroExtractor(
         .replace("&", "and")
         .filter { it.isLetterOrDigit() }
 
+    // ======================== VidSrc.pm (Pulse) backend =======================
+
+    private val pulseApiHeaders: Headers
+        get() = headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Referer", "$PULSE_ORIGIN/")
+            .set("x-player-key", PULSE_PLAYER_KEY)
+            .build()
+
+    /** The relays answer 403 to a request that does not name the site, and some also want its Origin. */
+    private val pulseStreamHeaders: Headers
+        get() = headers.newBuilder()
+            .set("Referer", "$PULSE_ORIGIN/")
+            .set("Origin", PULSE_ORIGIN)
+            .build()
+
+    /**
+     * VidSrc.pm (the "Vidflix" player) is plain JSON behind one fixed key: its player asks
+     * `/api/vidora/v1/...?source=` for one upstream at a time and plays the first that answers.
+     * Every source in [PULSE_SOURCES] is asked here, in parallel, and each is listed as its own
+     * "Pulse/<name>" group.
+     *
+     * Checked on 18 October 2026 on Fight Club, Breaking Bad S1E1 and Spider-Man: Brand New Day,
+     * following each stream to its first segment with the headers below: Oreon and Nebula played
+     * on all three and Spider on Spider-Man only (its API answers 502 for episodes and its Fight
+     * Club playlist 404). Alpha played on all three at one run or another, but its relay is rate
+     * limited and answers 429 or 503 now and then, so its rows come and go. Two sources are left
+     * out. Beta's variant playlists came back as an HTML page on Fight Club and Breaking Bad, and
+     * Quasar answered 502, at its API or its segments, on each title in the last check. A source
+     * that answers nothing, or whose playlist does not load, costs only its own rows.
+     */
+    private suspend fun pulseVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val path = if (isMovie) "movie/$tmdbId" else "tv/$tmdbId/$seasonId/$episodeId"
+        return PULSE_SOURCES.parallelCatchingFlatMap { source -> pulseSource(source, path, subLimit) }
+    }
+
+    private suspend fun pulseSource(source: PulseSource, path: String, subLimit: Int): List<Video> {
+        val url = "$PULSE_API_BASE/$path".toHttpUrl().newBuilder()
+            .addQueryParameter("source", source.key)
+            .build()
+        val reply = client.newCall(GET(url.toString(), pulseApiHeaders)).awaitSuccess().parseAs<PulseResponseDto>()
+        val stream = reply.sources?.firstOrNull()?.takeIf { reply.result }
+        val mediaUrl = stream?.url?.takeIf { it.startsWith("http") } ?: return emptyList()
+
+        val subtitles = if (subLimit <= 0) {
+            emptyList()
+        } else {
+            stream.tracks.orEmpty()
+                .filter { it.file?.startsWith("http") == true }
+                .sortedByDescending { it.label.equals("English", ignoreCase = true) }
+                .take(subLimit)
+                .map { Track(it.file!!, it.label?.takeIf { label -> label.isNotBlank() } ?: "Unknown") }
+        }
+
+        // The relays name the playlist twice in the URL (`...master.m3u8&...&type=/index.m3u8`);
+        // a file is the one thing they carry without it.
+        if (".m3u8" in mediaUrl.lowercase()) {
+            return hlsRows(mediaUrl, pulseStreamHeaders, subtitles) { height ->
+                pulseLabel(source.label, height, "HLS", hevc = false, subCount = subtitles.size)
+            }
+        }
+
+        // A file comes with its other heights, the first of which repeats the main URL.
+        val files = stream.qualities.orEmpty()
+            .mapNotNull { quality ->
+                val file = quality.url?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+                (quality.height ?: 0) to file
+            }
+            .sortedByDescending { (height, _) -> height }
+            .ifEmpty { listOf(0 to mediaUrl) }
+
+        return files.map { (height, file) ->
+            Video(
+                url = file,
+                quality = pulseLabel(
+                    source.label,
+                    if (height > 0) "${height}p" else "Auto",
+                    "MP4",
+                    hevc = source.hevc,
+                    subCount = subtitles.size,
+                ),
+                videoUrl = file,
+                headers = pulseStreamHeaders,
+                subtitleTracks = subtitles,
+            )
+        }
+    }
+
+    /**
+     * The rows of one HLS stream, or none when the URL does not answer with a playlist.
+     *
+     * The playlist is read here first because [PlaylistUtils] takes any answer for one: a relay asked
+     * too often answers 429 "upstream error", and an API can name a stream for a title it does not
+     * carry (the page behind it is a 404). Either would be listed as a stream that cannot play. Only
+     * a positive answer drops a stream, and only the head is read, since a media playlist of a film
+     * can take a relay ten seconds to produce in full.
+     *
+     * [label] turns a height ("720p", or "Auto" when the playlist names none) into the row's name.
+     */
+    private suspend fun hlsRows(
+        url: String,
+        streamHeaders: Headers,
+        subtitles: List<Track>,
+        label: (String) -> String,
+    ): List<Video> {
+        val head = try {
+            client.newCall(GET(url, streamHeaders)).awaitSuccess().use { it.peekBody(HLS_HEAD_BYTES).string() }
+        } catch (_: HttpException) {
+            return emptyList()
+        } catch (_: IOException) {
+            return emptyList()
+        }
+        if (!head.trimStart().startsWith("#EXTM3U")) return emptyList()
+
+        // A media playlist is one stream of unknown height, which the probe in [withResolutions] fills in.
+        if ("#EXT-X-STREAM-INF" !in head) {
+            return listOf(
+                Video(
+                    url = url,
+                    quality = label("Auto"),
+                    videoUrl = url,
+                    headers = streamHeaders,
+                    subtitleTracks = subtitles,
+                ),
+            )
+        }
+
+        // The master is fetched again here. If that second answer is not a playlist, the library
+        // returns the master's own URL as a stream, which no variant of a real master ever is.
+        return runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = url,
+                videoNameGen = { variant -> label(hlsHeightLabel(variant)) },
+                subtitleList = subtitles,
+                masterHeaders = streamHeaders,
+                videoHeaders = streamHeaders,
+            )
+        }.getOrDefault(emptyList()).filterNot { it.url == url }
+    }
+
+    /**
+     * The height class of an HLS variant as [PlaylistUtils] names it ("480p (1280x534) - 2.3 MB/s"),
+     * taken from the frame size it carries. The library rounds the height alone to a standard one,
+     * which calls a letterboxed 1280x534 stream 480p and a 1920x800 one 720p.
+     */
+    private fun hlsHeightLabel(variant: String): String {
+        val size = FRAME_SIZE_REGEX.find(variant)
+        if (size == null) return LABEL_HEIGHT_REGEX.find(variant)?.value ?: "Auto"
+        val height = StreamProbe.heightClass(size.groupValues[1].toInt(), size.groupValues[2].toInt())
+        return if (height >= 2160) "4K" else "${height}p"
+    }
+
+    /** HEVC is named because many phones lack a decoder for it, so a failure reads as the device. */
+    private fun pulseLabel(source: String, quality: String, container: String, hevc: Boolean, subCount: Int): String = listOfNotNull(
+        "$PULSE_NAME/$source",
+        quality,
+        container,
+        "HEVC".takeIf { hevc },
+        "$subCount subs".takeIf { subCount > 0 },
+    ).joinToString(" · ")
+
     // ======================== VidLove (Yoru) backend ========================
 
     /** One upstream exposed by VidLove under its own source selector. */
@@ -3617,6 +3798,33 @@ class RentaroExtractor(
         /** Characters the site's search does not match on, such as the brackets of "【OSHI NO KO】". */
         private val KOTO_QUERY_NOISE_REGEX = Regex("""[^\p{L}\p{N}\s':.,!?&-]""")
 
+        // VidSrc.pm (vidsrc.pm) is a plain-JSON aggregate of upstream sources, served from one origin.
+        private const val PULSE_NAME = "Pulse"
+        private const val PULSE_ORIGIN = "https://vidsrc.pm"
+        private const val PULSE_API_BASE = "$PULSE_ORIGIN/api/vidora/v1"
+
+        /**
+         * Sent as `x-player-key`. A constant in the player bundle (`/assets/main-*.js`, the
+         * 64-hex string beside the `fetch("/api/vidora...")` calls), so it moves with a rebuild
+         * of the site: the symptom is every source answering 401 "Unauthorized".
+         */
+        private const val PULSE_PLAYER_KEY = "f3b72e73c80c9a996574379798703796a1936efa3516a7105cb0e43048b46b5a"
+
+        /**
+         * @param hevc whether the files it serves are H.265. Decided per source because the URL cannot
+         *   say: Oreon's 360p file sits under `/bt/` rather than `/resource/h265/` and is HEVC too.
+         */
+        private class PulseSource(val key: String, val label: String, val hevc: Boolean = false)
+
+        /** The sources named as the site's own server menu names them, `key` being what `?source=` takes. */
+        private val PULSE_SOURCES = listOf(
+            PulseSource("scrapify", "Alpha"),
+            // ffprobe on Fight Club's three files: hevc 1280x532, hevc 640x266, hevc 870x360.
+            PulseSource("oreon", "Oreon", hevc = true),
+            PulseSource("fsonic", "Nebula"),
+            PulseSource("lookmovie", "Spider"),
+        )
+
         private const val TMDB_API_BASE = "https://api.themoviedb.org/3"
 
         private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
@@ -3820,6 +4028,9 @@ class RentaroExtractor(
         /** A height such as "720p" or "1080P" in one label segment. */
         private val LABEL_HEIGHT_REGEX = Regex("""(?<!\d)\d{3,4}p\b""", RegexOption.IGNORE_CASE)
 
+        /** The "1280x534" an HLS variant name carries. */
+        private val FRAME_SIZE_REGEX = Regex("""(\d{3,5})[xX](\d{3,5})""")
+
         private val SIGNED_EXPIRY_REGEX = Regex("""[?&]expires?=(\d{10,13})(?:&|$)""", RegexOption.IGNORE_CASE)
 
         /** VidHide mirrors 4k-bk links as player pages rather than files. */
@@ -3843,6 +4054,9 @@ class RentaroExtractor(
         private const val VIDHIDE_PROBE_TIMEOUT_SECONDS = 12L
 
         private const val HLS_PROBE_BYTES = 64L
+
+        /** Enough of a playlist to tell a master from a media playlist: a master is far smaller. */
+        private const val HLS_HEAD_BYTES = 32L * 1024
 
         /** The hubcloud /drive/ link on a hubdrive /file/ page; absent when the file is gone. */
         private val HUBDRIVE_CLOUD_LINK_REGEX = Regex("""href="(https?://[^"]*hubcloud\.[a-z]+/drive/[A-Za-z0-9]+)"""")
@@ -4164,6 +4378,7 @@ class RentaroExtractor(
             SCREENSCAPE_NAME,
             KISS_NAME,
             KOTO_NAME,
+            PULSE_NAME,
         )
 
         /**
@@ -4191,6 +4406,7 @@ class RentaroExtractor(
             SCREENSCAPE_NAME -> "Multi-Lang"
             KISS_NAME -> "Original"
             KOTO_NAME -> "Sub/Dub"
+            PULSE_NAME -> "Original"
             else -> "Unknown"
         }
     }
