@@ -731,3 +731,39 @@ data class HaruSubtitleDto(
     val lang: String? = null,
     val url: String? = null,
 )
+
+// ============================ ZxcStream DTOs ============================
+
+/** `/backend/fucku`: the token a sources request is made under. */
+@Serializable
+data class FluxTokenDto(
+    val token: String? = null,
+    // Milliseconds. Read as a primitive so a number and a quoted number are both taken.
+    val ts: JsonPrimitive? = null,
+)
+
+/** `/backend_/sources/<server>`. Each link is sealed; see [ZxcCipher]. */
+@Serializable
+data class FluxSourcesDto(
+    val success: Boolean = false,
+    val links: List<FluxLinkDto>? = null,
+)
+
+@Serializable
+data class FluxLinkDto(
+    val type: String? = null,
+    val link: String? = null,
+    // The height, as a number or a quoted one; absent or 0 for a stream that names none.
+    val resolution: JsonPrimitive? = null,
+)
+
+@Serializable
+data class FluxCaptionsDto(
+    val captions: List<FluxCaptionDto>? = null,
+)
+
+@Serializable
+data class FluxCaptionDto(
+    val display: String? = null,
+    val file: String? = null,
+)

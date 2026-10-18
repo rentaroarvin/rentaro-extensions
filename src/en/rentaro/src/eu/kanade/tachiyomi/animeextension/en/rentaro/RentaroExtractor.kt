@@ -162,12 +162,13 @@ class RentaroExtractor(
         val kotoEnabled = KOTO_NAME in enabledServers
         val pulseEnabled = PULSE_NAME in enabledServers
         val haruEnabled = HARU_NAME in enabledServers
+        val fluxEnabled = FLUX_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
             !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled &&
-            !kotoEnabled && !pulseEnabled && !haruEnabled
+            !kotoEnabled && !pulseEnabled && !haruEnabled && !fluxEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -360,6 +361,19 @@ class RentaroExtractor(
                 } else {
                     try {
                         haruVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // ZxcStream mints a token per server and answers with sealed links; it is matched on title
+            // and year as well as the TMDB id, which its backend wants in the request.
+            {
+                if (!fluxEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        fluxVideos(tmdbId, title, year, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -2123,11 +2137,13 @@ class RentaroExtractor(
      * can take a relay ten seconds to produce in full.
      *
      * [label] turns a height ("720p", or "Auto" when the playlist names none) into the row's name.
+     * [hinted] marks a media playlist whose URL carries no `.m3u8`, as [hlsHintedUrl] does.
      */
     private suspend fun hlsRows(
         url: String,
         streamHeaders: Headers,
         subtitles: List<Track>,
+        hinted: Boolean = false,
         label: (String) -> String,
     ): List<Video> {
         val head = try {
@@ -2141,11 +2157,12 @@ class RentaroExtractor(
 
         // A media playlist is one stream of unknown height, which the probe in [withResolutions] fills in.
         if ("#EXT-X-STREAM-INF" !in head) {
+            val playable = if (hinted) hlsHintedUrl(url) ?: url else url
             return listOf(
                 Video(
-                    url = url,
+                    url = playable,
                     quality = label("Auto"),
-                    videoUrl = url,
+                    videoUrl = playable,
                     headers = streamHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -2336,6 +2353,165 @@ class RentaroExtractor(
     private fun haruLabel(height: String, subCount: Int): String = listOfNotNull(
         HARU_NAME,
         height,
+        "HLS",
+        "$subCount subs".takeIf { subCount > 0 },
+    ).joinToString(" · ")
+
+    // ==================== ZxcStream (Flux) backend =====================
+
+    /** What a ZxcStream request names: the title, and for an episode its season and episode. */
+    private class FluxMedia(
+        val tmdbId: String,
+        val title: String,
+        val year: String,
+        val season: Int?,
+        val episode: Int?,
+    ) {
+        val type = if (season == null || episode == null) "movie" else "tv"
+
+        /** The page the browser would be on; the backend checks the Origin and is happy with this Referer. */
+        val referer = if (type == "movie") "$FLUX_ORIGIN/player/movie/$tmdbId" else "$FLUX_ORIGIN/player/tv/$tmdbId/$season/$episode"
+    }
+
+    private class FluxToken(val value: String, val timestamp: String)
+
+    private class FluxLink(val server: String, val url: String, val height: Int?)
+
+    private fun fluxHeaders(media: FluxMedia): Headers = headers.newBuilder()
+        .set("Accept", "application/json, text/plain, */*")
+        .set("Origin", FLUX_ORIGIN)
+        .set("Referer", media.referer)
+        .build()
+
+    /**
+     * ZxcStream wants a token for each server, minted from the title alone, and a request that names the
+     * title again: every field has a hex name (see [ZxcCipher]) and none is checked against the title, but
+     * a blank one is refused. It has no release date to give, so the year stands in as 1 January. The
+     * reply's links are sealed, and each opens to a media playlist, served bare: no Referer, Origin or
+     * cookie was needed on the playlists or their segments.
+     *
+     * Checked on 18 October 2026 on seven titles (films, series and anime, with a colon, an ampersand and
+     * an accent among the names), following every playlist to media bytes: Alatreon (two playlists of
+     * different encodes on rotating workers.dev hosts, segments with no file extension) and Daedalus (one
+     * playlist, signed for about three hours, segments named `.jpg` that are MPEG-TS) played on every
+     * title they answered for. Each answered 404 "no streams" for one of them (Daedalus for Spider-Man:
+     * Brand New Day, Alatreon for Amélie), which costs only its own rows. The first, middle and last
+     * segments were read for three of the titles. Segment names like these are ones FFmpeg refuses unless
+     * told `extension_picky 0`, as with Koto, Dave and Jay; whether the app's player does is untested.
+     */
+    private suspend fun fluxVideos(
+        tmdbId: String,
+        title: String,
+        year: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        if (title.isBlank() || year.isBlank()) return emptyList()
+        val media = FluxMedia(
+            tmdbId = tmdbId,
+            title = title,
+            year = year,
+            season = if (isMovie) null else seasonId.toIntOrNull(),
+            episode = if (isMovie) null else episodeId.toIntOrNull(),
+        )
+        if (!isMovie && (media.season == null || media.episode == null)) return emptyList()
+
+        return coroutineScope {
+            val subtitles = async { fluxSubtitles(media, subLimit) }
+            val links = FLUX_SERVERS.parallelCatchingFlatMap { server -> fluxLinks(server, media) }
+            val tracks = subtitles.await()
+            links.parallelCatchingFlatMap { link ->
+                hlsRows(link.url, headers, tracks, hinted = true) { height ->
+                    fluxLabel(link.server, link.height?.let { "${it}p" } ?: height, tracks.size)
+                }
+            }
+        }
+    }
+
+    /** The HLS links [server] gives for [media], opened. Empty when it has none for the title. */
+    private suspend fun fluxLinks(server: FluxServer, media: FluxMedia): List<FluxLink> {
+        val token = fluxToken(server.key, media) ?: return emptyList()
+        val url = fluxUrl("$FLUX_ORIGIN/backend_/sources/${server.key}", server.key, token, media)
+        val reply = client.newCall(GET(url.toString(), fluxHeaders(media))).awaitSuccess().parseAs<FluxSourcesDto>()
+        if (!reply.success) return emptyList()
+
+        return reply.links.orEmpty()
+            .filter { it.type.equals("hls", ignoreCase = true) }
+            .mapNotNull { link ->
+                val opened = link.link?.let(ZxcCipher::decryptLink) ?: return@mapNotNull null
+                FluxLink(server.label, opened, link.resolution?.contentOrNull?.toIntOrNull()?.takeIf { it > 0 })
+            }
+            // A server repeats one URL under each resolution it lists.
+            .distinctBy { it.url }
+    }
+
+    /** The captions the site lists for [media], English first. Never throws: subtitles are not worth a row. */
+    private suspend fun fluxSubtitles(media: FluxMedia, subLimit: Int): List<Track> {
+        if (subLimit <= 0) return emptyList()
+        return try {
+            val token = fluxToken(FLUX_SUBTITLE_PATH, media) ?: return emptyList()
+            val url = fluxUrl("$FLUX_SUBTITLE_ORIGIN/backend/subtitle", FLUX_SUBTITLE_PATH, token, media)
+            client.newCall(GET(url.toString(), fluxHeaders(media))).awaitSuccess().parseAs<FluxCaptionsDto>()
+                .captions.orEmpty()
+                .filter { it.file?.startsWith("http") == true }
+                .sortedByDescending { it.display.equals("English", ignoreCase = true) }
+                .take(subLimit)
+                .map { Track(it.file!!, it.display?.takeIf { display -> display.isNotBlank() } ?: "Unknown") }
+        } catch (_: HttpException) {
+            emptyList()
+        } catch (_: IOException) {
+            emptyList()
+        } catch (_: SerializationException) {
+            emptyList()
+        }
+    }
+
+    /** `/backend/fucku`: the token for [path] (a server or [FLUX_SUBTITLE_PATH]). It answers empty now and then, so twice. */
+    private suspend fun fluxToken(path: String, media: FluxMedia): FluxToken? {
+        val body = buildJsonObject {
+            put(ZxcCipher.ID, media.tmdbId)
+            put(ZxcCipher.MEDIA_TYPE, media.type)
+            put(ZxcCipher.PATH, path)
+            media.season?.let { put(ZxcCipher.SEASON, it) }
+            media.episode?.let { put(ZxcCipher.EPISODE, it) }
+        }.toString().toRequestBody(JSON_MEDIA_TYPE)
+
+        repeat(FLUX_TOKEN_ATTEMPTS) {
+            val reply = try {
+                client.newCall(POST("$FLUX_ORIGIN/backend/fucku", fluxHeaders(media), body)).awaitSuccess().parseAs<FluxTokenDto>()
+            } catch (_: HttpException) {
+                null
+            } catch (_: IOException) {
+                null
+            } catch (_: SerializationException) {
+                null
+            }
+            val token = reply?.token?.takeIf { it.isNotBlank() }
+            val timestamp = reply?.ts?.contentOrNull?.takeIf { it.isNotBlank() }
+            if (token != null && timestamp != null) return FluxToken(token, timestamp)
+        }
+        return null
+    }
+
+    /** [base] with every field the backend reads; the token is the one minted for [path]. */
+    private fun fluxUrl(base: String, path: String, token: FluxToken, media: FluxMedia): HttpUrl = base.toHttpUrl().newBuilder().apply {
+        addQueryParameter(ZxcCipher.ID, media.tmdbId)
+        addQueryParameter(ZxcCipher.PATH, path)
+        addQueryParameter(ZxcCipher.MEDIA_TYPE, media.type)
+        addQueryParameter(ZxcCipher.TIMESTAMP, token.timestamp)
+        addQueryParameter(ZxcCipher.TICKET, token.value)
+        addQueryParameter(ZxcCipher.TITLE, media.title)
+        addQueryParameter(ZxcCipher.YEAR, media.year)
+        addQueryParameter(ZxcCipher.DATE, "${media.year}-01-01")
+        media.season?.let { addQueryParameter(ZxcCipher.SEASON, it.toString()) }
+        media.episode?.let { addQueryParameter(ZxcCipher.EPISODE, it.toString()) }
+    }.build()
+
+    private fun fluxLabel(server: String, quality: String, subCount: Int): String = listOfNotNull(
+        "$FLUX_NAME/$server",
+        quality,
         "HLS",
         "$subCount subs".takeIf { subCount > 0 },
     ).joinToString(" · ")
@@ -4016,6 +4192,34 @@ class RentaroExtractor(
         private const val HARU_TOKEN_RETRY_MS = 3_000L
         private const val THROTTLED = 429
 
+        // ZxcStream (zxcstream.cc) moved here from embed.zxcstream.xyz, which no longer resolves; its
+        // subtitles are served from vidstuck.cc, a sibling domain that wants the same Origin.
+        private const val FLUX_NAME = "Flux"
+        private const val FLUX_ORIGIN = "https://zxcstream.cc"
+        private const val FLUX_SUBTITLE_ORIGIN = "https://vidstuck.cc"
+
+        /** The pseudo-server a subtitle request's token is minted for. */
+        private const val FLUX_SUBTITLE_PATH = "subtitle_"
+
+        private const val FLUX_TOKEN_ATTEMPTS = 2
+
+        private class FluxServer(val key: String, val label: String)
+
+        /**
+         * The player's servers that gave HLS which played, named as its own menu names them (it adds a
+         * numeral, "Alatreon V"). Left out:
+         *  - Orion and Valstrax, which serve DASH in HEVC only. Orion also carries about a dozen dubbed
+         *    audio tracks, so this is a loss. Their manifests hold a bare `&` in every signed URL, so
+         *    libxml2 refuses them as XML; whether the app's player copes was not tested.
+         *  - Atlas, whose manifests answered 427 on every title.
+         *  - Ursa, whose playlists loaded on one title in four and whose segments answered 502 and 526.
+         *  - The hidden Resshin, whose host no longer resolves.
+         */
+        private val FLUX_SERVERS = listOf(
+            FluxServer("alatreon", "Alatreon"),
+            FluxServer("daedalus", "Daedalus"),
+        )
+
         private const val TMDB_API_BASE = "https://api.themoviedb.org/3"
 
         private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
@@ -4571,6 +4775,7 @@ class RentaroExtractor(
             KOTO_NAME,
             PULSE_NAME,
             HARU_NAME,
+            FLUX_NAME,
         )
 
         /**
@@ -4600,6 +4805,7 @@ class RentaroExtractor(
             KOTO_NAME -> "Sub/Dub"
             PULSE_NAME -> "Original"
             HARU_NAME -> "Original"
+            FLUX_NAME -> "Original"
             else -> "Unknown"
         }
     }

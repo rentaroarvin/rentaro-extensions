@@ -1113,7 +1113,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss", "Koto", "Pulse", "Haru")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss", "Koto", "Pulse", "Haru", "Flux")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -1198,6 +1198,8 @@ class Rentaro :
             "pref_optin_pulse" to setOf("Pulse"),
             // Videasy and VidSrc.to shipped as "Haru" in v61, on the same one-shot basis.
             "pref_optin_haru" to setOf("Haru"),
+            // ZxcStream shipped as "Flux" in v62, on the same one-shot basis.
+            "pref_optin_flux" to setOf("Flux"),
         )
 
         /**

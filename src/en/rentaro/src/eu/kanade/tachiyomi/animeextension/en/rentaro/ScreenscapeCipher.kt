@@ -136,9 +136,9 @@ internal object ScreenscapeCipher {
 
     /**
      * CryptoJS `AES.decrypt(ciphertext, passphrase)`: OpenSSL "Salted__" framing, key and IV
-     * from EVP_BytesToKey with MD5, AES-256-CBC with PKCS#7 padding.
+     * from EVP_BytesToKey with MD5, AES-256-CBC with PKCS#7 padding. [ZxcCipher] opens its links with it too.
      */
-    private fun cryptoJsDecrypt(encoded: String, passphrase: String): String? {
+    fun cryptoJsDecrypt(encoded: String, passphrase: String): String? {
         val raw = Base64.decode(encoded, Base64.DEFAULT)
         if (raw.size < 16 || String(raw, 0, 8, Charsets.US_ASCII) != "Salted__") return null
         val salt = raw.copyOfRange(8, 16)
