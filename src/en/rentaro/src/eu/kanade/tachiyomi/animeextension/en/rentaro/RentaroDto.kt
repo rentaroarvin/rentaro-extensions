@@ -677,3 +677,57 @@ data class PulseQualityDto(
     val height: Int? = null,
     val url: String? = null,
 )
+
+// ====================== Videasy / VidSrc.to DTOs ======================
+
+/** `vs_src.php`: the player page the entry hands the request on to. */
+@Serializable
+data class HaruEntryDto(
+    val src: String? = null,
+)
+
+/** `window.CFG` of the player's landing page. */
+@Serializable
+data class HaruLandingDto(
+    val playerUrl: String? = null,
+)
+
+/**
+ * `window.CONFIG` of the player page. A film names its stream request in [api]; an episode gives
+ * [streamBase] and the season and episode are appended.
+ */
+@Serializable
+data class HaruPlayerDto(
+    val api: String? = null,
+    val streamBase: String? = null,
+    val apiToken: String? = null,
+)
+
+/** vidsrc.sh `api.php`. The stream list is sealed in `data.stream_urls`; see [VidSrcCipher]. */
+@Serializable
+data class HaruStreamDto(
+    val data: HaruStreamDataDto? = null,
+    @SerialName("default_subs")
+    val defaultSubs: List<HaruSubtitleDto>? = null,
+    val vs: HaruWindowDto? = null,
+)
+
+@Serializable
+data class HaruStreamDataDto(
+    // One sealed string when the reply carries `vs`, a plain array of URLs when it does not.
+    @SerialName("stream_urls")
+    val streamUrls: JsonElement? = null,
+)
+
+/** The decryptor the reply was sealed for, regenerated every five minutes. */
+@Serializable
+data class HaruWindowDto(
+    @SerialName("wasm_url")
+    val wasmUrl: String? = null,
+)
+
+@Serializable
+data class HaruSubtitleDto(
+    val lang: String? = null,
+    val url: String? = null,
+)

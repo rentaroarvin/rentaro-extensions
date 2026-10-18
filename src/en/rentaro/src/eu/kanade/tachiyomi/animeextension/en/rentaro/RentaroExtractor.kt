@@ -19,6 +19,7 @@ import keiyoushi.utils.parallelMapNotNull
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.last
@@ -28,9 +29,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -48,6 +52,7 @@ import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.Normalizer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
@@ -156,12 +161,13 @@ class RentaroExtractor(
         val kissEnabled = KISS_NAME in enabledServers
         val kotoEnabled = KOTO_NAME in enabledServers
         val pulseEnabled = PULSE_NAME in enabledServers
+        val haruEnabled = HARU_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
             !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled &&
-            !kotoEnabled && !pulseEnabled
+            !kotoEnabled && !pulseEnabled && !haruEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -341,6 +347,19 @@ class RentaroExtractor(
                 } else {
                     try {
                         pulseVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // Videasy and VidSrc.to share one player; it takes several requests to reach a stream, so it
+            // runs alongside the others rather than in front of them.
+            {
+                if (!haruEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        haruVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
                     } catch (_: IOException) {
                         emptyList()
                     }
@@ -2167,6 +2186,160 @@ class RentaroExtractor(
         "$subCount subs".takeIf { subCount > 0 },
     ).joinToString(" · ")
 
+    // =================== Videasy / VidSrc.to (Haru) backend ===================
+
+    private fun haruHeaders(referer: String): Headers = headers.newBuilder()
+        .set("Accept", "*/*")
+        .set("Referer", referer)
+        .build()
+
+    private class HaruToken(val value: String, val expiresAt: Long)
+
+    /**
+     * Stream-host tokens by host. The JWT lives four hours and names only its issuer, times and the
+     * requester's address range, not a title. Its host answers `/generate.php` once, then refuses with
+     * 429 for about ten seconds (measured on two hosts: polled every 1 to 2 seconds the next request
+     * to get through came 10.4 seconds later, so refusals do not extend it). Opening the same episode
+     * again is therefore served from here rather than asking again. Kept for far less than its life,
+     * since a phone that changes network changes the address range the token names.
+     */
+    private val haruTokens = ConcurrentHashMap<String, HaruToken>()
+
+    /**
+     * Videasy and VidSrc.to are one player, vidsrc.sh's, behind two domains (VidSrc.to only frames
+     * vsembed.ru). The chain, checked on 18 October 2026 for films, series and anime:
+     *
+     *  1. `vs_src.php` names the player page, on a host that changes.
+     *  2. That page's `window.CFG` names the real player, whose `window.CONFIG` carries the stream API
+     *     and a single-use `apiToken` bound to the requester's address.
+     *  3. The API answers with the stream list sealed (see [VidSrcCipher]) plus the module that opens it.
+     *  4. The list holds one HLS stream three times (identical renditions, bandwidths and content id,
+     *     on one host) and that host hands out a JWT at `/generate.php`, to be sent as `?token=`.
+     *
+     * The page also holds a Cloudflare Turnstile gate that its own script says is for addresses it
+     * flags. The API answered here without the gate being passed. It is not solved, so what a flagged
+     * address gets back was not seen; at worst Haru lists nothing for it.
+     */
+    private suspend fun haruVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val query = if (isMovie) "type=movie&id=$tmdbId" else "type=tv&id=$tmdbId&season=$seasonId&episode=$episodeId"
+        val (entryOrigin, nested) = HARU_ORIGINS.firstNotNullOfOrNull { origin ->
+            haruEntry(origin, query)?.let { origin to it }
+        } ?: return emptyList()
+        val playerOrigin = "${nested.scheme}://${nested.host}"
+
+        val landing = client.newCall(GET(nested.toString(), haruHeaders("$entryOrigin/"))).awaitSuccess().bodyString()
+        val playerPath = HARU_CFG_REGEX.find(landing)?.groupValues?.get(1)?.parseAs<HaruLandingDto>()?.playerUrl
+            ?: return emptyList()
+        val playerUrl = nested.resolve(playerPath) ?: return emptyList()
+
+        val page = client.newCall(GET(playerUrl.toString(), haruHeaders("$playerOrigin/"))).awaitSuccess().bodyString()
+        val player = HARU_CONFIG_REGEX.find(page)?.groupValues?.get(1)?.parseAs<HaruPlayerDto>() ?: return emptyList()
+        val apiToken = player.apiToken?.takeIf { it.isNotBlank() } ?: return emptyList()
+        // A film names its stream request; an episode gives the base and the site adds the numbers.
+        val api = (if (isMovie) player.api else player.streamBase?.let { "$it&season=$seasonId&episode=$episodeId&stream_urls" })
+            ?.toHttpUrlOrNull() ?: return emptyList()
+
+        val stream = client.newCall(
+            GET(api.newBuilder().addQueryParameter("api_token", apiToken).build().toString(), haruHeaders("$playerOrigin/")),
+        ).awaitSuccess().parseAs<HaruStreamDto>()
+        val urls = haruStreamUrls(stream, playerOrigin)
+        if (urls.isEmpty()) return emptyList()
+
+        val subtitles = haruSubtitles(stream, subLimit)
+        // The browser sends the player's origin as Referer on every request to the stream host, and the
+        // segments answer 403 to a Referer naming anything else.
+        val streamHeaders = headers.newBuilder()
+            .set("Referer", "$playerOrigin/")
+            .set("Origin", playerOrigin)
+            .build()
+        for (url in urls.distinctBy { it.toHttpUrlOrNull()?.host }) {
+            val rows = haruStream(url, streamHeaders, subtitles)
+            if (rows.isNotEmpty()) return rows
+        }
+        // None opened. The token names the requester's address range, so one minted before the phone
+        // changed network is refused now; forget them so the next request mints again.
+        urls.mapNotNull { it.toHttpUrlOrNull()?.host }.forEach(haruTokens::remove)
+        return emptyList()
+    }
+
+    /** The player page `vs_src.php` names, or null when [origin] does not answer for the title. */
+    private suspend fun haruEntry(origin: String, query: String): HttpUrl? = try {
+        client.newCall(GET("$origin/vs_src.php?$query", haruHeaders("$origin/")))
+            .awaitSuccess().parseAs<HaruEntryDto>().src?.toHttpUrlOrNull()
+    } catch (_: HttpException) {
+        null
+    } catch (_: IOException) {
+        null
+    } catch (_: SerializationException) {
+        null
+    }
+
+    /** The stream URLs of [stream]: opened with the module the reply names, or plain when it is not sealed. */
+    private suspend fun haruStreamUrls(stream: HaruStreamDto, playerOrigin: String): List<String> {
+        val urls = when (val listed = stream.data?.streamUrls) {
+            is JsonArray -> listed.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            is JsonPrimitive -> {
+                val module = stream.vs?.wasmUrl?.takeIf { listed.isString } ?: return emptyList()
+                val wasm = client.newCall(GET(module, haruHeaders("$playerOrigin/"))).awaitSuccess().use { it.body.bytes() }
+                VidSrcCipher.open(listed.content, wasm)
+            }
+            else -> emptyList()
+        }
+        return urls.filter { it.startsWith("http") }
+    }
+
+    private fun haruSubtitles(stream: HaruStreamDto, subLimit: Int): List<Track> {
+        if (subLimit <= 0) return emptyList()
+        return stream.defaultSubs.orEmpty()
+            .filter { it.url?.startsWith("http") == true }
+            .sortedByDescending { it.lang?.startsWith("English", ignoreCase = true) == true }
+            .take(subLimit)
+            .map { Track(it.url!!, it.lang?.takeIf { lang -> lang.isNotBlank() } ?: "Unknown") }
+    }
+
+    /** One mirror's rows. */
+    private suspend fun haruStream(url: String, streamHeaders: Headers, subtitles: List<Track>): List<Video> {
+        val stream = url.toHttpUrlOrNull() ?: return emptyList()
+        val token = haruToken(stream, streamHeaders) ?: return emptyList()
+        val master = stream.newBuilder().addQueryParameter("token", token).build().toString()
+        return hlsRows(master, streamHeaders, subtitles) { height -> haruLabel(height, subtitles.size) }
+    }
+
+    private suspend fun haruToken(stream: HttpUrl, streamHeaders: Headers): String? {
+        // The reply is the JWT itself, as plain text. A 429 is the throttle, waited out in steps that
+        // together cover its ten seconds. The cache is looked at again each time because a request
+        // made at the same moment for the same host may have filled it meanwhile.
+        for (attempt in 0 until HARU_TOKEN_ATTEMPTS) {
+            if (attempt > 0) delay(HARU_TOKEN_RETRY_MS)
+            val now = System.currentTimeMillis()
+            haruTokens[stream.host]?.takeIf { it.expiresAt > now }?.let { return it.value }
+            val (code, body) = try {
+                client.newCall(GET("${stream.scheme}://${stream.host}/generate.php", streamHeaders)).await()
+                    .use { it.code to it.body.string().trim() }
+            } catch (_: IOException) {
+                return null
+            }
+            if (code == THROTTLED) continue
+            if (code !in 200..299 || !HARU_TOKEN_REGEX.matches(body)) return null
+            haruTokens[stream.host] = HaruToken(body, now + HARU_TOKEN_TTL_MS)
+            return body
+        }
+        return null
+    }
+
+    private fun haruLabel(height: String, subCount: Int): String = listOfNotNull(
+        HARU_NAME,
+        height,
+        "HLS",
+        "$subCount subs".takeIf { subCount > 0 },
+    ).joinToString(" · ")
+
     // ======================== VidLove (Yoru) backend ========================
 
     /** One upstream exposed by VidLove under its own source selector. */
@@ -3825,6 +3998,24 @@ class RentaroExtractor(
             PulseSource("lookmovie", "Spider"),
         )
 
+        // Videasy (player.videasy.ws) and VidSrc.to are one vidsrc.sh player behind two domains. The
+        // second is tried when the first does not answer; VidSrc.to itself only frames it.
+        private const val HARU_NAME = "Haru"
+        private val HARU_ORIGINS = listOf("https://player.videasy.ws", "https://vsembed.ru")
+
+        /** The two `window.` objects the player pages inline; the second holds the stream request. */
+        private val HARU_CFG_REGEX = Regex("""window\.CFG\s*=\s*(\{.*?\})\s*;\s*</script>""", RegexOption.DOT_MATCHES_ALL)
+        private val HARU_CONFIG_REGEX = Regex("""window\.CONFIG\s*=\s*(\{.*?\})\s*;\s*</script>""", RegexOption.DOT_MATCHES_ALL)
+
+        /** What `/generate.php` answers with: a JWT. Anything else, an error page included, is not one. */
+        private val HARU_TOKEN_REGEX = Regex("""[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+""")
+        private const val HARU_TOKEN_TTL_MS = 20 * 60 * 1000L
+
+        /** Tries at `/generate.php`, three seconds apart: the throttle it answers with lasts about ten. */
+        private const val HARU_TOKEN_ATTEMPTS = 4
+        private const val HARU_TOKEN_RETRY_MS = 3_000L
+        private const val THROTTLED = 429
+
         private const val TMDB_API_BASE = "https://api.themoviedb.org/3"
 
         private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
@@ -4379,6 +4570,7 @@ class RentaroExtractor(
             KISS_NAME,
             KOTO_NAME,
             PULSE_NAME,
+            HARU_NAME,
         )
 
         /**
@@ -4407,6 +4599,7 @@ class RentaroExtractor(
             KISS_NAME -> "Original"
             KOTO_NAME -> "Sub/Dub"
             PULSE_NAME -> "Original"
+            HARU_NAME -> "Original"
             else -> "Unknown"
         }
     }
