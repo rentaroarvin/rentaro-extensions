@@ -26,11 +26,11 @@ import javax.crypto.spec.SecretKeySpec
  */
 internal object ScreenscapeCipher {
 
-    /** Static secret mixed into every envelope key (deobfuscated from the bundle). */
-    private const val ENVELOPE_SECRET = "IAGFXUlAEZymC5s3XEnuLO9P0xHCCKrnJ6tMVE7MeavZmwhvV3siY0OxqWyWRLw"
+    /** Static string mixed into every envelope key (deobfuscated from the player bundle). */
+    private const val ENVELOPE_MIX = "IAGFXUlAEZymC5s3XEnuLO9P0xHCCKrnJ6tMVE7MeavZmwhvV3siY0OxqWyWRLw"
 
-    /** Static secret for the inner XOR layer. */
-    private const val INNER_SECRET = "9dZUFgMqUg3_CYHUGpVL1wCV-UOp7EvbflD6srGLsI9HzYF-0MX06wy3rHoxMV8"
+    /** Static string for the inner XOR layer. */
+    private const val INNER_MIX = "9dZUFgMqUg3_CYHUGpVL1wCV-UOp7EvbflD6srGLsI9HzYF-0MX06wy3rHoxMV8"
 
     /** Length of the envelope-key prefix used as the outer XOR key. */
     private const val OUTER_XOR_LENGTH = 18
@@ -112,8 +112,8 @@ internal object ScreenscapeCipher {
         }
 
         val envelopeKey = hours.firstNotNullOfOrNull { hour ->
-            val salt = md5Hex("$ENVELOPE_SECRET:$hour").take(16)
-            val candidate = sha256Hex("$key|$context|$ENVELOPE_SECRET|$salt")
+            val salt = md5Hex("$ENVELOPE_MIX:$hour").take(16)
+            val candidate = sha256Hex("$key|$context|$ENVELOPE_MIX|$salt")
             val signed = if (v >= 2) "$d:$v" else d
             candidate.takeIf { hmacHex(signed, it) == s }
         } ?: return null
@@ -125,7 +125,7 @@ internal object ScreenscapeCipher {
     private fun openInner(body: String, colon: Int, envelopeKey: String): String? {
         val stamp = body.substring(0, colon)
         val payload = body.substring(colon + 1)
-        val innerKey = sha256Hex("$INNER_SECRET:$stamp:$envelopeKey").take(INNER_XOR_LENGTH)
+        val innerKey = sha256Hex("$INNER_MIX:$stamp:$envelopeKey").take(INNER_XOR_LENGTH)
         val reversed = xor(payload, innerKey).reversed()
         val openSsl = String(
             Base64.decode(xor(reversed, envelopeKey.take(OUTER_XOR_LENGTH)), Base64.DEFAULT),

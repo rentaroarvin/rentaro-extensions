@@ -59,7 +59,7 @@ class Rentaro :
 
     /** Starts an official TMDB request with the v3 API key already attached. */
     private fun tmdbUrlBuilder(): HttpUrl.Builder = apiUrl.toHttpUrl().newBuilder()
-        .addQueryParameter("api_key", TMDB_API_KEY)
+        .addQueryParameter("api_key", TMDB_V3_KEY)
 
     override val lang = "en"
     override val supportsLatest = true
@@ -1083,7 +1083,7 @@ class Rentaro :
          * published key used by WatchBox's artwork client, verified against the official API
          * on 20 September 2026. The extractor reads it too, for Koto's season counts.
          */
-        internal const val TMDB_API_KEY = "d8cd4489c203c5e8c8efb70aa8e33565"
+        internal const val TMDB_V3_KEY = "d8cd4489c203c5e8c8efb70aa8e33565"
 
         // Hosts accepted when a URL is pasted into search. Kept in sync with
         // the intent filter in AndroidManifest.xml.

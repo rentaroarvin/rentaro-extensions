@@ -1936,7 +1936,7 @@ class RentaroExtractor(
     /** TMDB's episode count over the seasons before [season], or null when it cannot be read. */
     private suspend fun tmdbEpisodesBefore(tmdbId: String, season: Int): Int? = runCatching {
         val url = "$TMDB_API_BASE/tv/$tmdbId".toHttpUrl().newBuilder()
-            .addQueryParameter("api_key", Rentaro.TMDB_API_KEY)
+            .addQueryParameter("api_key", Rentaro.TMDB_V3_KEY)
             .build()
         client.newCall(GET(url.toString())).awaitSuccess().parseAs<TvDetailDto>()
             .seasons.filter { it.seasonNumber in 1 until season }
