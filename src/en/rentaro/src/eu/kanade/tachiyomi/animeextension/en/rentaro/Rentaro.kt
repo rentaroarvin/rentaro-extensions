@@ -9,6 +9,7 @@ import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.ProgressiveVideoSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
@@ -534,18 +535,6 @@ class Rentaro :
         }
     }
 
-    // ========================== Related Titles ============================
-    override fun relatedAnimeListRequest(anime: SAnime): Request {
-        val (type, id) = animeUrlToId(anime)
-        val url = tmdbUrlBuilder().apply {
-            addPathSegment(type)
-            addPathSegment(id)
-            addPathSegment("recommendations")
-            addQueryParameter("page", "1")
-        }.build()
-        return GET(url, headers)
-    }
-
     // ============================== Episodes ==============================
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val (type, _) = animeUrlToId(anime)
@@ -610,20 +599,48 @@ class Rentaro :
 
     // ============================ Video Links ============================
 
+    // Rentaro lists its own episodes and hosters; the request/parse pairs below are never used.
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException("Not used")
+
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException("Not used")
+
     /**
-     * Streams for [episode], emitted as backend results are collected.
+     * One hoster per enabled server, in catalogue order, which a lib 16 host takes as the
+     * order of preference.
      *
-     * Backend families are started concurrently and differ widely in cost,
-     * so joining them all before returning can withhold usable streams until the
-     * slowest enabled path finishes. Hosts that recognise
-     * [ProgressiveVideoSource] collect this instead and can start playback
-     * before every backend has completed.
+     * Nothing is requested here. Each hoster is resolved on its own by [getVideoList], so a
+     * host loading them side by side shows a server's streams as soon as that server answers,
+     * and one that is slow or down holds up nobody but itself. A single hoster holding every
+     * stream would instead withhold all of them until the slowest backend finished.
+     */
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val enabled = preferences.enabledServerNames
+        return RentaroExtractor.SERVER_DISPLAY_NAMES
+            .filter { it in enabled }
+            .map { server -> Hoster(hosterUrl = episode.url, hosterName = server) }
+    }
+
+    /** The streams of one server, named by [Hoster.hosterName] for the episode in [Hoster.hosterUrl]. */
+    @RequiresApi(Build.VERSION_CODES.N)
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = videosFlow(hoster.hosterUrl, setOf(hoster.hosterName)).last()
+
+    /**
+     * Streams for [episode] from every enabled server, emitted as backend results are collected.
      *
-     * Emissions are cumulative and fully ordered; [getVideoList] is the last one.
+     * Backend families are started concurrently and differ widely in cost, so joining them all
+     * before returning can withhold usable streams until the slowest enabled path finishes. Hosts
+     * that recognise [ProgressiveVideoSource] collect this instead and can start playback before
+     * every backend has completed. Lib 16 hosts that list hosters never call it; they get the same
+     * streams one server at a time through [getHosterList] and [getVideoList].
+     *
+     * Emissions are cumulative and fully ordered; the last one is the whole list.
      */
     @RequiresApi(Build.VERSION_CODES.N)
-    override fun getVideoListFlow(episode: SEpisode): Flow<List<Video>> {
-        val (path, extraDataEncoded) = episode.url.split("#", limit = 2)
+    override fun getVideoListFlow(episode: SEpisode): Flow<List<Video>> = videosFlow(episode.url, preferences.enabledServerNames)
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun videosFlow(episodeUrl: String, servers: Set<String>): Flow<List<Video>> {
+        val (path, extraDataEncoded) = episodeUrl.split("#", limit = 2)
         val (title, year, imdbId) =
             extraDataEncoded.parseAs<Triple<String, String, String>>()
 
@@ -632,7 +649,7 @@ class Rentaro :
             title = title,
             year = year,
             imdbId = imdbId,
-            enabledServers = preferences.enabledServerNames,
+            enabledServers = servers,
             subLimit = preferences.subLimitPref.toIntOrNull()
                 ?: PREF_SUB_LIMIT_DEFAULT.toInt(),
             qualityPref = preferences.qualityPref,
@@ -643,15 +660,6 @@ class Rentaro :
             enabledScreenscapeServers = preferences.enabledScreenscapeServers,
         )
     }
-
-    /**
-     * The finished list, for hosts that do not know about [getVideoListFlow].
-     *
-     * Delegates to the flow's terminal emission so the ordering rules are not
-     * duplicated: both paths return the same list in the same order.
-     */
-    @RequiresApi(Build.VERSION_CODES.N)
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListFlow(episode).last()
 
     // ============================== Settings ==============================
     private val SharedPreferences.popularListPref by preferences.delegate(

@@ -186,9 +186,8 @@ internal class OneTouchTv(
         val playable = manifest.toURI().toString()
         return listOf(
             Video(
-                url = playable,
-                quality = label(source, height?.let { "${it}p" } ?: "Auto", "DASH", subtitles.size, hevc),
                 videoUrl = playable,
+                videoTitle = label(source, height?.let { "${it}p" } ?: "Auto", "DASH", subtitles.size, hevc),
                 headers = mediaHeaders,
                 subtitleTracks = subtitles,
             ),

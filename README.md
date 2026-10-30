@@ -112,8 +112,10 @@ Useful checks:
 ```
 
 The debug APK is written under
-`src/en/rentaro/build/outputs/apk/debug/`. Its `v14.<code>` suffix is derived
-from the extension library major version and `extVersionCode`.
+`src/en/rentaro/build/outputs/apk/debug/`. Its `v16.<code>` suffix is derived
+from the extension library major version and `extVersionCode`. The extension
+targets extensions-lib 16 (`com.github.aniyomiorg:extensions-lib:v16`), which lists
+streams through hosters; Rentaro offers one hoster per enabled server.
 
 ## Publishing
 

@@ -467,20 +467,19 @@ class RentaroExtractor(
      * longer resolves); a slow or unreadable stream keeps its row as it was. See [StreamProbe].
      */
     private suspend fun withResolutions(videos: List<Video>): List<Video> = videos.parallelMapNotNull { video ->
-        if (labelHasHeight(video.quality)) return@parallelMapNotNull video
-        val url = video.videoUrl ?: video.url
+        if (labelHasHeight(video.videoTitle)) return@parallelMapNotNull video
+        val url = video.videoUrl
         // OneTouchTV caches misnamed DASH manifests with a .mpd extension for the player.
         // Their representations have already been inspected; an HTTP probe cannot read file:.
         if (url.startsWith("file:")) return@parallelMapNotNull video
-        val lower = "${url.lowercase()} ${video.quality.lowercase()}"
+        val lower = "${url.lowercase()} ${video.videoTitle.lowercase()}"
         val adaptive = ".m3u8" in lower || ".mpd" in lower || " hls" in lower || " dash" in lower
         when (val result = StreamProbe.probe(streamProbeClient, url, video.headers ?: headers, range = !adaptive)) {
             is StreamProbe.Resolution -> {
                 val height = StreamProbe.heightClass(result.width, result.height)
                 Video(
-                    url = video.url,
-                    quality = labelWithHeight(video.quality, if (height >= 2160) "4K" else "${height}p"),
                     videoUrl = video.videoUrl,
+                    videoTitle = labelWithHeight(video.videoTitle, if (height >= 2160) "4K" else "${height}p"),
                     headers = video.headers,
                     subtitleTracks = video.subtitleTracks,
                     audioTracks = video.audioTracks,
@@ -529,7 +528,7 @@ class RentaroExtractor(
         val serverRank = SERVER_ORDER_HINT.withIndex().associate { (index, name) -> name to index }
 
         return videos
-            .groupBy { videoServerName(it.quality) }
+            .groupBy { videoServerName(it.videoTitle) }
             .toList()
             .sortedBy { (server, _) ->
                 // Art and Jay fan out to "Art/<provider>" and "Jay/<server>", so
@@ -540,10 +539,10 @@ class RentaroExtractor(
             .flatMap { (_, group) ->
                 group.sortedWith(
                     compareByDescending<Video> {
-                        it.quality.contains(qualityPref, ignoreCase = true) ||
-                            (qualityPref == "2160" && it.quality.contains("4k", ignoreCase = true))
+                        it.videoTitle.contains(qualityPref, ignoreCase = true) ||
+                            (qualityPref == "2160" && it.videoTitle.contains("4k", ignoreCase = true))
                     }.thenByDescending {
-                        extractQualityValue(it.quality)
+                        extractQualityValue(it.videoTitle)
                     },
                 )
             }
@@ -633,9 +632,8 @@ class RentaroExtractor(
                     ?: "Auto"
                 return listOf(
                     Video(
-                        url = playlist,
-                        quality = vidLinkLabel(label, playlist, subtitles.size, meta?.codecName),
                         videoUrl = playlist,
+                        videoTitle = vidLinkLabel(label, playlist, subtitles.size, meta?.codecName),
                         headers = streamHeaders,
                         subtitleTracks = subtitles,
                     ),
@@ -657,9 +655,8 @@ class RentaroExtractor(
             return expanded.ifEmpty {
                 listOf(
                     Video(
-                        url = playlist,
-                        quality = vidLinkLabel("Auto", playlist, subtitles.size),
                         videoUrl = playlist,
+                        videoTitle = vidLinkLabel("Auto", playlist, subtitles.size),
                         headers = streamHeaders,
                         subtitleTracks = subtitles,
                     ),
@@ -680,14 +677,13 @@ class RentaroExtractor(
                 val videoUrl = entry.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                 val quality = if (label.all(Char::isDigit)) "${label}p" else label
                 Video(
-                    url = videoUrl,
-                    quality = vidLinkLabel(quality, videoUrl, subtitles.size, entry.codecName),
                     videoUrl = videoUrl,
+                    videoTitle = vidLinkLabel(quality, videoUrl, subtitles.size, entry.codecName),
                     headers = progressiveHeaders,
                     subtitleTracks = subtitles,
                 )
             }
-            .sortedByDescending { extractQualityValue(it.quality) }
+            .sortedByDescending { extractQualityValue(it.videoTitle) }
     }
 
     private fun vidLinkLabel(
@@ -888,14 +884,13 @@ class RentaroExtractor(
             // segment URIs still resolve against the same base. Verified against
             // both CDNs, which answer identically with and without it.
             return expanded.map { video ->
-                val hinted = hlsHintedUrl(video.videoUrl ?: video.url)
+                val hinted = hlsHintedUrl(video.videoUrl)
                 if (hinted == null) {
                     video
                 } else {
                     Video(
-                        url = hinted,
-                        quality = video.quality,
                         videoUrl = hinted,
+                        videoTitle = video.videoTitle,
                         headers = video.headers,
                         subtitleTracks = video.subtitleTracks,
                         audioTracks = video.audioTracks,
@@ -904,9 +899,8 @@ class RentaroExtractor(
             }.ifEmpty {
                 listOf(
                     Video(
-                        url = playlist,
-                        quality = cineJoyLabel(server, stream.id, "Auto", playlist, subtitles.size),
                         videoUrl = playlist,
+                        videoTitle = cineJoyLabel(server, stream.id, "Auto", playlist, subtitles.size),
                         headers = streamHeaders,
                         subtitleTracks = subtitles,
                     ),
@@ -921,9 +915,8 @@ class RentaroExtractor(
             val videoUrl = entry.url?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
             val quality = if (label.all(Char::isDigit)) "${label}p" else label
             Video(
-                url = videoUrl,
-                quality = cineJoyLabel(server, stream.id, quality, videoUrl, subtitles.size),
                 videoUrl = videoUrl,
+                videoTitle = cineJoyLabel(server, stream.id, quality, videoUrl, subtitles.size),
                 headers = streamHeaders,
                 subtitleTracks = subtitles,
             )
@@ -1147,14 +1140,13 @@ class RentaroExtractor(
         // request, since a fragment is never sent to the server and relative
         // segment URIs still resolve against the same base.
         return expanded.map { video ->
-            val hinted = hlsHintedUrl(video.videoUrl ?: video.url)
+            val hinted = hlsHintedUrl(video.videoUrl)
             if (hinted == null) {
                 video
             } else {
                 Video(
-                    url = hinted,
-                    quality = video.quality,
                     videoUrl = hinted,
+                    videoTitle = video.videoTitle,
                     headers = video.headers,
                     subtitleTracks = video.subtitleTracks,
                     audioTracks = video.audioTracks,
@@ -1163,9 +1155,8 @@ class RentaroExtractor(
         }.ifEmpty {
             listOf(
                 Video(
-                    url = playlist,
-                    quality = cineFlixLabel("Auto", playlist, subtitles.size),
                     videoUrl = playlist,
+                    videoTitle = cineFlixLabel("Auto", playlist, subtitles.size),
                     headers = streamHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -1309,7 +1300,7 @@ class RentaroExtractor(
                 if (screenscapeLanguageGroup(language) !in enabledLanguages) return@mapNotNull null
                 screenscapeVideo(server, stream, url, language)
             }
-            .distinctBy { it.videoUrl ?: it.url }
+            .distinctBy { it.videoUrl }
             .toList()
     }
 
@@ -1395,9 +1386,8 @@ class RentaroExtractor(
         ).joinToString(" · ")
 
         return Video(
-            url = playable,
-            quality = label,
             videoUrl = playable,
+            videoTitle = label,
             headers = streamHeaders,
         )
     }
@@ -1607,9 +1597,8 @@ class RentaroExtractor(
         if (!isHls) {
             return listOf(
                 Video(
-                    url = url,
-                    quality = kissLabel(server, "Auto", "MP4", subtitles.size),
                     videoUrl = url,
+                    videoTitle = kissLabel(server, "Auto", "MP4", subtitles.size),
                     headers = streamHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -2165,15 +2154,14 @@ class RentaroExtractor(
 
         return files.map { (height, file) ->
             Video(
-                url = file,
-                quality = pulseLabel(
+                videoUrl = file,
+                videoTitle = pulseLabel(
                     source.label,
                     if (height > 0) "${height}p" else "Auto",
                     "MP4",
                     hevc = source.hevc,
                     subCount = subtitles.size,
                 ),
-                videoUrl = file,
                 headers = pulseStreamHeaders,
                 subtitleTracks = subtitles,
             )
@@ -2213,9 +2201,8 @@ class RentaroExtractor(
             val playable = if (hinted) hlsHintedUrl(url) ?: url else url
             return listOf(
                 Video(
-                    url = playable,
-                    quality = label("Auto"),
                     videoUrl = playable,
+                    videoTitle = label("Auto"),
                     headers = streamHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -2232,7 +2219,7 @@ class RentaroExtractor(
                 masterHeaders = streamHeaders,
                 videoHeaders = streamHeaders,
             )
-        }.getOrDefault(emptyList()).filterNot { it.url == url }
+        }.getOrDefault(emptyList()).filterNot { it.videoUrl == url }
     }
 
     /**
@@ -2600,8 +2587,8 @@ class RentaroExtractor(
         }.map { video ->
             // GoodStream's masters and renditions both use extensionless routes. Apply the
             // same client-side hint used by the other servers, preserving every query token.
-            val playable = hlsHintedUrl(video.videoUrl ?: video.url) ?: return@map video
-            Video(playable, video.quality, playable, video.headers, video.subtitleTracks, video.audioTracks)
+            val playable = hlsHintedUrl(video.videoUrl) ?: return@map video
+            Video(videoUrl = playable, videoTitle = video.videoTitle, headers = video.headers, subtitleTracks = video.subtitleTracks, audioTracks = video.audioTracks)
         }
     }
 
@@ -2664,8 +2651,8 @@ class RentaroExtractor(
                 }.map { video ->
                     // Luna's master and renditions are extensionless; Orion's already end in .m3u8 and pass
                     // through. The fragment is the same client-side hint the other servers use.
-                    val playable = hlsHintedUrl(video.videoUrl ?: video.url) ?: return@map video
-                    Video(playable, video.quality, playable, video.headers, video.subtitleTracks, video.audioTracks)
+                    val playable = hlsHintedUrl(video.videoUrl) ?: return@map video
+                    Video(videoUrl = playable, videoTitle = video.videoTitle, headers = video.headers, subtitleTracks = video.subtitleTracks, audioTracks = video.audioTracks)
                 }
             }
         }
@@ -2881,8 +2868,8 @@ class RentaroExtractor(
             // master variants. These endpoints are extensionless, so the label declares MP4.
             listOf(
                 Video(
-                    url = streamUrl,
-                    quality = vidLoveLabel(
+                    videoUrl = streamUrl,
+                    videoTitle = vidLoveLabel(
                         sourceLabel = sourceLabel,
                         quality = "Auto",
                         url = streamUrl,
@@ -2890,7 +2877,6 @@ class RentaroExtractor(
                         isHls = false,
                         isMp4 = true,
                     ),
-                    videoUrl = streamUrl,
                     headers = streamHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -2904,8 +2890,8 @@ class RentaroExtractor(
             val qualityIsHls = ".m3u8" in url.lowercase()
             val hinted = if (qualityIsHls) hlsHintedUrl(url) ?: url else url
             Video(
-                url = hinted,
-                quality = vidLoveLabel(
+                videoUrl = hinted,
+                videoTitle = vidLoveLabel(
                     sourceLabel = sourceLabel,
                     quality = quality.quality ?: "Auto",
                     url = url,
@@ -2914,13 +2900,12 @@ class RentaroExtractor(
                     isMp4 = !qualityIsHls,
                     codec = quality.codec,
                 ),
-                videoUrl = hinted,
                 headers = streamHeaders,
                 subtitleTracks = subtitles,
             )
         }
 
-        return (direct + qualities).distinctBy { video -> video.videoUrl ?: video.url }
+        return (direct + qualities).distinctBy { video -> video.videoUrl }
     }
 
     /** Turns VidLove's inline HLS master into normal extension Video entries. */
@@ -2970,8 +2955,8 @@ class RentaroExtractor(
 
                 add(
                     Video(
-                        url = hinted,
-                        quality = vidLoveLabel(
+                        videoUrl = hinted,
+                        videoTitle = vidLoveLabel(
                             sourceLabel = sourceLabel,
                             quality = quality,
                             url = url,
@@ -2979,14 +2964,13 @@ class RentaroExtractor(
                             isHls = true,
                             codec = attrs["CODECS"],
                         ),
-                        videoUrl = hinted,
                         headers = streamHeaders,
                         subtitleTracks = subtitles,
                         audioTracks = audioTracks,
                     ),
                 )
             }
-        }.distinctBy { video -> video.videoUrl ?: video.url }
+        }.distinctBy { video -> video.videoUrl }
     }
 
     private fun vidLoveHlsAttributes(line: String): Map<String, String> = VIDLOVE_HLS_ATTRIBUTE_REGEX.findAll(line.substringAfter(':'))
@@ -3168,9 +3152,8 @@ class RentaroExtractor(
         if (stream.mp4) {
             return listOf(
                 Video(
-                    url = url,
-                    quality = label,
                     videoUrl = url,
+                    videoTitle = label,
                     headers = playbackHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -3187,9 +3170,8 @@ class RentaroExtractor(
         }.getOrNull().orEmpty().ifEmpty {
             listOf(
                 Video(
-                    url = url,
-                    quality = label,
                     videoUrl = url,
+                    videoTitle = label,
                     headers = playbackHeaders,
                     subtitleTracks = subtitles,
                 ),
@@ -3545,9 +3527,8 @@ class RentaroExtractor(
 
             val asSingleFile = listOf(
                 Video(
-                    url = candidate.url,
-                    quality = label,
                     videoUrl = candidate.url,
+                    videoTitle = label,
                     headers = candidate.videoHeaders,
                     subtitleTracks = candidate.subtitles,
                 ),
