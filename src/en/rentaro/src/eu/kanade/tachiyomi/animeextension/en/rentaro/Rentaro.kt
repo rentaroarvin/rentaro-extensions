@@ -613,7 +613,7 @@ class Rentaro :
     /**
      * Streams for [episode], emitted as backend results are collected.
      *
-     * Six backend families are started concurrently and differ widely in cost,
+     * Backend families are started concurrently and differ widely in cost,
      * so joining them all before returning can withhold usable streams until the
      * slowest enabled path finishes. Hosts that recognise
      * [ProgressiveVideoSource] collect this instead and can start playback
@@ -1113,7 +1113,7 @@ class Rentaro :
 
         private const val PREF_SERVERS_KEY = "pref_servers_v2"
         private val PREF_SERVERS_DEFAULT =
-            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss", "Koto", "Pulse", "Haru", "Flux")
+            setOf("Orion", "Art", "Jay", "Dave", "Wave", "Yoru", "Sun", "Kiss", "Koto", "Pulse", "Haru", "Flux", "Sora", "Aki", "Ishi")
 
         private const val PREF_NEXUS_PROVIDERS_KEY = "pref_nexus_providers"
 
@@ -1200,6 +1200,12 @@ class Rentaro :
             "pref_optin_haru" to setOf("Haru"),
             // ZxcStream shipped as "Flux" in v62, on the same one-shot basis.
             "pref_optin_flux" to setOf("Flux"),
+            // OneTouchTV shipped as "Sora" in v63, on the same one-shot basis.
+            "pref_optin_sora" to setOf("Sora"),
+            // HollyMovieHD shipped as "Aki" in v64, on the same one-shot basis.
+            "pref_optin_aki" to setOf("Aki"),
+            // Vidrock shipped as "Ishi" in v65, on the same one-shot basis.
+            "pref_optin_ishi" to setOf("Ishi"),
         )
 
         /**

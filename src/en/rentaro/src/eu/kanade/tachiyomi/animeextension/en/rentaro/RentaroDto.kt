@@ -767,3 +767,112 @@ data class FluxCaptionDto(
     val display: String? = null,
     val file: String? = null,
 )
+
+// ============================ OneTouchTV DTOs ============================
+
+@Serializable
+internal data class OneTouchResponseDto<T>(
+    val success: Boolean = false,
+    val result: T? = null,
+)
+
+@Serializable
+internal data class OneTouchTitleDto(
+    val id: String? = null,
+    val title: String? = null,
+    val otherTitles: List<String>? = null,
+    val type: String? = null,
+    val year: JsonPrimitive? = null,
+    val episodes: List<OneTouchEpisodeDto>? = null,
+)
+
+@Serializable
+internal data class OneTouchEpisodeDto(
+    val id: String? = null,
+    val identifier: String? = null,
+    val episode: JsonPrimitive? = null,
+    val playId: JsonPrimitive? = null,
+) {
+    /** Mirrors the app's gSA: explicit playId, -episode- suffix, then "first". */
+    val sourceId: String
+        get() = playId?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: id?.substringAfterLast("-episode-", "")?.takeIf { it.isNotBlank() }
+            ?: "first"
+}
+
+@Serializable
+internal data class OneTouchSourcesDto(
+    val sources: List<OneTouchSourceDto>? = null,
+    val track: List<OneTouchTrackDto>? = null,
+)
+
+@Serializable
+internal data class OneTouchSourceDto(
+    val url: String? = null,
+    val type: String? = null,
+    val name: String? = null,
+    val quality: String? = null,
+)
+
+@Serializable
+internal data class OneTouchTrackDto(
+    val file: String? = null,
+    val name: String? = null,
+    val code: String? = null,
+    val kind: String? = null,
+    val default: Boolean = false,
+)
+
+// =========================== HollyMovieHD DTOs ===========================
+
+@Serializable
+internal data class AkiSearchDto(
+    val title: String? = null,
+    val url: String? = null,
+    val subtype: String? = null,
+)
+
+@Serializable
+internal data class AkiEmbedsDto(
+    @SerialName("servers_iframe")
+    val iframes: Map<String, String>? = null,
+    val subtitles: JsonElement? = null,
+)
+
+@Serializable
+internal data class AkiSourcesDto(
+    val success: Boolean = false,
+    val sources: List<AkiSourceDto>? = null,
+    val tracks: List<AkiTrackDto>? = null,
+)
+
+@Serializable
+internal data class AkiSourceDto(
+    val file: String? = null,
+    val label: String? = null,
+    val type: String? = null,
+)
+
+@Serializable
+internal data class AkiTrackDto(
+    val file: String? = null,
+    val label: String? = null,
+    val kind: String? = null,
+)
+
+// ============================== Vidrock DTOs ==============================
+
+/** One source of `vidrock.net/api/...`. [url] is sealed (see [VidrockCipher]) and empty for a source with no stream. */
+@Serializable
+data class IshiSourceDto(
+    val url: String? = null,
+    val language: String? = null,
+    val type: String? = null,
+)
+
+/** One caption of `sub.vdrk.site/v2/...`. */
+@Serializable
+data class IshiCaptionDto(
+    val label: String? = null,
+    val file: String? = null,
+)

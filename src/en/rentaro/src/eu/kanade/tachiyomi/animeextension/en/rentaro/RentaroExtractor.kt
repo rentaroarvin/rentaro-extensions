@@ -58,7 +58,7 @@ import kotlin.math.abs
 
 /**
  * Resolves Rentaro playback through the independent VidLink, Nexus, CineJoy,
- * CineFlix, VidFast and VidLove backend families.
+ * CineFlix, VidFast, VidLove and other backend families.
  */
 class RentaroExtractor(
     private val client: OkHttpClient,
@@ -66,6 +66,8 @@ class RentaroExtractor(
 ) {
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val sora by lazy { OneTouchTv(client, headers) }
+    private val aki by lazy { HollyMovieHd(client, headers) }
 
     /** Mirrors VidLove's own HEVC capability gate before asking for HEVC-only fallbacks. */
     private val supportsHevc by lazy {
@@ -118,7 +120,7 @@ class RentaroExtractor(
      * Resolves every enabled backend, emitting the list again as family results
      * are collected.
      *
-     * Six backend families are started concurrently and differ enormously in
+     * Backend families are started concurrently and differ enormously in
      * cost. Some make one request while others fan out across selectable upstream
      * servers or encrypted request chains. Waiting for every family before
      * returning anything would withhold usable streams until the slowest enabled
@@ -163,12 +165,15 @@ class RentaroExtractor(
         val pulseEnabled = PULSE_NAME in enabledServers
         val haruEnabled = HARU_NAME in enabledServers
         val fluxEnabled = FLUX_NAME in enabledServers
+        val soraEnabled = SORA_NAME in enabledServers
+        val akiEnabled = AKI_NAME in enabledServers
+        val ishiEnabled = ISHI_NAME in enabledServers
 
         // Emitted even when nothing is enabled: the contract asks for at least
         // one emission so the host can tell "none found" from "still working".
         if (!vidLinkEnabled && !nexusEnabled && !cineJoyEnabled &&
             !cineFlixEnabled && !vidFastEnabled && !vidLoveEnabled && !screenscapeEnabled && !kissEnabled &&
-            !kotoEnabled && !pulseEnabled && !haruEnabled && !fluxEnabled
+            !kotoEnabled && !pulseEnabled && !haruEnabled && !fluxEnabled && !soraEnabled && !akiEnabled && !ishiEnabled
         ) {
             send(emptyList())
             return@channelFlow
@@ -379,6 +384,51 @@ class RentaroExtractor(
                     }
                 }
             },
+            // OneTouchTV matches its own catalogue by title and season, then decodes Devcorp's
+            // metadata. The returned manifest, not the often-misleading URL suffix, selects HLS/DASH.
+            {
+                if (!soraEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        sora.videos(
+                            title,
+                            year,
+                            seasonId.toIntOrNull() ?: 1,
+                            episodeId.toIntOrNull() ?: 1,
+                            isMovie,
+                            subLimit,
+                        )
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // HollyMovieHD matches its WordPress catalogue, then follows the page nonce and
+            // GoodStream's guest CSRF source lookup without decoding or forging its opaque links.
+            {
+                if (!akiEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        akiVideos(tmdbId, title, year, imdbId, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
+            // Vidrock answers by TMDB id alone, with each stream URL sealed under a key in its player.
+            {
+                if (!ishiEnabled) {
+                    emptyList()
+                } else {
+                    try {
+                        ishiVideos(tmdbId, seasonId, episodeId, isMovie, subLimit)
+                    } catch (_: IOException) {
+                        emptyList()
+                    }
+                }
+            },
         )
 
         // Publish inside each child rather than awaiting the resolver list in catalogue order.
@@ -419,6 +469,9 @@ class RentaroExtractor(
     private suspend fun withResolutions(videos: List<Video>): List<Video> = videos.parallelMapNotNull { video ->
         if (labelHasHeight(video.quality)) return@parallelMapNotNull video
         val url = video.videoUrl ?: video.url
+        // OneTouchTV caches misnamed DASH manifests with a .mpd extension for the player.
+        // Their representations have already been inspected; an HTTP probe cannot read file:.
+        if (url.startsWith("file:")) return@parallelMapNotNull video
         val lower = "${url.lowercase()} ${video.quality.lowercase()}"
         val adaptive = ".m3u8" in lower || ".mpd" in lower || " hls" in lower || " dash" in lower
         when (val result = StreamProbe.probe(streamProbeClient, url, video.headers ?: headers, range = !adaptive)) {
@@ -2516,6 +2569,137 @@ class RentaroExtractor(
         "$subCount subs".takeIf { subCount > 0 },
     ).joinToString(" · ")
 
+    // ===================== HollyMovieHD (Aki) backend =====================
+
+    private suspend fun akiVideos(
+        tmdbId: String,
+        title: String,
+        year: String,
+        imdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> = aki.streams(
+        title,
+        year,
+        tmdbId,
+        imdbId,
+        seasonId.toIntOrNull() ?: 1,
+        episodeId.toIntOrNull() ?: 1,
+        isMovie,
+        subLimit,
+    ).parallelCatchingFlatMap { stream ->
+        hlsRows(stream.url, stream.headers, stream.subtitles, hinted = true) { quality ->
+            listOfNotNull(
+                "$AKI_NAME/${stream.name}",
+                quality,
+                "HLS",
+                "${stream.subtitles.size} subs".takeIf { stream.subtitles.isNotEmpty() },
+            ).joinToString(" · ")
+        }.map { video ->
+            // GoodStream's masters and renditions both use extensionless routes. Apply the
+            // same client-side hint used by the other servers, preserving every query token.
+            val playable = hlsHintedUrl(video.videoUrl ?: video.url) ?: return@map video
+            Video(playable, video.quality, playable, video.headers, video.subtitleTracks, video.audioTracks)
+        }
+    }
+
+    // ======================== Vidrock (Ishi) backend ========================
+
+    /** Vidrock's CDNs answer 403 to a request without both its Referer and its Origin. */
+    private val ishiHeaders: Headers
+        get() = headers.newBuilder()
+            .set("Accept", "*/*")
+            .set("Referer", "$ISHI_ORIGIN/")
+            .set("Origin", ISHI_ORIGIN)
+            .build()
+
+    /**
+     * Vidrock keys everything by TMDB id: `/api/tv/<id>/<season>/<episode>` or `/api/movie/<id>` answers
+     * with one object per upstream (Nova, Atlas, Orion, Luna, Astra, Lyra and three Indian-language
+     * slots), each holding a sealed stream URL that [VidrockCipher] opens. A slot with no stream has an
+     * empty `url`. Captions come from a separate host, `sub.vdrk.site`, with no headers.
+     *
+     * Checked on 30 October 2026 against the API on over 40 titles (films and episodes): Orion and Luna
+     * answered for nearly all, a few had only one of them or neither, no other slot ever held a stream,
+     * and every answer was HLS. Lupin S1E1 and Fight Club were then run through this code and each row
+     * followed to its first segment with the headers above, all MPEG-TS: Orion is H.264 at 1080p, 720p
+     * and 360p with segments named `page-N.html`, Luna is H.264 at up to 1080p on rotating workers.dev
+     * hosts whose master, playlists and segments carry no file extension. FFmpeg 9 played Orion's
+     * playlist as it stands and refused Luna's segment names until told `extension_picky 0`, as with
+     * Flux, Koto, Dave and Jay; whether the app's player does is untested. A source whose playlist does
+     * not load costs only its own rows.
+     */
+    private suspend fun ishiVideos(
+        tmdbId: String,
+        seasonId: String,
+        episodeId: String,
+        isMovie: Boolean,
+        subLimit: Int,
+    ): List<Video> {
+        val path = if (isMovie) "movie/$tmdbId" else "tv/$tmdbId/$seasonId/$episodeId"
+        return coroutineScope {
+            val captions = async { ishiSubtitles(path, subLimit) }
+            val reply = client.newCall(GET("$ISHI_API_BASE/$path", ishiHeaders)).awaitSuccess().parseAs<JsonObject>()
+            val streams = reply.mapNotNull { (name, element) ->
+                // A slot is an object, but the player skips anything else rather than fail, so do the same.
+                val source = runCatching { element.parseAs<IshiSourceDto>() }.getOrNull() ?: return@mapNotNull null
+                if (!source.type.equals("hls", ignoreCase = true)) return@mapNotNull null
+                val url = source.url?.takeIf { it.isNotBlank() }?.let(VidrockCipher::decrypt)
+                    ?.takeIf { it.startsWith("http") }
+                    ?: return@mapNotNull null
+                name to url
+            }
+            val tracks = captions.await()
+
+            streams.parallelCatchingFlatMap { (name, url) ->
+                hlsRows(url, ishiHeaders, tracks, hinted = true) { quality ->
+                    listOfNotNull(
+                        "$ISHI_NAME/$name",
+                        quality,
+                        "HLS",
+                        "${tracks.size} subs".takeIf { tracks.isNotEmpty() },
+                    ).joinToString(" · ")
+                }.map { video ->
+                    // Luna's master and renditions are extensionless; Orion's already end in .m3u8 and pass
+                    // through. The fragment is the same client-side hint the other servers use.
+                    val playable = hlsHintedUrl(video.videoUrl ?: video.url) ?: return@map video
+                    Video(playable, video.quality, playable, video.headers, video.subtitleTracks, video.audioTracks)
+                }
+            }
+        }
+    }
+
+    /** The captions Vidrock lists for [path], English first. Never throws: subtitles are not worth a row. */
+    private suspend fun ishiSubtitles(path: String, subLimit: Int): List<Track> {
+        if (subLimit <= 0) return emptyList()
+        return try {
+            client.newCall(GET("$ISHI_SUBTITLE_BASE/$path", headers)).awaitSuccess().parseAs<List<IshiCaptionDto>>()
+                .mapNotNull { caption ->
+                    // The file names hold spaces ("English - English.vtt"); parsing percent-encodes them.
+                    val file = caption.file?.toHttpUrlOrNull() ?: return@mapNotNull null
+                    Track(file.toString(), ishiCaptionLabel(caption.label))
+                }
+                .sortedByDescending { it.lang.startsWith("English", ignoreCase = true) }
+                .take(subLimit)
+        } catch (_: HttpException) {
+            emptyList()
+        } catch (_: IOException) {
+            emptyList()
+        } catch (_: SerializationException) {
+            emptyList()
+        }
+    }
+
+    /** "English - English (SDH)" reads "English (SDH)"; "Arabic - Arabic" reads "Arabic". */
+    private fun ishiCaptionLabel(label: String?): String {
+        val text = label?.trim().orEmpty().ifEmpty { return "Unknown" }
+        val language = text.substringBefore(" - ")
+        val named = text.substringAfter(" - ", "")
+        return if (named.startsWith(language, ignoreCase = true)) named else text
+    }
+
     // ======================== VidLove (Yoru) backend ========================
 
     /** One upstream exposed by VidLove under its own source selector. */
@@ -4220,6 +4404,18 @@ class RentaroExtractor(
             FluxServer("daedalus", "Daedalus"),
         )
 
+        // OneTouchTV's public Devcorp catalogue and playback API.
+        private const val SORA_NAME = "Sora"
+
+        // HollyMovieHD's WordPress and GoodStream playback chain.
+        private const val AKI_NAME = "Aki"
+
+        // Vidrock (vidrock.net) answers by TMDB id; the captions live on a separate host.
+        private const val ISHI_NAME = "Ishi"
+        private const val ISHI_ORIGIN = "https://vidrock.net"
+        private const val ISHI_API_BASE = "$ISHI_ORIGIN/api"
+        private const val ISHI_SUBTITLE_BASE = "https://sub.vdrk.site/v2"
+
         private const val TMDB_API_BASE = "https://api.themoviedb.org/3"
 
         private class ScreenscapeServer(val key: String, val label: String, val note: String = "")
@@ -4776,6 +4972,9 @@ class RentaroExtractor(
             PULSE_NAME,
             HARU_NAME,
             FLUX_NAME,
+            SORA_NAME,
+            AKI_NAME,
+            ISHI_NAME,
         )
 
         /**
@@ -4806,6 +5005,9 @@ class RentaroExtractor(
             PULSE_NAME -> "Original"
             HARU_NAME -> "Original"
             FLUX_NAME -> "Original"
+            SORA_NAME -> "Original"
+            AKI_NAME -> "Original"
+            ISHI_NAME -> "Original"
             else -> "Unknown"
         }
     }
