@@ -2097,14 +2097,21 @@ class RentaroExtractor(
      * Every source in [PULSE_SOURCES] is asked here, in parallel, and each is listed as its own
      * "Pulse/<name>" group.
      *
-     * Checked on 18 October 2026 on Fight Club, Breaking Bad S1E1 and Spider-Man: Brand New Day,
-     * following each stream to its first segment with the headers below: Oreon and Nebula played
-     * on all three and Spider on Spider-Man only (its API answers 502 for episodes and its Fight
-     * Club playlist 404). Alpha played on all three at one run or another, but its relay is rate
-     * limited and answers 429 or 503 now and then, so its rows come and go. Two sources are left
-     * out. Beta's variant playlists came back as an HTML page on Fight Club and Breaking Bad, and
-     * Quasar answered 502, at its API or its segments, on each title in the last check. A source
-     * that answers nothing, or whose playlist does not load, costs only its own rows.
+     * The site renamed every source key on or before 31 October 2026 (the menu in `/assets/main-*.js`
+     * is the `key:` / `label:` list beside `vp_server_favorites`). The old keys are no longer read:
+     * the API answers any key, an invented one included, with the Alpha stream. The API allows 15
+     * requests per 60 seconds, so test a few at a time.
+     *
+     * Checked on 31 October 2026 on Fight Club, The Matrix, Game of Thrones S1E1 and more, following
+     * each stream to media bytes with the headers below. Only Nebula (`w7dn`) is listed. It gave
+     * 1080p and 720p HLS on every title tried (360p on most), and its segments are MPEG-TS on every episode tried
+     * (Game of Thrones, Breaking Bad, Stranger Things, The Office, Dan Da Dan). On films they were
+     * behind a PNG header on six of seven (Fight Club, The Matrix, The Dark Knight, Interstellar,
+     * Dune, Oppenheimer; Inception was plain TS), which a player may refuse; that was not tried in
+     * the app. Left out: Alpha (`k2mq`), whose relay (`followguchimany.workers.dev`) answers 403 to
+     * every request; Beta (`b4tz`) and Orbit (`r3yk`), which answer 500 on a film and an episode;
+     * and Lisbon (`v3hq`), which answers 502. A source that answers nothing, or whose playlist does
+     * not load, costs only its own rows.
      */
     private suspend fun pulseVideos(
         tmdbId: String,
@@ -2430,14 +2437,16 @@ class RentaroExtractor(
      * reply's links are sealed, and each opens to a media playlist, served bare: no Referer, Origin or
      * cookie was needed on the playlists or their segments.
      *
-     * Checked on 18 October 2026 on seven titles (films, series and anime, with a colon, an ampersand and
-     * an accent among the names), following every playlist to media bytes: Alatreon (two playlists of
-     * different encodes on rotating workers.dev hosts, segments with no file extension) and Daedalus (one
-     * playlist, signed for about three hours, segments named `.jpg` that are MPEG-TS) played on every
-     * title they answered for. Each answered 404 "no streams" for one of them (Daedalus for Spider-Man:
-     * Brand New Day, Alatreon for Amélie), which costs only its own rows. The first, middle and last
-     * segments were read for three of the titles. Segment names like these are ones FFmpeg refuses unless
-     * told `extension_picky 0`, as with Koto, Dave and Jay; whether the app's player does is untested.
+     * Checked on 31 October 2026 on nineteen titles (films and series, anime among them), after the
+     * field names in [ZxcCipher] had been replaced. Alatreon answered with two links on 17 of the 19
+     * (Spirited Away and Amelie got "Holly scrape failed", which costs only its own rows). Each link
+     * opens to `vidstuck.cc/backend/servers/atlas/edge?url=...`, a playlist the edge serves bare, whose
+     * segments sit on rotating workers.dev hosts and are MPEG-TS with no file extension; the first,
+     * middle and last segments were read for Fight Club, Game of Thrones S1E1 and The Matrix. Segment
+     * names like these are ones FFmpeg refuses unless told `extension_picky 0`, as with Koto, Dave and
+     * Jay; whether the app's player does is untested.
+     *
+     * Daedalus is no longer listed: it answered 404 "No streams found" on all 19 titles.
      */
     private suspend fun fluxVideos(
         tmdbId: String,
@@ -4332,11 +4341,7 @@ class RentaroExtractor(
 
         /** The sources named as the site's own server menu names them, `key` being what `?source=` takes. */
         private val PULSE_SOURCES = listOf(
-            PulseSource("scrapify", "Alpha"),
-            // ffprobe on Fight Club's three files: hevc 1280x532, hevc 640x266, hevc 870x360.
-            PulseSource("oreon", "Oreon", hevc = true),
-            PulseSource("fsonic", "Nebula"),
-            PulseSource("lookmovie", "Spider"),
+            PulseSource("w7dn", "Nebula"),
         )
 
         // Videasy (player.videasy.ws) and VidSrc.to are one vidsrc.sh player behind two domains. The
@@ -4379,10 +4384,12 @@ class RentaroExtractor(
          *  - Atlas, whose manifests answered 427 on every title.
          *  - Ursa, whose playlists loaded on one title in four and whose segments answered 502 and 526.
          *  - The hidden Resshin, whose host no longer resolves.
+         *  - Daedalus, which answered 404 "No streams found" on all 19 titles tried on 31 October 2026
+         *    (it played on 18 October). Add it back if it starts answering.
+         * Atlas, Ursa, Orion and Valstrax were not re-tried on 31 October.
          */
         private val FLUX_SERVERS = listOf(
             FluxServer("alatreon", "Alatreon"),
-            FluxServer("daedalus", "Daedalus"),
         )
 
         // OneTouchTV's public Devcorp catalogue and playback API.
