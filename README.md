@@ -40,6 +40,7 @@ the index repository.
 | Rentaro | en |
 | Arvin-RF | en |
 | Arvin-ND | en |
+| Arvin-KD | en |
 
 ## Progressive stream resolution
 
