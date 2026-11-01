@@ -38,6 +38,7 @@ the index repository.
 | Name | Language |
 | --- | --- |
 | Rentaro | en |
+| Arvin-RF | en |
 
 ## Progressive stream resolution
 
