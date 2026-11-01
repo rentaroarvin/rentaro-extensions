@@ -41,6 +41,7 @@ the index repository.
 | Arvin-RF | en |
 | Arvin-ND | en |
 | Arvin-KD | en |
+| Arvin-HD | en |
 
 ## Progressive stream resolution
 
