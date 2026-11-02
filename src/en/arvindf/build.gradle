@@ -1,0 +1,22 @@
+ext {
+    extName = 'Arvin-DF'
+    extClass = '.ArvinDf'
+    extVersionCode = 1
+    isNsfw = false
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}
