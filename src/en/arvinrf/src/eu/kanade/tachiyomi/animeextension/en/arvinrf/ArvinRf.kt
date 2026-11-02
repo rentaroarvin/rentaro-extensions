@@ -20,6 +20,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -63,12 +64,12 @@ class ArvinRf :
             noPopular.add(provider)
         }
         // Fall back to the default listing so the tab is not blank for such a provider.
-        return client.newCall(latestUpdatesRequest(page)).awaitSuccess().use { latestUpdatesParse(it) }
+        return client.newCall(feedRequest(provider, page, popular = false)).awaitSuccess().use { popularAnimeParse(it) }
     }
 
-    // The API has no "newest" feed: every name tried returned the default listing, and only
-    // `popular` reorders it. So Latest is the provider's default listing and Popular is `popular`.
-    override fun latestUpdatesRequest(page: Int): Request = feedRequest(preferences.providerPref, page, popular = false)
+    // Explore's "All Regions" listing omits provider and feed, mixing titles across providers.
+    // Keep it independent of Popular's selected provider instead of repeating that provider's home.
+    override fun latestUpdatesRequest(page: Int): Request = feedRequest(null, page, popular = false)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseFeed(response)
 
@@ -94,21 +95,7 @@ class ArvinRf :
 
     override fun searchAnimeParse(response: Response): AnimesPage = parseFeed(response)
 
-    private fun feedRequest(provider: String, page: Int, popular: Boolean): Request {
-        // `offset` is a page index, not an item offset.
-        val url = API_URL.toHttpUrl().newBuilder()
-            .addPathSegments("api/home")
-            .addQueryParameter("provider", provider)
-            .addQueryParameter("offset", (page - 1).toString())
-            .addQueryParameter("lang", LANG)
-            .apply {
-                if (popular) addQueryParameter("feed", "popular")
-                // WeTV's plain home feed answers 502; only its anime category (10240) loads.
-                if (provider == "wetv") addQueryParameter("category", WETV_CATEGORY)
-            }
-            .build()
-        return GET(url, headers)
-    }
+    private fun feedRequest(provider: String?, page: Int, popular: Boolean): Request = GET(feedUrl(provider, page, popular), headers)
 
     /**
      * Several providers ignore `offset` past the first page and answer the same titles again
@@ -133,8 +120,7 @@ class ArvinRf :
         val page = (url.queryParameter("offset")?.toIntOrNull() ?: 0) + 1
         val feed = response.parseAs<FeedDto>()
 
-        val key = listOf("provider", "feed", "q").joinToString("|") { url.queryParameter(it).orEmpty() }
-        val fresh = unseen(key, page, feed.data)
+        val fresh = unseen(feedKey(url), page, feed.data)
 
         val shown = fresh.filter { it.provider in SUPPORTED_IDS && !it.title.isNullOrBlank() }
         // Paging stops when a page brings nothing new. The decision uses the unfiltered page so a
@@ -297,7 +283,7 @@ class ArvinRf :
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         screen.addListPreference(
             key = PREF_PROVIDER_KEY,
-            title = "Provider shown in Popular and Latest",
+            title = "Provider shown in Popular",
             entries = ARVIN_RF_PROVIDERS.map { it.label },
             entryValues = ARVIN_RF_PROVIDERS.map { it.id },
             default = PREF_PROVIDER_DEFAULT,
@@ -350,5 +336,27 @@ class ArvinRf :
         private const val PREF_PROVIDER_DEFAULT = "mydrama"
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_DEFAULT = "1080"
+
+        internal fun feedUrl(provider: String?, page: Int, popular: Boolean): HttpUrl = API_URL.toHttpUrl().newBuilder()
+            .addPathSegments("api/home")
+            // `offset` is a page index, not an item offset.
+            .addQueryParameter("offset", (page - 1).toString())
+            .addQueryParameter("lang", LANG)
+            .apply {
+                if (provider != null) addQueryParameter("provider", provider)
+                if (popular) addQueryParameter("feed", "popular")
+                // WeTV's plain home feed answers 502; only its anime category (10240) loads.
+                if (provider == "wetv") addQueryParameter("category", WETV_CATEGORY)
+            }
+            .build()
+
+        internal fun feedKey(url: HttpUrl): String = listOf(
+            url.encodedPath,
+            url.queryParameter("provider").orEmpty(),
+            url.queryParameter("feed").orEmpty(),
+            url.queryParameter("category").orEmpty(),
+            url.queryParameter("lang").orEmpty(),
+            url.queryParameter("q").orEmpty(),
+        ).joinToString("|")
     }
 }

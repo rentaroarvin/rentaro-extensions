@@ -1,8 +1,22 @@
 ext {
     extName = 'Arvin-RF'
     extClass = '.ArvinRf'
-    extVersionCode = 1
+    extVersionCode = 2
     isNsfw = false
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}
