@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.arvinkd
 
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -20,6 +21,7 @@ import keiyoushi.utils.delegate
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.CacheControl
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
@@ -168,71 +170,89 @@ class ArvinKd :
         val html = fetch(hoster.hosterUrl)
         val player = KdParser.parsePlayer(html) ?: throw Exception("KiligDrama's episode page carried no player data")
 
-        // The page embeds the source for the episode it was opened for. That is the one the link points
-        // at, so it is used as is; the API is only asked when the embedded data is for another serial.
         val requested = Regex("""/episode-(\d+)$""").find(hoster.hosterUrl)?.groupValues?.get(1)?.toIntOrNull()
         val serial = requested?.let { it - 1 + (player.firstSerial ?: 1) }
-        var descriptor = player.source?.takeIf { player.currentSerial == null || serial == null || player.currentSerial == serial }
-        if (descriptor == null && player.bookId != null && serial != null) {
-            val body = fetch("/api/episode-source/${player.bookId}/$serial?lang=$LANG&refresh=1", json = true)
-            descriptor = KdParser.parseDescriptor(body)
-        }
-        descriptor ?: throw Exception("KiligDrama returned no source for this episode")
+        val initial = player.source?.takeIf { player.currentSerial == null || serial == null || player.currentSerial == serial }
 
-        val subtitles = listOfNotNull(
-            descriptor.subtitle?.enc?.let(KdCipher::open)?.let { Track(it, subtitleLabel(descriptor.subtitle.language)) },
-        )
-
-        // A chain lists fallbacks in order; the first one that opens and plays wins.
         var lastProblem: String? = null
-        for (entry in descriptor.entries()) {
-            val link = KdCipher.open(entry.enc)
-            if (link == null) {
-                lastProblem = "a source link did not open (the site may have rotated its key)"
-                continue
-            }
-            val videos = withContext(Dispatchers.IO) { resolve(link, subtitles) }
-            if (videos.isNotEmpty()) return videos.sortedByQuality()
-            lastProblem = "${entry.source ?: entry.type ?: "a source"} refused the request"
-        }
+        val videos = resolveKdPlayback(
+            initial = initial,
+            refresh = if (player.bookId != null && serial != null) {
+                {
+                    Log.i(TAG, "Refreshing stream for ${hoster.hosterUrl.substringBefore('?')}")
+                    val body = fetch(
+                        "/api/episode-source/${player.bookId}/$serial?lang=$LANG&refresh=1",
+                        json = true,
+                        forceNetwork = true,
+                        referer = hoster.hosterUrl,
+                    )
+                    KdParser.parseDescriptor(body).also {
+                        if (it == null) lastProblem = "the refreshed episode source was missing"
+                    }
+                }
+            } else {
+                null
+            },
+            resolve = { descriptor ->
+                // A refreshed descriptor can also replace an expired subtitle URL.
+                val subtitles = listOfNotNull(
+                    descriptor.subtitle?.enc?.let(KdCipher::open)?.let { Track(kdMediaUrl(it), subtitleLabel(descriptor.subtitle.language)) },
+                )
+                var resolved: List<Video> = emptyList()
+                for (entry in descriptor.entries()) {
+                    val link = KdCipher.open(entry.enc)
+                    if (link == null) {
+                        lastProblem = "a source link did not open (the site may have rotated its key)"
+                        Log.w(TAG, "Could not unwrap ${entry.source ?: entry.type ?: "source"} link")
+                        continue
+                    }
+                    resolved = withContext(Dispatchers.IO) { resolve(link, subtitles) }
+                    if (resolved.isNotEmpty()) break
+                    lastProblem = "${entry.source ?: entry.type ?: "a source"} refused the request"
+                }
+                resolved
+            },
+        )
+        if (videos.isNotEmpty()) return videos.sortedByQuality()
         throw Exception("KiligDrama could not supply a playable source: ${lastProblem ?: "none was listed"}")
     }
 
     /**
      * Turns one unwrapped link into videos, or into nothing when it does not play.
      *
-     * The links point at the upstream providers' own hosts. The site's player sends them through its own
-     * media proxy (cdn.dramadizilerim.xyz) for the browser's CORS and referrer rules. This source uses the
-     * unwrapped link directly, without a Referer, and a refusal only moves on to the next entry of the chain.
-     *
-     * That is a design choice to confirm, not a settled fact. The analysis kit saw the proxy answer a
-     * command-line client with HTTP 451 and did not establish why, and going to the upstream host instead
-     * is exactly the substitution that kit avoided. The upstream host answered two small range requests
-     * (a playlist head and a subtitle head) openly; no media was decoded.
+     * ShortTV's upstream denies direct requests, so it follows the same media relay as the site's
+     * player. Other providers keep their existing direct URLs. A refusal moves on to the next
+     * source in the chain, then allows one descriptor refresh.
      */
     private fun resolve(link: String, subtitles: List<Track>): List<Video> {
-        val probe = headers.newBuilder().set("Range", "bytes=0-63").build()
+        val playbackUrl = kdMediaUrl(link)
+        val videoHeaders = kdMediaHeaders(headers, baseUrl, playbackUrl)
+        val probe = videoHeaders.newBuilder().set("Range", "bytes=0-63").build()
         val head = try {
-            client.newCall(GET(link, probe)).execute().use { response ->
+            client.newCall(GET(playbackUrl, probe)).execute().use { response ->
+                // Keep signed URLs and their tokens out of logs.
+                Log.i(TAG, "Stream probe HTTP ${response.code}: ${response.request.url.host}")
                 if (!response.isSuccessful) return emptyList()
                 String(response.peekBody(HEAD_BYTES).bytes(), Charsets.ISO_8859_1).trimStart()
             }
         } catch (e: IOException) {
+            Log.w(TAG, "Stream probe failed: ${e.javaClass.simpleName}")
             return emptyList()
         }
         return when {
             head.contains("#EXTM3U") -> try {
                 playlists.extractFromHls(
-                    playlistUrl = link,
-                    masterHeaders = headers,
-                    videoHeaders = headers,
+                    playlistUrl = playbackUrl,
+                    masterHeaders = videoHeaders,
+                    videoHeaders = videoHeaders,
                     subtitleList = subtitles,
                 )
             } catch (e: IOException) {
+                Log.w(TAG, "HLS playlist failed: ${e.javaClass.simpleName}")
                 emptyList()
             }
             head.isEmpty() || head.startsWith("<") || head.startsWith("{") -> emptyList()
-            else -> listOf(Video(videoUrl = link, videoTitle = "Video", headers = headers, subtitleTracks = subtitles))
+            else -> listOf(Video(videoUrl = playbackUrl, videoTitle = "Video", headers = videoHeaders, subtitleTracks = subtitles))
         }
     }
 
@@ -259,14 +279,26 @@ class ArvinKd :
     }
 
     /** Fetches a site path as text, and says so plainly when the site answers a challenge instead of content. */
-    private suspend fun fetch(path: String, json: Boolean = false): String {
+    private suspend fun fetch(path: String, json: Boolean = false, forceNetwork: Boolean = false, referer: String? = null): String {
         val request = GET(baseUrl + path, if (json) pageHeaders.newBuilder().set("Accept", "application/json").build() else pageHeaders)
+            .newBuilder()
+            .apply {
+                if (forceNetwork) cacheControl(CacheControl.FORCE_NETWORK)
+                if (referer != null) {
+                    header("Referer", baseUrl + referer)
+                    header("Origin", baseUrl)
+                }
+            }
+            .build()
         return client.newCall(request).await().use { response ->
             val body = response.body.string()
             if (response.header("cf-mitigated") == "challenge" || KdParser.isChallenge(body)) {
                 throw Exception("KiligDrama is asking for a Cloudflare check. Open the site once in WebView, pass it, and retry.")
             }
-            if (!response.isSuccessful) throw Exception("KiligDrama answered HTTP ${response.code}")
+            if (!response.isSuccessful) {
+                Log.w(TAG, "Site request HTTP ${response.code}: ${request.url.encodedPath}")
+                throw Exception("KiligDrama answered HTTP ${response.code}")
+            }
             body
         }
     }
@@ -293,6 +325,7 @@ class ArvinKd :
     private class SourceFilter : AnimeFilter.Select<String>("Source (wins over genre)", arrayOf("Any") + KD_SOURCES.map { it.label }.toTypedArray())
 
     companion object {
+        private const val TAG = "ArvinKD"
         private const val LANG = "en"
         private const val HEAD_BYTES = 64L
 

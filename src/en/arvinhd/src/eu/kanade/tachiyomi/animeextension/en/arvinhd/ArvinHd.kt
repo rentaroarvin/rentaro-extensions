@@ -262,8 +262,20 @@ class ArvinHd :
                     masterHeaders = headers,
                     videoHeaders = headers,
                     subtitleList = subtitles,
-                    videoNameGen = { quality -> "$label · $quality" },
-                )
+                    videoNameGen = { quality -> "$label · $quality · HLS" },
+                ).map { video ->
+                    // A media playlist can remain behind /api/stream/<id>/<variant>.
+                    // Media3 selects its media source before following that redirect,
+                    // so retain a client-only HLS hint without changing the request URL.
+                    val mediaUrl = video.videoUrl
+                    video.copy(
+                        videoUrl = if (mediaUrl.contains(".m3u8", ignoreCase = true) || '#' in mediaUrl) {
+                            mediaUrl
+                        } else {
+                            "$mediaUrl#.m3u8"
+                        },
+                    )
+                }
             } catch (e: IOException) {
                 null
             }

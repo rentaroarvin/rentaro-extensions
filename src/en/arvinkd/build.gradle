@@ -1,12 +1,23 @@
 ext {
     extName = 'Arvin-KD'
     extClass = '.ArvinKd'
-    extVersionCode = 1
+    extVersionCode = 2
     isNsfw = false
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
+android {
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
 dependencies {
     implementation(project(':lib:playlistutils'))
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
 }
