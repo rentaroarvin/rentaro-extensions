@@ -11,7 +11,6 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.await
-import keiyoushi.utils.parallelMapNotNull
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.SerializationException
 import okhttp3.HttpUrl
@@ -21,86 +20,49 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Locale
 
 /**
- * DramaFren (dramafren.org) is a WordPress catalogue of short Chinese dramas that links out to
- * third-party players, and it runs a separate DramaWave subsite (dramawave.dramafren.org) with its own
- * titles and a JSON source API. Both are covered here, as two catalogues behind one source.
+ * Arvin-DF covers the subsites of dramafren.org, not the WordPress site itself:
  *
- *  - **DramaFren.** Listing, search and the series page are plain HTML. Each episode's watch page offers
- *    a handful of players; only Abyss is played. The embed carries its own source configuration (see
- *    [AbyssConfig]), which this reads directly. The player's click-to-open-popups overlay is a page
- *    script that never runs here, and nothing is forged to stand in for it.
- *  - **DramaWave.** Pages are behind a Cloudflare check that the host's client answers the way the app
- *    does (open the source in WebView once); when that is not enough this says so. The source API on
- *    the CDN hosts answers openly and returns an HLS master whose audio is a separate rendition.
- *
+ *  - **DramaWave** (dramawave.dramafren.org) has its own titles and a JSON source API. Its pages are
+ *    behind a Cloudflare check that the host's client answers the way the app does (open the source in
+ *    WebView once); when that is not enough this says so. The source API on the CDN hosts answers openly
+ *    and returns an HLS master whose audio is a separate rendition.
  *  - **Provider portals.** dramafren.org links to a set of provider portals (DramaBox, GoodShort,
  *    NetShort, FlickReels, ReelShort and others) that have their own titles. The ones that answered in
  *    the capture are browsable through the Catalogue filter; see [Portals] and [PortalSource].
  *
- * UPNShare, the other player the site embeds, is not used: its page runs a "Verifying human" check
- * that this extension does not answer. The same goes for the site's other mirrors.
- *
- * `SAnime.url` is a site path (`/series/<slug>/`, or `/watch/<slug>/` for cards that point at an
- * episode), `dw/<lang>/<id>` for DramaWave, or `p/<portal>/<reference>` for a provider portal.
- * `SEpisode.url` is the watch path, `dw/<lang>/<id>/<episode>`, or `p/<portal>/<reference>`.
+ * `SAnime.url` is `dw/<lang>/<id>` for DramaWave, or `p/<portal>/<reference>` for a provider portal.
+ * `SEpisode.url` is `dw/<lang>/<id>/<episode>` or `p/<portal>/<reference>`. A library entry saved by an
+ * older version from the main site (`/series/...`, `/watch/...`) has neither shape and says so.
  */
 class ArvinDf : AnimeHttpSource() {
 
     override val name = "Arvin-DF"
 
-    override val baseUrl = Routes.DRAMAFREN
+    override val baseUrl = Routes.DRAMAWAVE
 
     override val lang = "en"
-    override val supportsLatest = true
+
+    // DramaWave's only browse feed is its Recently Watched list, which is what Popular shows. A Latest
+    // tab would repeat it.
+    override val supportsLatest = false
 
     // ============================ Browse / search ============================
 
-    override suspend fun getPopularAnime(page: Int): AnimesPage = dramaFrenListing(Routes.advancedSearch(page, OrderFilter.POPULAR, null))
-
-    /** The series archive lists newest first and has no ordering parameter, which suits "latest". */
-    override suspend fun getLatestUpdates(page: Int): AnimesPage {
-        val url = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegments(if (page > 1) "series/page/$page/" else "series/")
-            .build()
-        return dramaFrenListing(url)
-    }
+    override suspend fun getPopularAnime(page: Int): AnimesPage = dramaWaveListing(page, DEFAULT_LANGUAGE, null)
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Pick a catalogue. Sort and status apply to DramaFren; language applies to DramaWave."),
+        AnimeFilter.Header("Pick a catalogue. Language applies to DramaWave."),
         CatalogueFilter(),
         LanguageFilter(),
-        OrderFilter(),
-        StatusFilter(),
     )
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        val text = query.trim()
-        val catalogue = filters.filterIsInstance<CatalogueFilter>().firstOrNull()
-        catalogue?.portal?.let { portal -> return portalListing(portal, page, text.ifEmpty { null }) }
-        if (catalogue?.isDramaWave == true) {
-            val language = filters.filterIsInstance<LanguageFilter>().firstOrNull()?.code ?: DEFAULT_LANGUAGE
-            return dramaWaveListing(page, language, text.ifEmpty { null })
-        }
-        if (text.isNotEmpty()) return dramaFrenListing(Routes.keywordSearch(page, text))
-        val order = filters.filterIsInstance<OrderFilter>().firstOrNull()?.value ?: OrderFilter.POPULAR
-        val status = filters.filterIsInstance<StatusFilter>().firstOrNull()?.value
-        return dramaFrenListing(Routes.advancedSearch(page, order, status))
-    }
-
-    private suspend fun dramaFrenListing(listUrl: HttpUrl): AnimesPage {
-        val result = DramaFrenParser.listing(document(listUrl))
-        val animes = result.cards.map { card ->
-            SAnime.create().apply {
-                title = card.title
-                url = card.url
-                thumbnail_url = card.thumbnail
-            }
-        }
-        return AnimesPage(animes, result.hasNext && animes.isNotEmpty())
+        val text = query.trim().ifEmpty { null }
+        filters.filterIsInstance<CatalogueFilter>().firstOrNull()?.portal?.let { portal -> return portalListing(portal, page, text) }
+        val language = filters.filterIsInstance<LanguageFilter>().firstOrNull()?.code ?: DEFAULT_LANGUAGE
+        return dramaWaveListing(page, language, text)
     }
 
     private suspend fun dramaWaveListing(page: Int, language: String, query: String?): AnimesPage {
@@ -152,7 +114,7 @@ class ArvinDf : AnimeHttpSource() {
             val ref = dramaWaveRef(anime.url)
             return Routes.dramaWaveDetail(ref.id, ref.lang).toString()
         }
-        return absolute(anime.url)
+        return baseUrl
     }
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET(getAnimeUrl(anime), headers)
@@ -168,41 +130,18 @@ class ArvinDf : AnimeHttpSource() {
                 status = SAnime.UNKNOWN
             }
         }
-        if (anime.url.startsWith(DW_PREFIX)) {
-            val ref = dramaWaveRef(anime.url)
-            val page = document(Routes.dramaWaveDetail(ref.id, ref.lang))
-            return SAnime.create().apply {
-                DramaWaveParser.title(page)?.let { title = it }
-                DramaWaveParser.poster(page)?.let { thumbnail_url = it }
-                description = DramaWaveParser.description(page)
-                status = SAnime.UNKNOWN
-            }
-        }
-        val (_, page) = seriesDocument(anime.url)
+        if (!anime.url.startsWith(DW_PREFIX)) throw mainSiteEntry()
+        val ref = dramaWaveRef(anime.url)
+        val page = document(Routes.dramaWaveDetail(ref.id, ref.lang))
         return SAnime.create().apply {
-            DramaFrenParser.title(page)?.let { title = it }
-            DramaFrenParser.poster(page)?.let { thumbnail_url = it }
-            status = when (DramaFrenParser.status(page)?.lowercase()) {
-                "completed" -> SAnime.COMPLETED
-                "ongoing" -> SAnime.ONGOING
-                "dropped" -> SAnime.CANCELLED
-                else -> SAnime.UNKNOWN
-            }
+            DramaWaveParser.title(page)?.let { title = it }
+            DramaWaveParser.poster(page)?.let { thumbnail_url = it }
+            description = DramaWaveParser.description(page)
+            status = SAnime.UNKNOWN
         }
     }
 
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException("Not used")
-
-    /**
-     * The advanced search lists episode posts (`/watch/...`) where the archive lists series, and a watch
-     * page names its series in the breadcrumb. A post with no series is shown as a title of its own.
-     */
-    private suspend fun seriesDocument(path: String): Pair<String, Document> {
-        val first = document(absolute(path).toHttpUrl())
-        if (!path.startsWith("/watch/")) return path to first
-        val series = DramaFrenParser.seriesPath(first) ?: return path to first
-        return series to document(absolute(series).toHttpUrl())
-    }
 
     // ================================ Episodes ================================
 
@@ -219,43 +158,15 @@ class ArvinDf : AnimeHttpSource() {
                 }
             }
         }
-        if (anime.url.startsWith(DW_PREFIX)) {
-            val ref = dramaWaveRef(anime.url)
-            val numbers = DramaWaveParser.episodes(document(Routes.dramaWaveDetail(ref.id, ref.lang)))
-            if (numbers.isEmpty()) throw Exception("DramaWave listed no episodes for this title")
-            return numbers.sortedDescending().map { number ->
-                SEpisode.create().apply {
-                    name = "Episode $number"
-                    episode_number = number.toFloat()
-                    url = "${anime.url}/$number"
-                }
-            }
-        }
-
-        val (_, page) = seriesDocument(anime.url)
-        val rows = DramaFrenParser.episodes(page)
-        if (rows.isEmpty()) {
-            // A post with no episode list is the episode itself.
-            if (!anime.url.startsWith("/watch/")) throw Exception("DramaFren listed no episodes for this title")
-            return listOf(
-                SEpisode.create().apply {
-                    name = DramaFrenParser.title(page) ?: "Episode 1"
-                    episode_number = 1f
-                    url = anime.url
-                },
-            )
-        }
-        return rows.sortedByDescending { it.number ?: 0f }.map { row ->
+        if (!anime.url.startsWith(DW_PREFIX)) throw mainSiteEntry()
+        val ref = dramaWaveRef(anime.url)
+        val numbers = DramaWaveParser.episodes(document(Routes.dramaWaveDetail(ref.id, ref.lang)))
+        if (numbers.isEmpty()) throw Exception("DramaWave listed no episodes for this title")
+        return numbers.sortedDescending().map { number ->
             SEpisode.create().apply {
-                val number = row.number
-                name = when {
-                    number == null -> row.title.ifEmpty { "Episode" }
-                    row.title.isEmpty() || row.title.equals("FULL EPISODE", ignoreCase = true) -> "Episode ${number.toInt()}"
-                    else -> "Episode ${number.toInt()} - ${row.title}"
-                }
-                episode_number = number ?: 0f
-                url = row.path
-                date_upload = parseDate(row.date)
+                name = "Episode $number"
+                episode_number = number.toFloat()
+                url = "${anime.url}/$number"
             }
         }
     }
@@ -263,10 +174,6 @@ class ArvinDf : AnimeHttpSource() {
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException("Not used")
 
     override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException("Not used")
-
-    private fun parseDate(text: String): Long = runCatching {
-        SimpleDateFormat("MMMM d, yyyy", Locale.US).parse(text)?.time
-    }.getOrNull() ?: 0L
 
     // ============================== Video links ==============================
 
@@ -276,124 +183,21 @@ class ArvinDf : AnimeHttpSource() {
         parsePortalRef(episode.url)?.let { (portal, _) ->
             return listOf(Hoster(hosterUrl = episode.url, hosterName = portal.label))
         }
-        if (episode.url.startsWith(DW_PREFIX)) {
-            val ref = dramaWaveRef(episode.url)
-            val number = ref.episode ?: throw Exception("This DramaWave episode has no number")
-            return listOf(1, 2).map { server ->
-                Hoster(hosterUrl = "$DW_PREFIX$server/${ref.lang}/${ref.id}/$number", hosterName = "DramaWave server $server")
-            }
-        }
-
-        val mirrors = DramaFrenParser.mirrors(document(absolute(episode.url).toHttpUrl()))
-        val abyss = mirrors.filter { DramaFrenParser.isAbyss(it.url) }
-        if (abyss.isEmpty()) {
-            if (mirrors.isEmpty()) throw Exception("DramaFren lists no player for this episode")
-            val names = mirrors.joinToString(", ") { it.label.ifBlank { "unnamed" } }
-            throw Exception("This episode is only on $names. Arvin-DF plays Abyss, and the site's UPNShare asks for a human check it does not answer.")
-        }
-        return abyss.mapIndexed { index, mirror ->
-            Hoster(hosterUrl = "$ABYSS_PREFIX${mirror.url}", hosterName = if (abyss.size > 1) "Abyss ${index + 1}" else "Abyss")
+        if (!episode.url.startsWith(DW_PREFIX)) throw mainSiteEntry()
+        val ref = dramaWaveRef(episode.url)
+        val number = ref.episode ?: throw Exception("This DramaWave episode has no number")
+        return listOf(1, 2).map { server ->
+            Hoster(hosterUrl = "$DW_PREFIX$server/${ref.lang}/${ref.id}/$number", hosterName = "DramaWave server $server")
         }
     }
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> = when {
-        hoster.hosterUrl.startsWith(ABYSS_PREFIX) -> abyssVideos(hoster.hosterUrl.removePrefix(ABYSS_PREFIX))
         hoster.hosterUrl.startsWith(DW_PREFIX) -> dramaWaveVideos(hoster.hosterUrl.removePrefix(DW_PREFIX))
         hoster.hosterUrl.startsWith(PORTAL_PREFIX) -> {
             val (portal, ref) = parsePortalRef(hoster.hosterUrl) ?: throw Exception("Arvin-DF does not know this portal")
             portalSource.videos(portal, ref)
         }
         else -> throw Exception("Arvin-DF does not know this player")
-    }
-
-    // ---------------------------------- Abyss ----------------------------------
-
-    private suspend fun abyssVideos(embedUrl: String): List<Video> {
-        val embed = embedUrl.toHttpUrl()
-        val html = client.newCall(GET(embed, headers.newBuilder().set("Referer", "$baseUrl/").build())).await().use { response ->
-            if (!response.isSuccessful) throw Exception("Abyss answered HTTP ${response.code}")
-            response.body.string()
-        }
-        val config = try {
-            AbyssConfig.read(html)
-        } catch (e: IllegalArgumentException) {
-            throw Exception("Abyss changed its player page, so Arvin-DF cannot read it")
-        } catch (e: SerializationException) {
-            throw Exception("Abyss changed its player data, so Arvin-DF cannot read it")
-        }
-        if (config.sources.isEmpty()) {
-            throw Exception(
-                if (config.skipped > 0) {
-                    "This Abyss file uses a delivery route Arvin-DF does not play yet"
-                } else {
-                    "Abyss lists no file for this episode"
-                },
-            )
-        }
-
-        // The storage host answers 403 unless the request carries the embed player's own origin, which
-        // is what the player sends from inside its iframe.
-        val referer = "${embed.scheme}://${embed.host}/"
-        val userAgent = headers["User-Agent"].orEmpty()
-        val reachable = config.sources.parallelMapNotNull { source ->
-            headState(source, referer, userAgent)?.let { encrypted -> source to encrypted }
-        }
-        if (reachable.isEmpty()) throw Exception("Abyss's storage did not serve this episode. Try again later.")
-
-        return reachable
-            .sortedWith(
-                compareByDescending<Pair<AbyssSource, Boolean>> { it.first.label.filter(Char::isDigit).toIntOrNull() ?: 0 }
-                    .thenByDescending { it.first.size },
-            )
-            .map { (source, encrypted) ->
-                Video(
-                    videoUrl = AbyssProxy.urlFor(source, encrypted, referer, userAgent, client),
-                    videoTitle = "Abyss · ${source.label} (${source.size / 1_000_000} MB)",
-                    headers = headers,
-                )
-            }
-    }
-
-    /**
-     * Fetches the first bytes of [source] and works out how its head is stored, the way the Abyss
-     * player does: if the file opens as an MP4 as served it is plain, and if it only does after the
-     * AES-CTR pass it is encrypted. Returns true for encrypted, false for plain, null if neither
-     * reads as an MP4 or the storage host refused.
-     */
-    private suspend fun headState(source: AbyssSource, referer: String, userAgent: String): Boolean? {
-        val request = Request.Builder()
-            .url(source.base)
-            .header("User-Agent", userAgent)
-            .header("Referer", referer)
-            .header("Range", "bytes=0-31")
-            .build()
-        return try {
-            client.newCall(request).await().use { response ->
-                if (response.code != 206 && response.code != 200) return null
-                val head = response.body.byteStream().readNBytesCompat(32)
-                if (head.size < 12) return null
-                when {
-                    isMp4Head(head) -> false
-                    isMp4Head(AbyssCrypto.apply(AbyssCrypto.md5Hex(source.fileName), head)) -> true
-                    else -> null
-                }
-            }
-        } catch (e: IOException) {
-            null
-        }
-    }
-
-    private fun isMp4Head(bytes: ByteArray): Boolean = bytes.size >= 8 && String(bytes, 4, 4, Charsets.ISO_8859_1) == "ftyp"
-
-    private fun java.io.InputStream.readNBytesCompat(count: Int): ByteArray {
-        val buffer = ByteArray(count)
-        var filled = 0
-        while (filled < count) {
-            val read = read(buffer, filled, count - filled)
-            if (read < 0) break
-            filled += read
-        }
-        return buffer.copyOf(filled)
     }
 
     // -------------------------------- DramaWave --------------------------------
@@ -477,37 +281,33 @@ class ArvinDf : AnimeHttpSource() {
         return DramaWaveRef(parts[0], parts[1], parts.getOrNull(2))
     }
 
+    /** What an entry saved from the old main-site catalogue gets, instead of a confusing network error. */
+    private fun mainSiteEntry() = Exception(
+        "This title was saved from the dramafren.org main site, which Arvin-DF no longer covers. " +
+            "Remove it from your library and look it up under DramaWave or a provider portal.",
+    )
+
     /**
-     * DramaWave's pages sit behind a Cloudflare check, which the host's Cloudflare-aware client answers
-     * by loading the page in a WebView. It is kept to those pages: the Abyss storage calls use the plain
-     * client, so a refused request there can never open a WebView.
+     * The subsites' pages sit behind a Cloudflare check, which the host's Cloudflare-aware client answers
+     * by loading the page in a WebView. It is kept to those pages: the media and resolver calls use the
+     * plain client, so a refused request there can never open a WebView.
      */
     private val pageClient by lazy { network.cloudflareClient }
 
     private val portalSource by lazy { PortalSource(client, { pageClient }, headers) }
 
-    /** Fetches a page as HTML, and says plainly when a Cloudflare check answered instead. */
-    private suspend fun document(url: HttpUrl): Document = (if (url.host == DRAMAWAVE_HOST) pageClient else client).newCall(GET(url, headers)).await().use { response ->
+    /** Fetches a DramaWave page as HTML, and says plainly when a Cloudflare check answered instead. */
+    private suspend fun document(url: HttpUrl): Document = pageClient.newCall(GET(url, headers)).await().use { response ->
         val body = response.body.string()
-        if ((response.code == 403 || response.code == 503) && isChallenge(body)) throw Exception(CHALLENGE_MESSAGE)
+        if (Cloudflare.isChallenge(response.code, body)) throw Exception(Cloudflare.message(url.host))
         if (!response.isSuccessful) throw Exception("${url.host} answered HTTP ${response.code}")
         Jsoup.parse(body, url.toString())
     }
-
-    private fun isChallenge(body: String): Boolean = body.contains("Just a moment", ignoreCase = true) ||
-        body.contains("challenges.cloudflare.com", ignoreCase = true)
-
-    private fun absolute(path: String): String = if (path.startsWith("http://") || path.startsWith("https://")) path else baseUrl + path
 
     private fun String.toHttpUrlOrNull(): HttpUrl? = runCatching { toHttpUrl() }.getOrNull()
 
     companion object {
         private const val DW_PREFIX = "dw/"
-        private const val ABYSS_PREFIX = "abyss:"
         private const val DEFAULT_LANGUAGE = "en-US"
-        private const val DRAMAWAVE_HOST = "dramawave.dramafren.org"
-
-        private const val CHALLENGE_MESSAGE =
-            "DramaWave asked for a Cloudflare check. Open this source in WebView, let the page load, then try again."
     }
 }

@@ -2,84 +2,17 @@ package eu.kanade.tachiyomi.animeextension.en.arvindf
 
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.Jsoup
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ParsersTest {
 
     private fun b64(text: String) = java.util.Base64.getEncoder().encodeToString(text.toByteArray())
-
-    private val listing = """
-        <div class="los">
-        <article class="box"><div class="bx"><a class="tip" rel="1" href="https://dramafren.org/series/one/" title="One">
-          <img src="https://i0.wp.com/x/one.jpg?resize=200,300"><h2 class="entry-title">One &amp; Two</h2></a></div></article>
-        <article class="box"><div class="bx"><a class="tip" rel="2" href="https://dramafren.org/watch/two-full/" title="Two Full">
-          <img src="https://i0.wp.com/x/two.jpg"><h2 class="entry-title">Two</h2></a></div></article>
-        <article class="box"><div class="bx"><a class="tip" rel="3" href="https://dramafren.org/series/one/" title="Dup">
-          <h2 class="entry-title">One again</h2></a></div></article>
-        <article class="box"><div class="bx"><a class="tip" rel="4" href="https://elsewhere.test/x/" title="Off"><h2 class="entry-title">Off</h2></a></div></article>
-        </div>
-        <div class="pagination"><span class="page-numbers current">1</span><a class="next page-numbers" href="https://dramafren.org/page/2/">Next</a></div>
-    """
-
-    @Test
-    fun `listing keeps series and watch cards once each and reads the pager`() {
-        val page = DramaFrenParser.listing(Jsoup.parse(listing))
-        assertEquals(listOf("/series/one/", "/watch/two-full/"), page.cards.map { it.url })
-        assertEquals("One & Two", page.cards[0].title)
-        assertEquals("https://i0.wp.com/x/one.jpg?resize=200,300", page.cards[0].thumbnail)
-        assertTrue(page.hasNext)
-    }
-
-    @Test
-    fun `the last listing page has no next`() {
-        assertFalse(DramaFrenParser.listing(Jsoup.parse(listing.replace("next page-numbers", "page-numbers"))).hasNext)
-    }
-
-    @Test
-    fun `a series page gives its episodes with numbers titles and dates`() {
-        val html = """
-            <div class="epsdlist"><ul>
-              <li data-ID="2"><a href="https://dramafren.org/watch/x-part-2-end/"><div class="l"><div class="epl-num">EP 2</div>
-                <div class="epl-title">Part 2 END</div><div class="epl-date">March 23, 2025</div></div></a></li>
-              <li class='tseplsfrst' data-ID="1"><a href="https://dramafren.org/watch/x-part-1/"><div class="l"><div class="epl-num">EP 1</div>
-                <div class="epl-title">FULL EPISODE</div><div class="epl-date">March 23, 2025</div></div></a></li>
-            </ul></div>
-            <ul class="data"><li><b>Status:</b> <span class="colspan"><span>Completed</span></span></li></ul>
-        """
-        val document = Jsoup.parse(html)
-        val rows = DramaFrenParser.episodes(document)
-        assertEquals(listOf("/watch/x-part-2-end/", "/watch/x-part-1/"), rows.map { it.path })
-        assertEquals(listOf(2f, 1f), rows.map { it.number })
-        assertEquals("FULL EPISODE", rows[1].title)
-        assertEquals("March 23, 2025", rows[0].date)
-        assertEquals("Completed", DramaFrenParser.status(document))
-    }
-
-    @Test
-    fun `a watch page names its series in the breadcrumb`() {
-        val html = """
-            <a class="breadcrumb-link" href="https://dramafren.org/">Home</a>
-            <a class="breadcrumb-link" href="https://dramafren.org/series">TV Series</a>
-            <a class="breadcrumb-link" href="https://dramafren.org/series/return-of-his-majesty-chinese-drama/">x</a>
-        """
-        assertEquals("/series/return-of-his-majesty-chinese-drama/", DramaFrenParser.seriesPath(Jsoup.parse(html)))
-        assertNull(DramaFrenParser.seriesPath(Jsoup.parse("<h1>No breadcrumb</h1>")))
-    }
-
-    @Test
-    fun `mirrors are unwrapped from their base64 iframe`() {
-        val abyss = b64("""<iframe src="https://player.abyssplayer.com/2f9I-IVIh" width="100%"></iframe>""")
-        val upper = b64("""<IFRAME SRC="https://Smoothpre.com/embed/4gomaqdudh0a" FRAMEBORDER=0></IFRAME>""")
-        val html = """<a href="#/" data-em="$upper" data-index="1"> VidHide </a><a href="#/" data-em="$abyss" data-index="2"> Abyss </a><a data-em="@@@@">bad</a>"""
-        val mirrors = DramaFrenParser.mirrors(Jsoup.parse(html))
-        assertEquals(listOf("VidHide", "Abyss"), mirrors.map { it.label })
-        assertEquals("https://Smoothpre.com/embed/4gomaqdudh0a", mirrors[0].url)
-        assertEquals("https://player.abyssplayer.com/2f9I-IVIh", mirrors[1].url)
-    }
 
     @Test
     fun `dramawave cards need an id and a title and the pager needs a live next link`() {
@@ -108,26 +41,6 @@ class ParsersTest {
             <a href="index.php?page=watch&amp;id=F&amp;ep=2&amp;lang=en-US">2</a>
         """
         assertEquals(listOf(1, 2, 10), DramaWaveParser.episodes(Jsoup.parse(html)))
-    }
-
-    @Test
-    fun `advanced search writes indexed array keys and pages by path`() {
-        val first = Routes.advancedSearch(1, "popular", null)
-        assertEquals("/advanced-search/", first.encodedPath)
-        assertEquals("series", first.queryParameter("type[0]"))
-        assertNull(first.queryParameter("status[0]"))
-        val second = Routes.advancedSearch(2, "title", "completed")
-        assertEquals("/advanced-search/page/2/", second.encodedPath)
-        assertEquals("completed", second.queryParameter("status[0]"))
-        assertEquals("title", second.queryParameter("order"))
-    }
-
-    @Test
-    fun `keyword search pages by path and keeps the query`() {
-        assertEquals("https://dramafren.org/?s=Spring%20Time", Routes.keywordSearch(1, "Spring Time").toString().replace("+", "%20"))
-        val two = Routes.keywordSearch(2, "Spring")
-        assertEquals("/page/2/", two.encodedPath)
-        assertEquals("Spring", two.queryParameter("s"))
     }
 
     @Test
@@ -180,5 +93,14 @@ class ParsersTest {
         assertEquals(1, info.audio.size)
         assertEquals("https://cdn.example.test/x/a/en.aac.m3u8", info.audio[0].url)
         assertEquals("en-US", info.audio[0].name)
+    }
+
+    @Test
+    fun `base64 reads standard, url safe and unpadded text`() {
+        assertArrayEquals("hello world".toByteArray(), Base64Lite.decode("aGVsbG8gd29ybGQ="))
+        assertArrayEquals("hello world".toByteArray(), Base64Lite.decode("aGVsbG8gd29ybGQ"))
+        assertArrayEquals(byteArrayOf(-5, -1, -2), Base64Lite.decode("+//+"))
+        assertArrayEquals(byteArrayOf(-5, -1, -2), Base64Lite.decode("-__-"))
+        assertThrows(IllegalArgumentException::class.java) { Base64Lite.decode("abéd") }
     }
 }

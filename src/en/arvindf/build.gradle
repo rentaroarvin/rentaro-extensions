@@ -1,7 +1,7 @@
 ext {
     extName = 'Arvin-DF'
     extClass = '.ArvinDf'
-    extVersionCode = 1
+    extVersionCode = 2
     isNsfw = false
 }
 
