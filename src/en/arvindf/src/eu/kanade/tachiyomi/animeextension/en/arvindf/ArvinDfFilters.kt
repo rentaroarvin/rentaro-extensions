@@ -35,6 +35,25 @@ internal class CatalogueFilter :
     val portal: Portal? get() = Portals.ALL.getOrNull(state - 1)
 }
 
+/** Only read for the TvSeries catalogue with no search text: which of its four browse tabs to list. */
+internal class TvFeedFilter :
+    AnimeFilter.Select<String>(
+        "TvSeries browse",
+        TvFeed.entries.map { it.label }.toTypedArray(),
+    ) {
+    val feed: TvFeed get() = TvFeed.entries.getOrElse(state) { TvFeed.HOME }
+}
+
+/** Only read for a TvSeries search: the portal searches series and movies separately. */
+internal class TvSearchTypeFilter :
+    AnimeFilter.Select<String>(
+        "TvSeries search in",
+        arrayOf("Series", "Movies"),
+    ) {
+    /** The portal's `subjectType`: 2 for series, 1 for movies. */
+    val subjectType: Int get() = if (state == 1) 1 else 2
+}
+
 /** Only read for the DramaWave catalogue. It chooses the language of titles and subtitles. */
 internal class LanguageFilter :
     AnimeFilter.Select<String>(

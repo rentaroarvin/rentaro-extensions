@@ -133,6 +133,94 @@ internal object PortalResolvers {
         return Resolved(streams).takeIf { it.streams.isNotEmpty() }
     }
 
+    /**
+     * ShotShort `/book/{id}/chapter/{chapterId}`: the page plays `hdUrl || sdUrl || ldUrl`, all HLS
+     * playlists, so those three are offered best first. Its subtitles come as `data.subtitles`, either
+     * lists (`{list: [...]}`) or bare entries, each with the upstream address in `url`.
+     */
+    fun shotshort(root: JsonObject): Resolved? {
+        val data = PortalJson.shotshortData(root) ?: return null
+        val streams = listOf("HD" to "hdUrl", "SD" to "sdUrl", "LD" to "ldUrl").mapNotNull { (label, key) ->
+            data[key].text()?.takeIf { it.startsWith("http") }?.let { Stream(label, it) }
+        }
+        val subs = data["subtitles"].asArray().flatMap { item ->
+            val o = item.asObject() ?: return@flatMap emptyList()
+            val list = o["list"].asArray()
+            if (list.isNotEmpty()) list.mapNotNull { it.asObject() } else listOf(o)
+        }.mapNotNull { sub ->
+            val url = sub["url"].text()?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+            Sub(sub["desc"].text() ?: sub["language"].text() ?: "Subtitles", url)
+        }.sortedByDescending { it.label.startsWith("English") }
+        return Resolved(streams, subs).takeIf { it.streams.isNotEmpty() }
+    }
+
+    /** Whether a ShotShort chapter says it is not free: a lock flag, a VIP episode, or a price. */
+    fun shotshortLocked(root: JsonObject): Boolean {
+        val data = PortalJson.shotshortData(root) ?: return false
+        return data["lock"].flag() == true || data["isVipEpisode"].flag() == true ||
+            (data["price"].text()?.toDoubleOrNull() ?: 0.0) > 0.0
+    }
+
+    /**
+     * MoboReels `video`: the page prefers H.264 entries of `episMedia` by descending resolution, then
+     * `mediaUrl`, then any entry with a URL. The response may be wrapped in `data` or not, as the page allows.
+     */
+    fun moboreels(root: JsonObject): Resolved? {
+        val data = root["data"].asObject() ?: root
+        val media = data["episMedia"].asArray().mapNotNull { it.asObject() }.filter { it["mediaUrl"].text() != null }
+        val h264 = media.filter { it["codec"].text() == "h264" }.sortedByDescending { it["resolution"].text()?.toIntOrNull() ?: 0 }
+        val streams = ArrayList<Stream>()
+        h264.forEach { entry ->
+            val resolution = entry["resolution"].text()?.toIntOrNull() ?: 0
+            streams += Stream(if (resolution > 0) "${resolution}p" else "Video", entry["mediaUrl"].text()!!)
+        }
+        data["mediaUrl"].text()?.let { streams += Stream("Video", it) }
+        media.filter { it["codec"].text() != "h264" }.forEach { entry ->
+            streams += Stream(entry["codec"].text()?.uppercase() ?: "Video", entry["mediaUrl"].text()!!)
+        }
+        return Resolved(streams.filter { it.url.startsWith("http") }.distinctBy { it.url }).takeIf { it.streams.isNotEmpty() }
+    }
+
+    /**
+     * TvSeries `getplay`. The portal's page plays `vid_url_proxy || vid_url || hls[0].url_proxy ||
+     * hls[0].url`; the relay (`url_proxy`) is first because the direct media host answered HTTP 429 to a
+     * plain client in testing while the relay served the same file. Every distinct address is offered,
+     * the 480p MP4 first, then the `hls[]` entries, which are MP4 files too despite the name.
+     * Subtitles come from `subtitles[]` (`url`, `url_proxy` or `subUrl`) or the single `sub_url`.
+     */
+    fun tvseries(root: JsonObject): Resolved? {
+        val data = root["data"].asObject() ?: return null
+        val code = root["code"].text()
+        if (root["error"].text() != null || (code != null && code !in setOf("0", "1", "200"))) return null
+        val streams = ArrayList<Stream>()
+        val quality = data["quality"].text()?.toIntOrNull()
+        val label = if (quality != null && quality > 0) "${quality}p" else "Video"
+        data["vid_url_proxy"].text()?.let { streams += Stream(label, it) }
+        data["vid_url"].text()?.let { streams += Stream(label, it) }
+        data["hls"].asArray().forEach { entry ->
+            val o = entry.asObject() ?: return@forEach
+            val height = o["resolutions"].text()?.toIntOrNull()
+            val name = if (height != null && height > 0) "${height}p" else "Video"
+            o["url_proxy"].text()?.let { streams += Stream(name, it) }
+            o["url"].text()?.let { streams += Stream(name, it) }
+        }
+        // (language code, subtitle), so English can be put first without keeping the code on the result.
+        val subs = ArrayList<Pair<String?, Sub>>()
+        data["subtitles"].asArray().forEach { entry ->
+            val o = entry.asObject() ?: return@forEach
+            val url = o["url_proxy"].text() ?: o["url"].text() ?: o["subUrl"].text() ?: return@forEach
+            subs += o["lang"].text() to Sub(o["label"].text() ?: o["lang"].text() ?: "Subtitles", url)
+        }
+        if (subs.isEmpty()) {
+            (data["sub_url_proxy"].text() ?: data["sub_url"].text())?.let { subs += null to Sub("Subtitles", it) }
+        }
+        val ordered = subs.filter { it.second.url.startsWith("http") }.distinctBy { it.second.url }
+            .sortedByDescending { it.first == "en" || it.first == "en_us" }
+            .map { it.second }
+        val unique = streams.filter { it.url.startsWith("http") }.distinctBy { it.url }
+        return Resolved(unique, ordered).takeIf { it.streams.isNotEmpty() }
+    }
+
     private fun qualities(array: JsonElement?): List<Stream> = array.asArray().mapNotNull { entry ->
         val o = entry.asObject() ?: return@mapNotNull null
         val url = o["playUrl"].text() ?: o["url"].text() ?: return@mapNotNull null

@@ -53,14 +53,20 @@ class ArvinDf : AnimeHttpSource() {
     override suspend fun getPopularAnime(page: Int): AnimesPage = dramaWaveListing(page, DEFAULT_LANGUAGE, null)
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Pick a catalogue. Language applies to DramaWave."),
+        AnimeFilter.Header("Pick a catalogue. Language applies to DramaWave; the last two apply to TvSeries."),
         CatalogueFilter(),
         LanguageFilter(),
+        TvFeedFilter(),
+        TvSearchTypeFilter(),
     )
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val text = query.trim().ifEmpty { null }
-        filters.filterIsInstance<CatalogueFilter>().firstOrNull()?.portal?.let { portal -> return portalListing(portal, page, text) }
+        val tv = TvOptions(
+            feed = filters.filterIsInstance<TvFeedFilter>().firstOrNull()?.feed ?: TvFeed.HOME,
+            searchType = filters.filterIsInstance<TvSearchTypeFilter>().firstOrNull()?.subjectType ?: 2,
+        )
+        filters.filterIsInstance<CatalogueFilter>().firstOrNull()?.portal?.let { portal -> return portalListing(portal, page, text, tv) }
         val language = filters.filterIsInstance<LanguageFilter>().firstOrNull()?.code ?: DEFAULT_LANGUAGE
         return dramaWaveListing(page, language, text)
     }
@@ -79,8 +85,8 @@ class ArvinDf : AnimeHttpSource() {
         return AnimesPage(animes, query == null && result.hasNext && animes.isNotEmpty())
     }
 
-    private suspend fun portalListing(portal: Portal, page: Int, query: String?): AnimesPage {
-        val result = portalSource.listing(portal, page, query)
+    private suspend fun portalListing(portal: Portal, page: Int, query: String?, tv: TvOptions): AnimesPage {
+        val result = portalSource.listing(portal, page, query, tv)
         val animes = result.cards.map { card ->
             SAnime.create().apply {
                 title = card.title
@@ -107,9 +113,7 @@ class ArvinDf : AnimeHttpSource() {
     // ================================ Details ================================
 
     override fun getAnimeUrl(anime: SAnime): String {
-        parsePortalRef(anime.url)?.let { (portal, ref) ->
-            return if (portal.isJson) "${portal.base}/?id=$ref" else "${portal.base}/$ref"
-        }
+        parsePortalRef(anime.url)?.let { (portal, ref) -> return portal.webUrl(ref) }
         if (anime.url.startsWith(DW_PREFIX)) {
             val ref = dramaWaveRef(anime.url)
             return Routes.dramaWaveDetail(ref.id, ref.lang).toString()

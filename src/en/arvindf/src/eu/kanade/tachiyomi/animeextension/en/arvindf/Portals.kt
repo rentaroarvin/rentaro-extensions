@@ -21,7 +21,24 @@ internal enum class Resolver {
     // Same-origin JSON portals.
     MICRODRAMA,
     SHORTWAVE,
+    MOBOREELS,
+    SHOTSHORT,
+    TVSERIES,
 }
+
+/**
+ * The browse tabs of TvSeries, with the first page number the portal's own script requests for each.
+ * `home` and `movie` answer one page of sections; the two trending tabs are the paged ones.
+ */
+internal enum class TvFeed(val label: String, val route: String, val paged: Boolean, val firstPage: Int) {
+    HOME("Home", "home", false, 1),
+    TRENDING("Trending series", "trending", true, 0),
+    MOVIES("Movies", "movie", false, 1),
+    MOVIE_TRENDING("Trending movies", "movie/trending", true, 1),
+}
+
+/** What the user chose for TvSeries: the browse tab, and whether a keyword search looks for series (2) or movies (1). */
+internal data class TvOptions(val feed: TvFeed = TvFeed.HOME, val searchType: Int = 2)
 
 /** The query parameter a portal's home page uses to reach its next page. */
 internal enum class HomePager { P_HIST, HP, TAB }
@@ -44,9 +61,29 @@ internal data class Portal(
     val searchPager: SearchPager = SearchPager.NONE,
     /** Resolver endpoints, raced together; the first good answer wins. */
     val pool: List<String> = emptyList(),
+    /** The query key a JSON portal's routes go under: `api_route`, or `api_path` for ShotShort. */
+    val apiParam: String = "api_route",
+    /**
+     * Whether the media host is sent the portal's own origin as Referer, as a browser playing the portal's
+     * page would. Not shown to be required: the only media links captured had expired before they were tried.
+     */
+    val mediaReferer: Boolean = false,
 ) {
     val isJson: Boolean
-        get() = resolver == Resolver.MICRODRAMA || resolver == Resolver.SHORTWAVE
+        get() = resolver == Resolver.MICRODRAMA || resolver == Resolver.SHORTWAVE ||
+            resolver == Resolver.MOBOREELS || resolver == Resolver.SHOTSHORT || resolver == Resolver.TVSERIES
+
+    /** The portal's own page for a title, which is where "open in browser" should land. */
+    fun webUrl(ref: String): String = when {
+        resolver == Resolver.SHOTSHORT -> "$base/?bookId=$ref"
+        // TvSeries titles are stored as `<subjectId>/<detailPath>` and its page wants them as two parameters.
+        resolver == Resolver.TVSERIES -> "$base/".toHttpUrl().newBuilder()
+            .addQueryParameter("id", ref.substringBefore('/'))
+            .addQueryParameter("detailPath", ref.substringAfter('/', ""))
+            .build().toString()
+        isJson -> "$base/?id=$ref"
+        else -> "$base/$ref"
+    }
 
     /** The home listing. Page 1 is the plain front page, which is what the portal serves first. */
     fun homeUrl(page: Int): HttpUrl {
@@ -78,9 +115,9 @@ internal data class Portal(
         return builder.build()
     }
 
-    /** The portal's JSON route, for the two same-origin JSON portals. */
+    /** The portal's JSON route, for the same-origin JSON portals. */
     fun api(route: String, vararg params: Pair<String, String>): HttpUrl {
-        val builder = "$base/".toHttpUrl().newBuilder().addQueryParameter("api_route", route)
+        val builder = "$base/".toHttpUrl().newBuilder().addQueryParameter(apiParam, route)
         params.forEach { (key, value) -> builder.addQueryParameter(key, value) }
         return builder.build()
     }
@@ -93,10 +130,11 @@ internal object Portals {
 
     /**
      * The portals of dramafren.org's navigation that answered in the capture and are played here.
-     * Left out: RadReel, SnackShort and DreameShort (their hostnames did not resolve), Viglo (its API
-     * answered 404), MoboReels and ShotShort (no listing response was captured to read, and their
-     * media could not be checked outside a browser), and TvSeries (landscape TV and films with mixed
-     * mature metadata, not a short-drama provider).
+     * Left out: RadReel, SnackShort and DreameShort (their hostnames did not resolve) and Viglo (its
+     * API answered 404). MoboReels, ShotShort and TvSeries were added from the 2026-11-04 package,
+     * which holds their JSON responses; all three sit behind an interactive Cloudflare check, so they
+     * are covered by those saved shapes only. TvSeries is landscape TV and films rather than short
+     * dramas, added at the user's request.
      */
     val ALL: List<Portal> = listOf(
         Portal("dramabox", "DramaBox", "https://dramabox.dramafren.org", Resolver.DRAMABOX, pool = pool("cdn-dramabox", "cdn-dramaboxv2", "cdn-dramaboxv3")),
@@ -117,6 +155,10 @@ internal object Portals {
         Portal("dramapops", "DramaPops", "https://dramapops.dramafren.org", Resolver.DRAMAPOPS, homeLang = true),
         Portal("microdrama", "MicroDrama", "https://microdrama.dramafren.org", Resolver.MICRODRAMA),
         Portal("shortwave", "ShortWave", "https://shortwave.dramafren.org", Resolver.SHORTWAVE),
+        Portal("moboreels", "MoboReels", "https://moboreels.dramafren.org", Resolver.MOBOREELS, mediaReferer = true),
+        Portal("shotshort", "ShotShort", "https://shotshort.dramafren.org", Resolver.SHOTSHORT, apiParam = "api_path", mediaReferer = true),
+        // `en_us` is what its own script sends for English when it asks for a stream and its subtitles.
+        Portal("tvseries", "TvSeries", "https://tvseries.dramafren.org", Resolver.TVSERIES, lang = "en_us"),
     )
 
     fun byId(id: String): Portal? = ALL.firstOrNull { it.id == id }

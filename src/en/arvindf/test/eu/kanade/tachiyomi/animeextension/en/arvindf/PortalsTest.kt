@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.en.arvindf
 
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.Jsoup
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -35,7 +36,7 @@ class PortalsTest {
 
     @Test
     fun `the portals left out are not offered`() {
-        listOf("radreel", "snackshort", "dreameshort", "viglo", "moboreels", "shotshort", "tvseries").forEach {
+        listOf("radreel", "snackshort", "dreameshort", "viglo").forEach {
             assertNull(it, Portals.byId(it))
         }
     }
@@ -302,6 +303,209 @@ class PortalsTest {
         assertTrue(Cloudflare.isChallenge(403, "<title>Just a moment...</title>"))
         assertFalse(Cloudflare.isChallenge(200, "<title>Just a moment...</title>"))
         assertFalse(Cloudflare.isChallenge(403, "<h1>Forbidden</h1>"))
+    }
+
+    // ---------------------- ShotShort and MoboReels ----------------------
+
+    @Test
+    fun `shotshort routes go under api_path and moboreels under api_route`() {
+        val shot = portal("shotshort")
+        val url = shot.api("/book/3519/episodes", "lang" to "en")
+        assertEquals("/book/3519/episodes", url.queryParameter("api_path"))
+        assertNull(url.queryParameter("api_route"))
+        assertEquals("video", portal("moboreels").api("video", "id" to "1").queryParameter("api_route"))
+        assertTrue(shot.isJson && portal("moboreels").isJson)
+        assertEquals("https://shotshort.dramafren.org/?bookId=3519", shot.webUrl("3519"))
+        assertEquals("https://moboreels.dramafren.org/?id=44277322", portal("moboreels").webUrl("44277322"))
+        assertEquals("https://goodshort.dramafren.org/index.php?page=detail&id=1", portal("goodshort").webUrl("index.php?page=detail&id=1"))
+    }
+
+    @Test
+    fun `shotshort reads books from search and from a category and refuses a failed envelope`() {
+        val search = obj("""{"code":0,"msg":"success","data":{"list":[{"bookId":3519,"bookName":"Love Amidst Hatred","coverUrl":"https://c/1.webp"},{"bookId":3519,"bookName":"dup"},{"bookName":"no id"},{"bookId":7}],"similarList":[]}}""")
+        val books = PortalJson.shotshortBooks(search)
+        assertEquals(listOf("3519"), books.map { it.url })
+        assertEquals("Love Amidst Hatred", books[0].title)
+        assertEquals("https://c/1.webp", books[0].thumbnail)
+        val category = obj("""{"code":0,"msg":"success","data":{"localData":[],"pageData":[{"bookId":"88","bookName":"B"}]}}""")
+        assertEquals(listOf("88"), PortalJson.shotshortBooks(category).map { it.url })
+        // The captured Romance category was empty: that is an empty page, not an error.
+        assertTrue(PortalJson.shotshortBooks(obj("""{"code":0,"data":{"localData":[],"pageData":[]}}""")).isEmpty())
+        assertTrue(PortalJson.shotshortBooks(obj("""{"code":500,"msg":"boom","data":{"list":[{"bookId":1,"bookName":"x"}]}}""")).isEmpty())
+    }
+
+    @Test
+    fun `shotshort chapters keep the provider chapter ids and the detail joins its categories`() {
+        val episodes = obj("""{"code":0,"data":{"bookId":"3519","totalChapters":3,"episodes":[{"chapterId":56414,"chapterOrder":2},{"chapterId":56413,"chapterOrder":1},{"chapterId":56413,"chapterOrder":1},{"chapterOrder":9}]}}""")
+        assertEquals(listOf(2 to "56414", 1 to "56413"), PortalJson.shotshortChapters(episodes))
+        val detail = PortalJson.shotshortDetail(
+            obj("""{"code":0,"data":{"bookName":"Love Amidst Hatred","coverUrl":"https://c/1.webp","recommendIntro":"After an accident","video1stCategory":["Romance"],"video2ndCategory":["Urban"],"video3rdCategory":["Romance"]}}"""),
+        )
+        assertEquals("Love Amidst Hatred", detail.title)
+        assertEquals("After an accident", detail.description)
+        assertEquals("Romance, Urban", detail.genre)
+    }
+
+    @Test
+    fun `shotshort offers hd then sd then ld and flattens both subtitle shapes`() {
+        val root = obj(
+            """{"code":0,"isEncrypt":false,"data":{"price":0,"lock":0,"isVipEpisode":false,
+            "hdUrl":"https://m/hd.m3u8?auth_key=1","sdUrl":"https://m/sd.m3u8","ldUrl":"","fdUrl":"https://m/ignored.m3u8",
+            "subtitles":[{"list":[{"language":"es","desc":"Espanol","url":"https://s/es.srt"},{"language":"en","desc":"English","url":"https://s/en.srt"}]},{"language":"fr","url":"https://s/fr.srt"},{"language":"de"}]}}""",
+        )
+        val resolved = PortalResolvers.shotshort(root)!!
+        assertEquals(listOf("HD" to "https://m/hd.m3u8?auth_key=1", "SD" to "https://m/sd.m3u8"), resolved.streams.map { it.label to it.url })
+        assertEquals(listOf("English", "Espanol", "fr"), resolved.subs.map { it.label })
+        assertFalse(PortalResolvers.shotshortLocked(root))
+        assertNull(PortalResolvers.shotshort(obj("""{"code":0,"data":{"hdUrl":""}}""")))
+        assertNull(PortalResolvers.shotshort(obj("""{"code":1,"data":{"hdUrl":"https://m/hd.m3u8"}}""")))
+    }
+
+    @Test
+    fun `shotshort treats a price a lock or a vip episode as locked`() {
+        assertTrue(PortalResolvers.shotshortLocked(obj("""{"code":0,"data":{"price":3}}""")))
+        assertTrue(PortalResolvers.shotshortLocked(obj("""{"code":0,"data":{"lock":1}}""")))
+        assertTrue(PortalResolvers.shotshortLocked(obj("""{"code":0,"data":{"isVipEpisode":true}}""")))
+        assertFalse(PortalResolvers.shotshortLocked(obj("""{"code":0,"data":{"price":0,"lock":0,"isVipEpisode":false}}""")))
+    }
+
+    @Test
+    fun `moboreels picks the default channel and flattens its sections`() {
+        val channels = obj("""{"code":200,"data":{"channels":[{"channelId":"148131293978560769","title":"Home","isDefault":1},{"channelId":"113757996389499537","title":"New","isDefault":0}]}}""")
+        assertEquals("148131293978560769", PortalJson.moboreelsDefaultChannel(channels))
+        assertEquals("1", PortalJson.moboreelsDefaultChannel(obj("""{"code":200,"data":{"channels":[{"channelId":"1","isDefault":0}]}}""")))
+        assertNull(PortalJson.moboreelsDefaultChannel(obj("""{"code":403,"data":{"channels":[{"channelId":"1"}]}}""")))
+        val list = obj("""{"code":200,"data":{"sections":[{"title":"A","series":[{"seriesId":44277322,"seriesName":"Bind","coverUrl":"https://c/a.jpg"},{"seriesId":2,"seriesName":"Two"}]},{"series":[{"seriesId":44277322,"seriesName":"Bind again"},{"seriesName":"no id"}]}]}}""")
+        val cards = PortalJson.moboreelsSections(list)
+        assertEquals(listOf("44277322", "2"), cards.map { it.url })
+        assertEquals("https://c/a.jpg", cards[0].thumbnail)
+    }
+
+    @Test
+    fun `moboreels search works out its last page from the total`() {
+        fun page(no: Int) = obj("""{"code":200,"data":{"pageNo":$no,"pageSize":20,"total":45,"items":[{"seriesId":$no,"seriesName":"T$no"}]}}""")
+        assertTrue(PortalJson.moboreelsSearch(page(1)).hasNext)
+        assertTrue(PortalJson.moboreelsSearch(page(2)).hasNext)
+        assertFalse(PortalJson.moboreelsSearch(page(3)).hasNext)
+        assertEquals(listOf("2"), PortalJson.moboreelsSearch(page(2)).cards.map { it.url })
+        assertFalse(PortalJson.moboreelsSearch(obj("""{"code":200,"data":{"items":[{"seriesId":1,"seriesName":"x"}]}}""")).hasNext)
+        assertTrue(PortalJson.moboreelsSearch(obj("""{"code":500}""")).cards.isEmpty())
+    }
+
+    @Test
+    fun `moboreels episodes carry the lock flags and detail joins genres`() {
+        val episodes = obj("""{"code":200,"data":{"total":4,"items":[{"episId":"1","episNum":1,"isFree":true,"isLock":false,"isRedLock":false},{"episId":"2","episNum":10,"isFree":false,"isLock":true,"isRedLock":false},{"episId":"3","episNum":11,"isRedLock":true},{"episId":"4","episNum":1},{"episId":"5"}]}}""")
+        assertEquals(listOf(MoboEpisode(1, false), MoboEpisode(10, true), MoboEpisode(11, true)), PortalJson.moboreelsEpisodes(episodes))
+        val detail = PortalJson.moboreelsDetail(obj("""{"code":200,"data":{"seriesName":"Bind By Contract Or Love","coverUrl":"https://c/b.jpg","description":"To secure his inheritance","genres":["CEO","Contractual Marriage"]}}"""))
+        assertEquals("Bind By Contract Or Love", detail.title)
+        assertEquals("CEO, Contractual Marriage", detail.genre)
+    }
+
+    @Test
+    fun `moboreels prefers h264 by resolution then the plain media url`() {
+        val rich = obj(
+            """{"data":{"mediaUrl":"https://m/plain.mp4","episMedia":[
+            {"codec":"h265","resolution":"1080","mediaUrl":"https://m/h265.mp4"},
+            {"codec":"h264","resolution":"540","mediaUrl":"https://m/540.mp4"},
+            {"codec":"h264","resolution":"720","mediaUrl":"https://m/720.mp4"},
+            {"codec":"h264","resolution":"1080"}]}}""",
+        )
+        val streams = PortalResolvers.moboreels(rich)!!.streams
+        assertEquals(listOf("https://m/720.mp4", "https://m/540.mp4", "https://m/plain.mp4", "https://m/h265.mp4"), streams.map { it.url })
+        assertEquals(listOf("720p", "540p"), streams.take(2).map { it.label })
+        // The captured response held only a fallback source: {"data":{"mediaUrl":..., "source":"fallback"}}.
+        val fallback = PortalResolvers.moboreels(obj("""{"data":{"mediaUrl":"https://cdnvideo.example/f0.mp4?t=1","source":"fallback"}}"""))!!
+        assertEquals(listOf("https://cdnvideo.example/f0.mp4?t=1"), fallback.streams.map { it.url })
+        // The page also accepts the same object without the `data` wrapper.
+        assertEquals(1, PortalResolvers.moboreels(obj("""{"mediaUrl":"https://m/x.mp4"}"""))!!.streams.size)
+        assertNull(PortalResolvers.moboreels(obj("""{"data":{"mediaUrl":"not a url"}}""")))
+        assertNull(PortalResolvers.moboreels(obj("""{"data":{}}""")))
+    }
+
+    // ------------------------------ TvSeries ------------------------------
+
+    @Test
+    fun `tvseries titles need a numeric id and a detail path and are stored with both`() {
+        val root = obj(
+            """{"code":0,"message":"ok","data":{"hero_banners":[
+            {"subjectId":"7007542999475706272","detailPath":"love-67wpXcwCEl8","title":"Love","cover_url":"https://c/l.jpg"},
+            {"subjectId":"0","detailPath":"zero","title":"Zero"},
+            {"subjectId":"12ab","detailPath":"bad","title":"Bad id"},
+            {"subjectId":"5","title":"No path"},
+            {"subjectId":"6","detailPath":"a/b","title":"Slash"},
+            {"subjectId":"7","detailPath":"no-title"}],
+            "content_sections":[{"items":[{"subjectId":"7007542999475706272","detailPath":"love-67wpXcwCEl8","title":"Love again"},{"subjectId":"8","detailPath":"ok-8","title":"Eight"}]},{"section_title":"empty"}]}}""",
+        )
+        val cards = PortalJson.tvSections(root)
+        assertEquals(listOf("7007542999475706272/love-67wpXcwCEl8", "8/ok-8"), cards.map { it.url })
+        assertEquals("https://c/l.jpg", cards[0].thumbnail)
+        assertTrue(PortalJson.tvSections(obj("""{"code":500,"data":{"hero_banners":[{"subjectId":"1","detailPath":"a","title":"x"}]}}""")).isEmpty())
+        assertTrue(PortalJson.tvSections(obj("""{"error":"boom","data":{"hero_banners":[{"subjectId":"1","detailPath":"a","title":"x"}]}}""")).isEmpty())
+    }
+
+    @Test
+    fun `tvseries item lists read hasMore from either pager name and accept true as text`() {
+        fun page(pager: String) = obj("""{"code":0,"data":{"items":[{"subjectId":"1","detailPath":"a","title":"A"}],$pager}}""")
+        assertTrue(PortalJson.tvItems(page(""""pager":{"hasMore":true}""")).hasNext)
+        assertTrue(PortalJson.tvItems(page(""""pagination":{"hasMore":"true"}""")).hasNext)
+        assertTrue(PortalJson.tvItems(page(""""pager":{"hasMore":1}""")).hasNext)
+        assertFalse(PortalJson.tvItems(page(""""pager":{"hasMore":false}""")).hasNext)
+        assertFalse(PortalJson.tvItems(page(""""other":1""")).hasNext)
+        assertEquals(1, PortalJson.tvItems(page(""""other":1""")).cards.size)
+    }
+
+    @Test
+    fun `tvseries episodes follow seasons list and a movie is season 0 episode 0`() {
+        val series = obj("""{"code":0,"data":{"subjectType":2,"seasons_list":[{"season":1,"episodes":[1,2,"3"]},{"season":"2","episodes":[1]},{"episodes":[9]},{"season":3,"episodes":[1,1,"x"]}]}}""")
+        assertEquals(
+            listOf(PortalJson.TvEpisode(1, 1), PortalJson.TvEpisode(1, 2), PortalJson.TvEpisode(1, 3), PortalJson.TvEpisode(2, 1), PortalJson.TvEpisode(3, 1)),
+            PortalJson.tvEpisodes(series),
+        )
+        assertEquals(listOf(PortalJson.TvEpisode(0, 0)), PortalJson.tvEpisodes(obj("""{"code":0,"data":{"subjectType":1}}""")))
+        assertTrue(PortalJson.tvEpisodes(obj("""{"code":0,"data":{"subjectType":2}}""")).isEmpty())
+    }
+
+    @Test
+    fun `tvseries offers the relay first then the direct address and puts english subtitles first`() {
+        val root = obj(
+            """{"code":0,"message":"ok","data":{"quality":480,"vid_url":"https://d/480.mp4","vid_url_proxy":"https://r/480",
+            "hls":[{"resolutions":"480","url":"https://d/480.mp4","url_proxy":"https://r/480"},{"resolutions":"360","url":"https://d/360.mp4","url_proxy":"https://r/360"}],
+            "sub_url":"https://d/single.srt",
+            "subtitles":[{"lang":"ar","label":"Arabic","url":"https://d/ar.srt"},{"lang":"en","label":"English","url_proxy":"https://r/en","url":"https://d/en.srt"},{"lang":"bn","label":"Bangla","subUrl":"https://r/bn"},{"lang":"xx"}]}}""",
+        )
+        val resolved = PortalResolvers.tvseries(root)!!
+        assertEquals(listOf("https://r/480", "https://d/480.mp4", "https://r/360", "https://d/360.mp4"), resolved.streams.map { it.url })
+        assertEquals(listOf("480p", "480p", "360p", "360p"), resolved.streams.map { it.label })
+        assertEquals(listOf("English", "Arabic", "Bangla"), resolved.subs.map { it.label })
+        assertEquals("https://r/en", resolved.subs.first().url)
+        // With no subtitles list, the single address is used.
+        val single = PortalResolvers.tvseries(obj("""{"code":0,"data":{"vid_url":"https://d/a.mp4","sub_url":"https://d/one.srt"}}"""))!!
+        assertEquals(listOf("https://d/one.srt"), single.subs.map { it.url })
+        assertEquals("Video", single.streams.single().label)
+    }
+
+    @Test
+    fun `tvseries gives nothing for an empty or failed play answer`() {
+        assertNull(PortalResolvers.tvseries(obj("""{"code":0,"message":"stream video kosong","data":{"hls":[]}}""")))
+        assertNull(PortalResolvers.tvseries(obj("""{"code":0,"data":{"vid_url":"not a url"}}""")))
+        assertNull(PortalResolvers.tvseries(obj("""{"code":403,"data":{"vid_url":"https://d/a.mp4"}}""")))
+        assertNull(PortalResolvers.tvseries(obj("""{"error":"no","data":{"vid_url":"https://d/a.mp4"}}""")))
+        assertNull(PortalResolvers.tvseries(obj("""{"code":0}""")))
+    }
+
+    @Test
+    fun `tvseries details join year country and genres and the open-in-browser link carries both ids`() {
+        val detail = PortalJson.tvDetail(
+            obj("""{"code":0,"data":{"title":"Love","cover_url":"https://c/l.jpg","description":"Intro","releaseDate":"2021-01-23","country":"Korea","genre":"Drama,Percintaan\nRomance,Drama"}}"""),
+        )
+        assertEquals("Drama, Percintaan, Romance", detail.genre)
+        assertEquals("2021 · Korea\n\nIntro", detail.description)
+        assertEquals("Intro", PortalJson.tvDetail(obj("""{"code":0,"data":{"description":"Intro","releaseDate":"n/a"}}""")).description)
+        val link = portal("tvseries").webUrl("7007542999475706272/love-67wpXcwCEl8").toHttpUrl()
+        assertEquals("tvseries.dramafren.org", link.host)
+        assertEquals("7007542999475706272", link.queryParameter("id"))
+        assertEquals("love-67wpXcwCEl8", link.queryParameter("detailPath"))
+        assertEquals("en_us", portal("tvseries").lang)
     }
 
     // -------------------------------- race --------------------------------
