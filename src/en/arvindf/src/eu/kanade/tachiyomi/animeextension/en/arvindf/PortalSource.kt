@@ -89,13 +89,15 @@ internal class PortalSource(
 
     /**
      * ShotShort's category browse and its search both page by `page` with `limit=24`, and its own Next
-     * button stays off once a page comes back short. The category view of the capture came back empty
-     * (`pageData: []`) while search answered, so an empty browse is the portal's, not a parsing fault.
+     * button stays off once a page comes back short. The category route answers an empty `pageData`
+     * unless the request carries `type=2` (the site's "Latest" tab); with no `type`, `type=1` (Trending)
+     * or `type=3` every category came back empty. The portal's own page sends no `type`, so why 2 works
+     * is not known, only that it does (reported from a live test on 2026-11-04). Search needs no `type`.
      */
     private suspend fun shotshortListing(portal: Portal, page: Int, query: String?): ListingPage {
         val paging = arrayOf("page" to page.toString(), "limit" to SHOTSHORT_PAGE.toString(), "lang" to portal.lang)
         val url = if (query == null) {
-            portal.api("/category", "category" to "All", *paging)
+            portal.api("/category", "category" to "All", "type" to SHOTSHORT_LATEST, *paging)
         } else {
             portal.api("/search", "q" to query, *paging)
         }
@@ -437,6 +439,7 @@ internal class PortalSource(
     private companion object {
         const val SHORTWAVE_PAGE = 24
         const val SHOTSHORT_PAGE = 24
+        const val SHOTSHORT_LATEST = "2"
         const val TV_FEED_PAGE = 18
         const val TV_SEARCH_PAGE = 28
         val JSON_TYPE = "application/json".toMediaType()

@@ -11,6 +11,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -51,11 +52,21 @@ class PortalSourceTest {
 
     private val shotMedia = "https://media.example.test/f0/hd.m3u8?auth_key=1"
 
-    private fun shotshort(lock: Boolean = false, encrypted: Boolean = false, price: Int = 0) = source { url ->
+    private fun shotshort(
+        lock: Boolean = false,
+        encrypted: Boolean = false,
+        price: Int = 0,
+        categoryNeedsType: Boolean = false,
+    ) = source { url ->
         if (url.host == "media.example.test") return@source "#EXTM3U\n#EXT-X-VERSION:3\n"
         when (url.queryParameter("api_path")) {
             "/search" -> """{"code":0,"msg":"success","data":{"list":[{"bookId":3519,"bookName":"Love Amidst Hatred","coverUrl":"https://c/1.webp"}]}}"""
-            "/category" -> """{"code":0,"msg":"success","data":{"localData":[],"pageData":[]}}"""
+            // The live portal answers an empty pageData unless the request carries type=2.
+            "/category" -> if (categoryNeedsType && url.queryParameter("type") == "2") {
+                """{"code":0,"msg":"success","data":{"localData":[],"pageData":[{"bookId":88,"bookName":"B","coverUrl":"https://c/88.webp"}]}}"""
+            } else {
+                """{"code":0,"msg":"success","data":{"localData":[],"pageData":[]}}"""
+            }
             "/book/3519" -> """{"code":0,"data":{"bookName":"Love Amidst Hatred","recommendIntro":"After an accident","video1stCategory":["Romance"]}}"""
             "/book/3519/episodes" -> """{"code":0,"data":{"episodes":[{"chapterId":56413,"chapterOrder":1},{"chapterId":56414,"chapterOrder":2}]}}"""
             "/book/3519/chapter/56413" -> """{"code":0,"isEncrypt":$encrypted,"data":{"price":$price,"lock":${if (lock) 1 else 0},"hdUrl":"$shotMedia","sdUrl":"","subtitles":[]}}"""
@@ -82,6 +93,24 @@ class PortalSourceTest {
         assertTrue(result.cards.isEmpty())
         assertFalse(result.hasNext)
         assertEquals("All", seen.single().url.queryParameter("category"))
+    }
+
+    @Test
+    fun `shotshort browse sends type 2 because the category route is empty without it`() {
+        val result = run { shotshort(categoryNeedsType = true).listing(portal("shotshort"), 2, null) }
+        assertEquals(listOf("p/shotshort/88"), result.cards.map { it.url })
+        val request = seen.single().url
+        assertEquals("/category", request.queryParameter("api_path"))
+        assertEquals("2", request.queryParameter("type"))
+        assertEquals("All", request.queryParameter("category"))
+        assertEquals("2", request.queryParameter("page"))
+        assertEquals("24", request.queryParameter("limit"))
+    }
+
+    @Test
+    fun `shotshort search does not send a type`() {
+        run { shotshort().listing(portal("shotshort"), 1, "love") }
+        assertNull(seen.single().url.queryParameter("type"))
     }
 
     @Test
