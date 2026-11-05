@@ -3,8 +3,10 @@ package eu.kanade.tachiyomi.animeextension.en.arvinkd
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Comment
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.jsoup.nodes.Node
 
 /**
  * Reads KiligDrama's server-rendered pages. Kept free of network and Android types so it can be run
@@ -35,19 +37,61 @@ internal object KdParser {
     // fills them arrives later in hidden `<div id="S:n">` blocks, each followed by a `$RS("S:n","P:n")` call
     // that moves its children into the slot (the ids count in hexadecimal). A browser runs those calls. An HTTP client does not, so it sees
     // a grid of 18 cards as 2 cards and 16 empty slots. The swaps are replayed here, in order.
-    private val streamSwap = Regex("""\${'$'}RS\("(S:[0-9a-f]+)","(P:[0-9a-f]+)"\)""")
+    //
+    // A Suspense boundary is completed by a second call, `$RC("B:n","S:m")`: the boundary starts with
+    // `<!--$?--><template id="B:n"></template>`, holds a loading skeleton, ends at the matching `<!--/$-->`,
+    // and the content arrives in a hidden `<div id="S:m">` further down the document. The search results
+    // are such a boundary (a skeleton grid that the real grid replaces), so without replaying it the
+    // results page has no result grid at all.
+    private val streamStep = Regex("""\${'$'}R([SC])\("([A-Z]:[0-9a-f]+)","([A-Z]:[0-9a-f]+)"\)""")
 
     private fun parse(html: String): Document {
         val document = Jsoup.parse(html)
-        val swaps = document.select("script").flatMap { streamSwap.findAll(it.data()).toList() }
-        for (swap in swaps) {
-            val content = document.getElementById(swap.groupValues[1]) ?: continue
-            val slot = document.getElementById(swap.groupValues[2]) ?: continue
-            content.childNodes().toList().forEach { slot.before(it) }
-            slot.remove()
-            content.remove()
+        val steps = document.select("script").flatMap { streamStep.findAll(it.data()).toList() }
+        for (step in steps) {
+            val (kind, first, second) = step.destructured
+            if (kind == "S") swapSegment(document, first, second) else completeBoundary(document, first, second)
         }
         return document
+    }
+
+    /** `$RS(content, slot)`: the children of the hidden content block replace the empty slot. */
+    private fun swapSegment(document: Document, contentId: String, slotId: String) {
+        val content = document.getElementById(contentId) ?: return
+        val slot = document.getElementById(slotId) ?: return
+        content.childNodes().toList().forEach { slot.before(it) }
+        slot.remove()
+        content.remove()
+    }
+
+    /** `$RC(boundary, content)`: the hidden content block replaces the boundary's loading fallback. */
+    private fun completeBoundary(document: Document, boundaryId: String, contentId: String) {
+        val marker = document.getElementById(boundaryId) ?: return
+        val content = document.getElementById(contentId) ?: return
+
+        // The fallback runs from the marker to the boundary's own closing comment; boundaries inside it nest.
+        var depth = 1
+        val fallback = mutableListOf<Node>(marker)
+        var end: Node? = null
+        var node = marker.nextSibling()
+        while (node != null) {
+            if (node is Comment) {
+                val text = node.data
+                if (text.startsWith("$")) {
+                    depth++
+                } else if (text == "/$" && --depth == 0) {
+                    end = node
+                    break
+                }
+            }
+            fallback += node
+            node = node.nextSibling()
+        }
+        if (end == null) return
+
+        content.childNodes().toList().forEach { end.before(it) }
+        fallback.forEach { it.remove() }
+        content.remove()
     }
 
     // ================================ Listings ================================
