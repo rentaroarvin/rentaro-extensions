@@ -98,9 +98,10 @@ class ArvinNd :
             .build()
         val result = client.newCall(GET(url, xhrHeaders)).awaitSuccess().parseAs<SearchDto>()
 
-        // The index mixes languages (about a third of the hits are Indonesian); show only English.
+        // The index mixes languages (about a third of the hits are Indonesian); show only English. Hits carry
+        // a locale such as `en-US`, never the bare `en` that this source reports as its language.
         val animes = result.items
-            .filter { it.languageCode == null || it.languageCode == LANG }
+            .filter { it.languageCode == null || it.languageCode.startsWith(LANG, ignoreCase = true) }
             .mapNotNull { item ->
                 val link = item.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                 SAnime.create().apply {
