@@ -1,7 +1,12 @@
 package eu.kanade.tachiyomi.animeextension.en.arvinhd
 
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
+import android.widget.Toast
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -14,7 +19,9 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.addListPreference
+import keiyoushi.utils.applicationContext
 import keiyoushi.utils.delegate
+import keiyoushi.utils.getEditTextPreference
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.Dispatchers
@@ -26,6 +33,7 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * HepDrama (hepdrama.com) is a Next.js site of vertical short dramas. Browsing and search are plain
@@ -34,9 +42,11 @@ import java.io.IOException
  * watch, then the `/api/stream/...` URL it names, which redirects to the media.
  *
  * The site gives every visitor a limited number of free episodes (ten per series was advertised) and
- * asks the rest to sign up, watch an ad, or buy Premium. This extension plays only what the site
- * serves for free. When the site says an episode is locked, that is reported as an error and nothing
- * else is attempted: no sign-up, no ad unlock, no change of identity.
+ * asks the rest to sign in, watch an ad, or buy Premium. This extension plays what the site serves to
+ * the visitor it is talking to: anonymous by default, or the user's own account when they sign in under
+ * Settings (see [HdAuth]). When the site says an episode is locked, that is reported as an error and
+ * nothing else is attempted: no account is created, no ad unlock, no Premium workaround, no change of
+ * identity.
  *
  * `SAnime.url` is the series path (`/en/series/<slug>`); `SEpisode.url` is `<slug>/<episodeId>`.
  */
@@ -215,7 +225,8 @@ class ArvinHd :
             "OPEN" -> Unit
             // Only the first episodes of a series are free to a visitor without an account.
             "LOGIN_REQUIRED" -> throw Exception(
-                "HepDrama: only the first episodes of a series are free without an account. Sign up on the site to keep watching.",
+                "HepDrama: only the first episodes of a series are free without an account. " +
+                    "Sign in under Settings > HepDrama account (with an account you already have on the site).",
             )
             // The visitor's free allowance for the day is spent.
             "PREMIUM_REQUIRED" -> throw Exception("HepDrama: today's free episodes are used up. Unlock on the site.")
@@ -307,9 +318,110 @@ class ArvinHd :
             default = PREF_VARIANT_DEFAULT,
             summary = "%s",
         )
+
+        // Signing in is optional: browsing and the free episodes work without it. The host's preference
+        // classes on the extension classpath have no categories and no plain `Preference` constructor, so
+        // every row is an `EditTextPreference` or a `SwitchPreferenceCompat`, the two kinds already used here.
+        screen.addPreference(
+            screen.getEditTextPreference(
+                key = PREF_EMAIL_KEY,
+                default = "",
+                title = "HepDrama account: email",
+                summary = emailSummary(preferences.email),
+                getSummary = ::emailSummary,
+                dialogMessage = "Optional. The email of an account you already have on hepdrama.com. " +
+                    "Only needed for episodes the site keeps for signed-in viewers.",
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
+                validate = { EMAIL_REGEX.matches(it.trim()) },
+                validationMessage = { "That doesn't look like an email address." },
+            ),
+        )
+
+        screen.addPreference(
+            screen.getEditTextPreference(
+                key = PREF_PASSWORD_KEY,
+                default = "",
+                title = "HepDrama account: password (signs in)",
+                summary = "Type your password and tap OK to sign in with the email above. The password is used once and never stored.",
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                // Returning false keeps the password out of the saved settings; confirming the dialog is what signs in.
+                onChange = { _, value ->
+                    signIn(value)
+                    false
+                },
+            ),
+        )
+
+        screen.addPreference(
+            actionPreference(screen, "HepDrama account: check status", "Tap to ask HepDrama whether this device is signed in.") { checkStatus() },
+        )
+        screen.addPreference(
+            actionPreference(
+                screen,
+                "HepDrama account: sign out on this device",
+                "Tap to forget the HepDrama session stored on this device. HepDrama is not told, so it stays valid on its side.",
+            ) { signOut() },
+        )
     }
 
     private val SharedPreferences.variantPref by preferences.delegate(PREF_VARIANT_KEY, PREF_VARIANT_DEFAULT)
+
+    private val SharedPreferences.email by preferences.delegate(PREF_EMAIL_KEY, "")
+
+    private fun emailSummary(value: String): String = value.trim().ifEmpty { "Not set" }
+
+    private val auth by lazy { HdAuth(client, baseUrl, headers) }
+
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    private val busy = AtomicBoolean(false)
+
+    /**
+     * A row that runs [action] when tapped. It is a switch whose change is always refused, so it never
+     * shows as on and nothing is saved; the tap is the only thing that happens.
+     */
+    private fun actionPreference(screen: PreferenceScreen, title: String, summary: String, action: () -> Unit): SwitchPreferenceCompat = SwitchPreferenceCompat(screen.context).apply {
+        this.title = title
+        this.summary = summary
+        setOnPreferenceChangeListener { _, _ ->
+            action()
+            false
+        }
+    }
+
+    private fun signIn(password: String) {
+        val email = preferences.email.trim()
+        if (!EMAIL_REGEX.matches(email)) return toast("Set your email address first.")
+        runAccountAction { auth.signIn(email, password) }
+    }
+
+    private fun checkStatus() = runAccountAction { auth.status() }
+
+    private fun signOut() = runAccountAction { auth.signOutLocally() }
+
+    /**
+     * Runs one account call off the main thread and shows what it said. A second tap while one is running
+     * is ignored.
+     */
+    private fun runAccountAction(call: () -> AuthResult) {
+        if (!busy.compareAndSet(false, true)) return toast("Still working on the last request.")
+        Thread {
+            val result = try {
+                call()
+            } catch (e: IOException) {
+                AuthResult(false, "Could not reach HepDrama (${e.message ?: "network error"}).")
+            } finally {
+                busy.set(false)
+            }
+            toast(result.message, long = true)
+        }.start()
+    }
+
+    private fun toast(message: String, long: Boolean = false) {
+        mainHandler.post {
+            Toast.makeText(applicationContext, message, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // ================================ Helpers ================================
 
@@ -331,5 +443,9 @@ class ArvinHd :
 
         private const val PREF_VARIANT_KEY = "preferred_variant"
         private const val PREF_VARIANT_DEFAULT = "ORIGINAL"
+        private const val PREF_EMAIL_KEY = "hepdrama_email"
+        private const val PREF_PASSWORD_KEY = "hepdrama_password_entry"
+
+        private val EMAIL_REGEX = Regex("""^[^\s@]+@[^\s@]+\.[^\s@]+$""")
     }
 }
